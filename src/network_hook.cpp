@@ -71,8 +71,6 @@ volatile LONG g_crypto_ready;
 struct SocketState {
     bool used;
     SOCKET socket;
-    int type;
-    int protocol;
     uint16_t virtual_lan_port;
     bool virtual_connected;
     bool broadcast_interface_configured;
@@ -897,10 +895,6 @@ void feed_stream(SocketState *state, const char *direction,
 
 SOCKET WSAAPI hook_socket(int af, int type, int protocol) {
     SOCKET s = g_next_socket ? g_next_socket(af, type, protocol) : INVALID_SOCKET;
-    if (s != INVALID_SOCKET) {
-        SocketState *state = state_for(s, true);
-        if (state != nullptr) { state->type = type; state->protocol = protocol; }
-    }
     log_line("SOCKET", "api=socket af=%d type=%d protocol=%d result=%lld error=%d/%s",
         af, type, protocol, (long long)s,
         s == INVALID_SOCKET ? WSAGetLastError() : 0,
@@ -1090,10 +1084,6 @@ int WSAAPI hook_shutdown(SOCKET s, int how) {
 
 SOCKET WSAAPI hook_wsasocketw(int af, int type, int protocol, LPWSAPROTOCOL_INFOW info, GROUP group, DWORD flags) {
     SOCKET s = g_next_wsasocketw ? g_next_wsasocketw(af, type, protocol, info, group, flags) : INVALID_SOCKET;
-    if (s != INVALID_SOCKET) {
-        SocketState *state = state_for(s, true);
-        if (state) { state->type = type; state->protocol = protocol; }
-    }
     log_line("SOCKET", "api=WSASocketW af=%d type=%d protocol=%d flags=0x%lX result=%lld error=%d/%s",
         af, type, protocol, flags, (long long)s,
         s == INVALID_SOCKET ? WSAGetLastError() : 0,
