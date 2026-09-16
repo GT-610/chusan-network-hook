@@ -72,7 +72,6 @@ struct SocketState {
     bool used;
     SOCKET socket;
     uint16_t virtual_lan_port;
-    bool virtual_connected;
     bool broadcast_interface_configured;
     bool tcp_source_bound;
     bool route_logged;
@@ -930,7 +929,7 @@ int WSAAPI hook_listen(SOCKET s, int backlog) {
 int WSAAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
     const uint16_t port = port_of(name, namelen);
     if (g_config.lan_install_enable && port == kLanSyncPort) {
-        SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; st->virtual_connected = true; save_address(st, name, namelen, true); }
+        SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; save_address(st, name, namelen, true); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
         log_line("LAN_VIRT", "connect_skipped port=%u requested=%s result=0", port, requested);
         return 0;
@@ -1095,7 +1094,7 @@ int WSAAPI hook_wsaconnect(SOCKET s, const sockaddr *name, int namelen, LPWSABUF
                            LPWSABUF caller_data, LPQOS sqos, LPQOS gqos) {
     const uint16_t port = port_of(name, namelen);
     if (g_config.lan_install_enable && port == kLanSyncPort) {
-        SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; st->virtual_connected = true; save_address(st, name, namelen, true); }
+        SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; save_address(st, name, namelen, true); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
         log_line("LAN_VIRT", "WSAConnect_skipped port=%u requested=%s result=0", port, requested);
         return 0;
