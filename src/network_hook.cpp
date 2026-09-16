@@ -1294,9 +1294,10 @@ HookSpec g_hooks[] = {
 };
 
 bool install_iat_hooks(HMODULE module) {
+    if (!module) return false;
     unsigned char *base = reinterpret_cast<unsigned char *>(module);
     IMAGE_DOS_HEADER *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
-    if (!module || dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
     IMAGE_NT_HEADERS *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
     const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
