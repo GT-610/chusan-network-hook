@@ -381,6 +381,19 @@ void save_address(SocketState *state, const sockaddr *address, int length, bool 
 }
 
 SocketState *state_for(SOCKET socket, bool create) {
+    if (!create) {
+        AcquireSRWLockShared(&g_state_lock);
+        for (size_t i = 0; i < kSocketCapacity; ++i) {
+            if (g_sockets[i].used && g_sockets[i].socket == socket) {
+                SocketState *state = &g_sockets[i];
+                ReleaseSRWLockShared(&g_state_lock);
+                return state;
+            }
+        }
+        ReleaseSRWLockShared(&g_state_lock);
+        return nullptr;
+    }
+
     AcquireSRWLockExclusive(&g_state_lock);
     SocketState *free_slot = nullptr;
     for (size_t i = 0; i < kSocketCapacity; ++i) {
@@ -396,7 +409,7 @@ SocketState *state_for(SOCKET socket, bool create) {
         free_slot->socket = socket;
     }
     ReleaseSRWLockExclusive(&g_state_lock);
-    return create ? free_slot : nullptr;
+    return free_slot;
 }
 
 void refresh_addresses(SocketState *state) {
