@@ -12,6 +12,39 @@ static int fail(const char *step, int error) {
     return 1;
 }
 
+static int test_party_loopback() {
+    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) return fail("party loopback listener socket", WSAGetLastError());
+
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(50200);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(listener, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == SOCKET_ERROR)
+        return fail("party loopback bind", WSAGetLastError());
+    if (listen(listener, 2) == SOCKET_ERROR)
+        return fail("party loopback listen", WSAGetLastError());
+
+    for (int use_wsa_connect = 0; use_wsa_connect < 2; ++use_wsa_connect) {
+        SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (client == INVALID_SOCKET) return fail("party loopback client socket", WSAGetLastError());
+        const int result = use_wsa_connect
+            ? WSAConnect(client, reinterpret_cast<const sockaddr *>(&address), sizeof(address),
+                nullptr, nullptr, nullptr, nullptr)
+            : connect(client, reinterpret_cast<const sockaddr *>(&address), sizeof(address));
+        if (result == SOCKET_ERROR)
+            return fail(use_wsa_connect ? "party loopback WSAConnect" : "party loopback connect",
+                WSAGetLastError());
+        SOCKET accepted = accept(listener, nullptr, nullptr);
+        if (accepted == INVALID_SOCKET) return fail("party loopback accept", WSAGetLastError());
+        closesocket(accepted);
+        closesocket(client);
+    }
+
+    closesocket(listener);
+    return 0;
+}
+
 int wmain(int argc, wchar_t **argv) {
     if (argc != 2) {
         fwprintf(stderr, L"Usage: %s <hook.dll>\n", argv[0]);
@@ -22,6 +55,8 @@ int wmain(int argc, wchar_t **argv) {
     HMODULE hook = LoadLibraryW(argv[1]);
     if (hook == nullptr) return fail("LoadLibraryW", GetLastError());
     Sleep(300);
+
+    if (test_party_loopback() != 0) return 1;
 
     SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp == INVALID_SOCKET) return fail("UDP socket", WSAGetLastError());
@@ -59,6 +94,6 @@ int wmain(int argc, wchar_t **argv) {
     closesocket(tcp);
 
     WSACleanup();
-    puts("PASS: LAN Install virtualization smoke test");
+    puts("PASS: loopback Party and LAN Install virtualization smoke tests");
     return 0;
 }

@@ -92,7 +92,7 @@ All Boolean fields use `0` for disabled and `1` for enabled.
 - UDP 50201 for Setting;
 - UDP 50202 for Advertise.
 
-`forceTcpSource=1` binds an unbound client socket to `interfaceAddress` before connecting to TCP 40110 or 50200-50202. Listener sockets are not restricted and may continue to listen on `0.0.0.0`.
+`forceTcpSource=1` binds an unbound client socket to `interfaceAddress` before connecting to TCP 40110 or 50200-50202. Connections to `127.0.0.0/8` are left on the loopback interface so the game's local Join Party path can connect to itself. Listener sockets are not restricted and may continue to listen on `0.0.0.0`.
 
 `strict=1` blocks the affected operation when the configured address is missing, the adapter is down, or Windows rejects the interface selection. This prevents a silent fallback to an unintended adapter. With `strict=0`, the hook reports the problem and lets Windows use its normal routing rules.
 

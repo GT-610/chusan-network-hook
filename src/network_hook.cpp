@@ -150,6 +150,20 @@ uint16_t port_of(const sockaddr *address, int length) {
     return 0;
 }
 
+bool loopback_target(const sockaddr *address, int length) {
+    if (address == nullptr) return false;
+    if (address->sa_family == AF_INET && length >= (int)sizeof(sockaddr_in)) {
+        const uint32_t ip = ntohl(
+            reinterpret_cast<const sockaddr_in *>(address)->sin_addr.s_addr);
+        return (ip & 0xFF000000u) == 0x7F000000u;
+    }
+    if (address->sa_family == AF_INET6 && length >= (int)sizeof(sockaddr_in6)) {
+        return IN6_IS_ADDR_LOOPBACK(
+            &reinterpret_cast<const sockaddr_in6 *>(address)->sin6_addr) != 0;
+    }
+    return false;
+}
+
 bool relevant(uint16_t port) {
     return port == kLanSyncPort || port == kLanBeaconPort || port == kPartyPort ||
         port == kSettingPort || port == kAdvertisePort;
@@ -625,8 +639,18 @@ bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
     return true;
 }
 
-bool ensure_tcp_source(SOCKET socket, uint16_t port) {
+bool ensure_tcp_source(SOCKET socket, uint16_t port,
+                       const sockaddr *target, int target_length) {
     if (!g_config.network_enable || !g_config.force_tcp_source) return true;
+    if (loopback_target(target, target_length)) {
+        char destination[96] = {};
+        endpoint(target, target_length, destination, sizeof(destination));
+        human_line("INFO", "%s TCP loopback connection to %s keeps the loopback source.",
+            service(port), destination);
+        log_line("INTERFACE", "action=skip_tcp_source socket=%llu service=%s port=%u target=%s reason=loopback",
+            (unsigned long long)(uintptr_t)socket, service(port), port, destination);
+        return true;
+    }
     const int saved_error = WSAGetLastError();
     SocketState *state = state_for(socket, true);
     if (state != nullptr && state->tcp_source_bound) {
@@ -917,7 +941,7 @@ int WSAAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
         log_line("LAN_VIRT", "connect_skipped port=%u requested=%s result=0", port, requested);
         return 0;
     }
-    if (relevant(port) && !ensure_tcp_source(s, port)) return SOCKET_ERROR;
+    if (relevant(port) && !ensure_tcp_source(s, port, name, namelen)) return SOCKET_ERROR;
     if (relevant(port)) log_route_for(name, namelen);
     SocketState *st = state_for(s, true); if (st) save_address(st, name, namelen, true);
     int r = g_next_connect(s, name, namelen); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
@@ -1086,7 +1110,7 @@ int WSAAPI hook_wsaconnect(SOCKET s, const sockaddr *name, int namelen, LPWSABUF
         log_line("LAN_VIRT", "WSAConnect_skipped port=%u requested=%s result=0", port, requested);
         return 0;
     }
-    if (relevant(port) && !ensure_tcp_source(s, port)) return SOCKET_ERROR;
+    if (relevant(port) && !ensure_tcp_source(s, port, name, namelen)) return SOCKET_ERROR;
     if (relevant(port)) log_route_for(name, namelen);
     SocketState *st = state_for(s, true); if (st) save_address(st, name, namelen, true);
     int r = g_next_wsaconnect(s, name, namelen, callee_data, caller_data, sqos, gqos);
