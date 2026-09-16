@@ -34,10 +34,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item build\chusan_network_hook_x64.dll release\
           Copy-Item build\chusan_network_hook_x86.dll release\
-          Copy-Item build\network_hook_smoketest_x64.exe release\
-          Copy-Item build\network_hook_smoketest_x86.exe release\
           Copy-Item network_hook.ini release\
-          Copy-Item README.md release\
           Compress-Archive -Path release\* -DestinationPath "build\chusan-network-hook_${{ github.ref_name }}.zip" -Force
 
       - name: Create GitHub release
@@ -49,7 +46,5 @@ jobs:
           if (-not $tag.StartsWith("v")) { throw "Release tags must start with v." }
           gh release create $tag `
             "build\chusan-network-hook_${tag}.zip" `
-            "build\chusan_network_hook_x64.dll" `
-            "build\chusan_network_hook_x86.dll" `
             --title $tag `
             --generate-notes
