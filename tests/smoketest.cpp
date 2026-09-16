@@ -69,14 +69,6 @@ int wmain(int argc, wchar_t **argv) {
         reinterpret_cast<const sockaddr *>(&beacon), sizeof(beacon));
     if (sent != (int)sizeof(payload)) return fail("virtual UDP beacon", WSAGetLastError());
 
-    BOOL broadcast_enabled = TRUE;
-    if (setsockopt(udp, SOL_SOCKET, SO_BROADCAST,
-        reinterpret_cast<const char *>(&broadcast_enabled), sizeof(broadcast_enabled)) == SOCKET_ERROR)
-        return fail("SO_BROADCAST", WSAGetLastError());
-    beacon.sin_port = htons(50201);
-    const int game_sent = sendto(udp, payload, (int)sizeof(payload), 0,
-        reinterpret_cast<const sockaddr *>(&beacon), sizeof(beacon));
-    if (game_sent != (int)sizeof(payload)) return fail("game limited broadcast", WSAGetLastError());
     closesocket(udp);
 
     SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);

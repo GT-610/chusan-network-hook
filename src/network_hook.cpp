@@ -71,10 +71,7 @@ volatile LONG g_crypto_ready;
 struct SocketState {
     bool used;
     SOCKET socket;
-    int type;
-    int protocol;
     uint16_t virtual_lan_port;
-    bool virtual_connected;
     bool broadcast_interface_configured;
     bool tcp_source_bound;
     bool route_logged;
@@ -384,6 +381,19 @@ void save_address(SocketState *state, const sockaddr *address, int length, bool 
 }
 
 SocketState *state_for(SOCKET socket, bool create) {
+    if (!create) {
+        AcquireSRWLockShared(&g_state_lock);
+        for (size_t i = 0; i < kSocketCapacity; ++i) {
+            if (g_sockets[i].used && g_sockets[i].socket == socket) {
+                SocketState *state = &g_sockets[i];
+                ReleaseSRWLockShared(&g_state_lock);
+                return state;
+            }
+        }
+        ReleaseSRWLockShared(&g_state_lock);
+        return nullptr;
+    }
+
     AcquireSRWLockExclusive(&g_state_lock);
     SocketState *free_slot = nullptr;
     for (size_t i = 0; i < kSocketCapacity; ++i) {
@@ -399,7 +409,7 @@ SocketState *state_for(SOCKET socket, bool create) {
         free_slot->socket = socket;
     }
     ReleaseSRWLockExclusive(&g_state_lock);
-    return create ? free_slot : nullptr;
+    return free_slot;
 }
 
 void refresh_addresses(SocketState *state) {
@@ -897,10 +907,6 @@ void feed_stream(SocketState *state, const char *direction,
 
 SOCKET WSAAPI hook_socket(int af, int type, int protocol) {
     SOCKET s = g_next_socket ? g_next_socket(af, type, protocol) : INVALID_SOCKET;
-    if (s != INVALID_SOCKET) {
-        SocketState *state = state_for(s, true);
-        if (state != nullptr) { state->type = type; state->protocol = protocol; }
-    }
     log_line("SOCKET", "api=socket af=%d type=%d protocol=%d result=%lld error=%d/%s",
         af, type, protocol, (long long)s,
         s == INVALID_SOCKET ? WSAGetLastError() : 0,
@@ -936,7 +942,7 @@ int WSAAPI hook_listen(SOCKET s, int backlog) {
 int WSAAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
     const uint16_t port = port_of(name, namelen);
     if (g_config.lan_install_enable && port == kLanSyncPort) {
-        SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; st->virtual_connected = true; save_address(st, name, namelen, true); }
+        SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; save_address(st, name, namelen, true); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
         log_line("LAN_VIRT", "connect_skipped port=%u requested=%s result=0", port, requested);
         return 0;
@@ -1090,10 +1096,6 @@ int WSAAPI hook_shutdown(SOCKET s, int how) {
 
 SOCKET WSAAPI hook_wsasocketw(int af, int type, int protocol, LPWSAPROTOCOL_INFOW info, GROUP group, DWORD flags) {
     SOCKET s = g_next_wsasocketw ? g_next_wsasocketw(af, type, protocol, info, group, flags) : INVALID_SOCKET;
-    if (s != INVALID_SOCKET) {
-        SocketState *state = state_for(s, true);
-        if (state) { state->type = type; state->protocol = protocol; }
-    }
     log_line("SOCKET", "api=WSASocketW af=%d type=%d protocol=%d flags=0x%lX result=%lld error=%d/%s",
         af, type, protocol, flags, (long long)s,
         s == INVALID_SOCKET ? WSAGetLastError() : 0,
@@ -1105,7 +1107,7 @@ int WSAAPI hook_wsaconnect(SOCKET s, const sockaddr *name, int namelen, LPWSABUF
                            LPWSABUF caller_data, LPQOS sqos, LPQOS gqos) {
     const uint16_t port = port_of(name, namelen);
     if (g_config.lan_install_enable && port == kLanSyncPort) {
-        SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; st->virtual_connected = true; save_address(st, name, namelen, true); }
+        SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; save_address(st, name, namelen, true); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
         log_line("LAN_VIRT", "WSAConnect_skipped port=%u requested=%s result=0", port, requested);
         return 0;
@@ -1305,9 +1307,10 @@ HookSpec g_hooks[] = {
 };
 
 bool install_iat_hooks(HMODULE module) {
+    if (!module) return false;
     unsigned char *base = reinterpret_cast<unsigned char *>(module);
     IMAGE_DOS_HEADER *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
-    if (!module || dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
     IMAGE_NT_HEADERS *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
     const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
