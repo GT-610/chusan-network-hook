@@ -127,7 +127,8 @@ Set `detailed=1` to enable the diagnostic logger ported from `chusan_netdiag`. D
 - local, remote, and target endpoints;
 - byte counters and hexadecimal payload summaries;
 - TCP stream framing and UDP frame parsing for ports 50200-50202;
-- AES-128-ECB prefix decoding with known message names when the packet format matches the recovered game protocol.
+- AES-128-ECB prefix decoding with known message names when the packet format matches the recovered game protocol;
+- in `chusanApp.exe`, the per-credit BONUS TRACK decision: the track limit and the three predicates that gate its "force four tracks" branch, logged with the in-store matching flag at `UserDataManager::Impl+0x14E8`.
 
 `writeFile=1` additionally writes the same output to:
 
