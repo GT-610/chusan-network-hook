@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <intrin.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -1396,6 +1397,162 @@ extern "C" __declspec(noinline) bool lan_duplicate_server_false() {
 }
 #endif
 
+#ifndef _WIN64
+// BONUS TRACK diagnostics for chusanApp.exe (SDHD 2.50, x86).
+//
+// The per-credit track limit is computed by FUN_00b113d0. Its "force four
+// tracks" branch is gated by three predicates that the function itself calls:
+//
+//   FUN_00aee980  data-entry predicate  (projView::GameDataManager)
+//   FUN_00b19090  amdaemon play id      (projView::UserDataManager)
+//   FUN_007e36c0  amdaemon play state
+//
+// With [log] detailed=1 the detours below log each predicate result and the
+// final track limit, together with the per-credit in-store matching flag at
+// UserDataManager::Impl+0x14E8. They only observe the original return values;
+// no return value or game state is modified.
+
+constexpr uintptr_t kTrackLimitRva = 0x007113D0;
+constexpr uintptr_t kTrackLimitEndRva = 0x00711500;
+constexpr uintptr_t kGateDataRva = 0x006EE980;
+constexpr uintptr_t kGatePlayRva = 0x00719090;
+constexpr uintptr_t kGateCreditRva = 0x003E36C0;
+constexpr uintptr_t kUserDataOwnerRva = 0x018B969C;
+constexpr uintptr_t kPartyOwnerRva = 0x018B3B80;
+constexpr uintptr_t kInStoreMatchOffset = 0x14E8;
+
+void *g_track_limit_trampoline;
+void *g_gate_data_trampoline;
+void *g_gate_play_trampoline;
+void *g_gate_credit_trampoline;
+
+void *owner_impl_at(uintptr_t wrapper_rva) {
+    unsigned char *base = reinterpret_cast<unsigned char *>(GetModuleHandleW(nullptr));
+    if (base == nullptr) return nullptr;
+    void *wrapper = *reinterpret_cast<void **>(base + wrapper_rva);
+    if (wrapper == nullptr) return nullptr;
+    return *reinterpret_cast<void **>(reinterpret_cast<unsigned char *>(wrapper) + 4);
+}
+
+int read_int_at(const void *object, uintptr_t offset) {
+    if (object == nullptr) return -1;
+    return *reinterpret_cast<const int *>(reinterpret_cast<const unsigned char *>(object) + offset);
+}
+
+bool install_detour(HMODULE module, uintptr_t rva, const unsigned char *expected,
+    size_t length, void *replacement, void **trampoline) {
+    if (module == nullptr || expected == nullptr || length < 5 || trampoline == nullptr) return false;
+    unsigned char *target = reinterpret_cast<unsigned char *>(module) + rva;
+    if (memcmp(target, expected, length) != 0) {
+        log_line("BONUS_HOOK", "status=skipped reason=prologue_mismatch rva=0x%llX",
+            (unsigned long long)rva);
+        return false;
+    }
+    // Relocated prologue followed by an absolute jump back into the function.
+    unsigned char *thunk = reinterpret_cast<unsigned char *>(
+        VirtualAlloc(nullptr, length + 6, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (thunk == nullptr) {
+        log_line("BONUS_HOOK", "status=failed stage=VirtualAlloc rva=0x%llX",
+            (unsigned long long)rva);
+        return false;
+    }
+    memcpy(thunk, target, length);
+    thunk[length] = 0x68;                                       // push imm32
+    const uintptr_t resume = reinterpret_cast<uintptr_t>(target + length);
+    memcpy(thunk + length + 1, &resume, sizeof(resume));
+    thunk[length + 5] = 0xC3;                                   // ret
+    // The replacement jump is also push/ret: it is absolute, clobbers no
+    // register, and does not depend on the DLL being within +-2GB.
+    unsigned char patch[8] = {0x68, 0, 0, 0, 0, 0xC3, 0x90, 0x90};
+    const uintptr_t destination = reinterpret_cast<uintptr_t>(replacement);
+    memcpy(patch + 1, &destination, sizeof(destination));
+    DWORD old = 0;
+    if (!VirtualProtect(target, length, PAGE_EXECUTE_READWRITE, &old)) {
+        VirtualFree(thunk, 0, MEM_RELEASE);
+        log_line("BONUS_HOOK", "status=failed stage=VirtualProtect rva=0x%llX",
+            (unsigned long long)rva);
+        return false;
+    }
+    memcpy(target, patch, length);
+    DWORD ignored = 0;
+    VirtualProtect(target, length, old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, length);
+    *trampoline = thunk;
+    log_line("BONUS_HOOK", "status=installed rva=0x%llX trampoline=%p",
+        (unsigned long long)rva, thunk);
+    return true;
+}
+
+bool called_by_track_limit(void *return_address) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const uintptr_t rva = reinterpret_cast<uintptr_t>(return_address) - base;
+    return rva >= kTrackLimitRva && rva < kTrackLimitEndRva;
+}
+
+bool __fastcall bonus_gate_data_hook(void *self) {
+    void *caller = _ReturnAddress();
+    auto original = reinterpret_cast<bool (__fastcall *)(void *)>(g_gate_data_trampoline);
+    const bool result = original(self);
+    if (called_by_track_limit(caller))
+        log_line("BONUS_GATE", "gate=data_entry result=%d this=%p", result ? 1 : 0, self);
+    return result;
+}
+
+bool __fastcall bonus_gate_play_hook(void *self) {
+    void *caller = _ReturnAddress();
+    auto original = reinterpret_cast<bool (__fastcall *)(void *)>(g_gate_play_trampoline);
+    const bool result = original(self);
+    if (called_by_track_limit(caller))
+        log_line("BONUS_GATE", "gate=amdaemon_play_id result=%d this=%p", result ? 1 : 0, self);
+    return result;
+}
+
+bool __cdecl bonus_gate_credit_hook() {
+    void *caller = _ReturnAddress();
+    auto original = reinterpret_cast<bool (__cdecl *)()>(g_gate_credit_trampoline);
+    const bool result = original();
+    if (called_by_track_limit(caller))
+        log_line("BONUS_GATE", "gate=amdaemon_play_state result=%d", result ? 1 : 0);
+    return result;
+}
+
+unsigned int __fastcall bonus_track_limit_hook(void *self) {
+    auto original = reinterpret_cast<unsigned int (__fastcall *)(void *)>(g_track_limit_trampoline);
+    const unsigned int limit = original(self);
+    const unsigned char *fields = reinterpret_cast<const unsigned char *>(self);
+    const void *user = owner_impl_at(kUserDataOwnerRva);
+    const void *party = *reinterpret_cast<void *const *>(
+        reinterpret_cast<unsigned char *>(GetModuleHandleW(nullptr)) + kPartyOwnerRva + 4);
+    log_line("BONUS_TRACK",
+        "limit=%u in_store_match=%d userdata_in_store_match=%d play_mode=%d single_track=%d "
+        "reward_tracks=%d/%d this=%p",
+        limit,
+        read_int_at(self, kInStoreMatchOffset),
+        read_int_at(user, kInStoreMatchOffset),
+        read_int_at(self, 0x2C),
+        *reinterpret_cast<const unsigned char *>(fields + 0x2F71),
+        read_int_at(party, 0x25C0), read_int_at(party, 0x25C4), self);
+    return limit;
+}
+
+bool install_bonus_track_hooks(HMODULE module) {
+    static const unsigned char limit_prologue[] = {0x83, 0xEC, 0x08, 0x53, 0x55};
+    static const unsigned char data_prologue[] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
+    static const unsigned char play_prologue[] = {0x53, 0x56, 0x8B, 0x71, 0x04};
+    static const unsigned char credit_prologue[] = {0x51, 0x53, 0x6A, 0x00, 0x8D, 0x4C, 0x24, 0x0B};
+    bool installed = true;
+    installed = install_detour(module, kTrackLimitRva, limit_prologue, sizeof(limit_prologue),
+        reinterpret_cast<void *>(&bonus_track_limit_hook), &g_track_limit_trampoline) && installed;
+    installed = install_detour(module, kGateDataRva, data_prologue, sizeof(data_prologue),
+        reinterpret_cast<void *>(&bonus_gate_data_hook), &g_gate_data_trampoline) && installed;
+    installed = install_detour(module, kGatePlayRva, play_prologue, sizeof(play_prologue),
+        reinterpret_cast<void *>(&bonus_gate_play_hook), &g_gate_play_trampoline) && installed;
+    installed = install_detour(module, kGateCreditRva, credit_prologue, sizeof(credit_prologue),
+        reinterpret_cast<void *>(&bonus_gate_credit_hook), &g_gate_credit_trampoline) && installed;
+    return installed;
+}
+#endif
+
 DWORD WINAPI initialize(void *) {
     configure_paths();
     load_config();
@@ -1438,8 +1595,12 @@ DWORD WINAPI initialize(void *) {
     log_line("START", "process=%s architecture=x64 image_base=%p iat=%s lan_duplicate_hook=%s ports=40110,40112,50200,50201,50202",
         exe, process, iat ? "installed" : "not_installed", lan ? "installed" : "not_applicable_or_skipped");
 #else
-    log_line("START", "process=%s architecture=x86 image_base=%p iat=%s ports=40110,40112,50200,50201,50202 lan_duplicate_hook=not_available",
-        exe, process, iat ? "installed" : "not_installed");
+    bool bonus = false;
+    if (g_config.log_detailed && _stricmp(exe, "chusanApp.exe") == 0)
+        bonus = install_bonus_track_hooks(process);
+    log_line("START", "process=%s architecture=x86 image_base=%p iat=%s bonus_track_hooks=%s ports=40110,40112,50200,50201,50202 lan_duplicate_hook=not_available",
+        exe, process, iat ? "installed" : "not_installed",
+        bonus ? "installed" : (g_config.log_detailed ? "skipped_or_failed" : "disabled"));
 #endif
     const char *network_status = !g_config.network_enable ? "disabled" :
         (g_network_ready ? "ready" : "failed");
