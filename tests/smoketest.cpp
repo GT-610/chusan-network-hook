@@ -109,6 +109,64 @@ static int test_netenv_style_broadcast() {
     return 0;
 }
 
+// The classification reported as matched= in the log. It must mirror exactly what
+// broadcast_match accepts, because an operator reads matched= to decide whether the
+// game's own directed broadcast was recognized or whether only netenv's rewritten
+// limited broadcast happened to match.
+static int test_broadcast_classification() {
+    in_addr iface = {};
+    InetPtonA(AF_INET, "192.168.139.18", &iface);
+    in_addr directed = {};
+    InetPtonA(AF_INET, "192.168.139.255", &directed);
+    in_addr limited = {};
+    InetPtonA(AF_INET, "255.255.255.255", &limited);
+    in_addr unrelated = {};
+    InetPtonA(AF_INET, "10.99.99.255", &unrelated);
+
+    struct Case {
+        const char *label;
+        unsigned long target;
+        bool network_ready;
+        bool directed_valid;
+        unsigned long directed;
+        BroadcastMatchKind expected;
+    };
+    const Case cases[] = {
+        {"limited",              limited.s_addr,  true,  true,  directed.s_addr, kBroadcastLimited},
+        // The limited broadcast is recognized before the interface is resolved, which is
+        // what lets strict mode block the send instead of silently routing it.
+        {"limited when unresolved", limited.s_addr, false, false, 0,            kBroadcastLimited},
+        {"directed",             directed.s_addr, true,  true,  directed.s_addr, kBroadcastDirected},
+        {"directed not yet known", directed.s_addr, true, false, 0,             kBroadcastNetenvStyle},
+        {"netenv style",         directed.s_addr, true,  true,  unrelated.s_addr, kBroadcastNetenvStyle},
+        {"unrelated",            unrelated.s_addr, true, true,  directed.s_addr, kBroadcastNotTarget},
+    };
+
+    for (const Case &c : cases) {
+        const BroadcastMatchKind got = classify_broadcast(
+            c.target, c.network_ready, c.directed_valid, c.directed, iface.s_addr);
+        if (got != c.expected) {
+            fprintf(stderr, "FAIL: broadcast classification '%s': got %s, expected %s\n",
+                c.label, broadcast_match_name(got), broadcast_match_name(c.expected));
+            return 1;
+        }
+    }
+
+    // "unrelated" must stay unrecognized even when no interface has been resolved, since
+    // the netenv-style form is derived from the configured address and needs that address.
+    const BroadcastMatchKind unresolved_unrelated = classify_broadcast(
+        unrelated.s_addr, false, false, 0, iface.s_addr);
+    if (unresolved_unrelated != kBroadcastNotTarget) {
+        fprintf(stderr, "FAIL: unrelated broadcast classified as %s while unresolved\n",
+            broadcast_match_name(unresolved_unrelated));
+        return 1;
+    }
+
+    printf("PASS: broadcast classification (%zu cases)\n",
+        sizeof(cases) / sizeof(cases[0]));
+    return 0;
+}
+
 static int test_party_loopback() {
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listener == INVALID_SOCKET) return fail("party loopback listener socket", WSAGetLastError());
@@ -209,10 +267,63 @@ static ProbeResult probe_broadcast(const char *destination_text, unsigned short 
     return result;
 }
 
+// Sends several broadcasts from ONE socket, as the game does: the captured session used a
+// single UDP socket for all 53 Setting announcements. Once the pin is set the hook takes a
+// reuse path, which must keep the pin and must not disturb the socket.
+//
+// Two different destination forms are used from that one socket so the reuse path is
+// exercised for a form other than the one that installed the pin. That is the case worth
+// covering: the pin is per socket, so a later, different broadcast form must neither
+// clear it nor be pinned to a different interface.
+static int test_broadcast_pin_reuse(const char *first_text, const char *second_text,
+                                    unsigned short port, long expected_index) {
+    SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udp == INVALID_SOCKET) return fail("reuse probe socket", WSAGetLastError());
+
+    BOOL enabled = TRUE;
+    if (setsockopt(udp, SOL_SOCKET, SO_BROADCAST,
+            reinterpret_cast<const char *>(&enabled), sizeof(enabled)) == SOCKET_ERROR) {
+        closesocket(udp);
+        return fail("reuse probe SO_BROADCAST", WSAGetLastError());
+    }
+
+    const char *destinations[2] = {first_text, second_text};
+    const char payload[] = "broadcast probe";
+    for (int pass = 0; pass < 2; ++pass) {
+        sockaddr_in destination = {};
+        destination.sin_family = AF_INET;
+        destination.sin_port = htons(port);
+        if (InetPtonA(AF_INET, destinations[pass], &destination.sin_addr) != 1) {
+            closesocket(udp);
+            return fail("reuse probe InetPtonA", WSAGetLastError());
+        }
+        for (int i = 0; i < 3; ++i) {
+            const int sent = sendto(udp, payload, (int)sizeof(payload), 0,
+                reinterpret_cast<const sockaddr *>(&destination), sizeof(destination));
+            if (sent != (int)sizeof(payload)) {
+                const int error = WSAGetLastError();
+                closesocket(udp);
+                return fail("reuse probe sendto", error);
+            }
+            const long index = static_cast<long>(pinned_interface_index(udp));
+            if (index != expected_index) {
+                closesocket(udp);
+                fprintf(stderr, "FAIL: reuse probe pass %d send %d to %s pinned index %ld, "
+                    "expected %ld\n", pass + 1, i + 1, destinations[pass], index, expected_index);
+                return 1;
+            }
+        }
+    }
+
+    closesocket(udp);
+    printf("PASS: one socket sending %s and %s kept the pin to interface index %ld\n",
+        first_text, second_text, expected_index);
+    return 0;
+}
+
 // Locates the real interface index and mask for an address using GetIpAddrTable, which
 // segatools' netenv does not hook. Returns false when the address is not local.
-static bool local_interface_for(const char *address_text, DWORD *index, DWORD *mask) {
-    in_addr address = {};
+static bool local_interface_for(const char *address_text, DWORD *index, DWORD *mask) {    in_addr address = {};
     if (InetPtonA(AF_INET, address_text, &address) != 1) return false;
 
     ULONG size = 0;
@@ -353,6 +464,14 @@ static int test_broadcast_interface_forcing(int argc, wchar_t **argv) {
     char netenv_text[64] = {};
     sprintf_s(netenv_text, "%u.%u.%u.255", address_bytes[0], address_bytes[1], address_bytes[2]);
 
+    // The captured session sent all 53 Setting announcements from one socket, so the pin is
+    // set once and every later send takes the reuse path. Send a second, different form from
+    // that same socket to prove the reuse path keeps the pin for new target forms too.
+    const char *other_form = (strcmp(netenv_text, directed_text) != 0)
+        ? netenv_text : "255.255.255.255";
+    if (test_broadcast_pin_reuse(directed_text, other_form, 50201,
+            static_cast<long>(index)) != 0) return 1;
+
     if (strcmp(netenv_text, directed_text) != 0) {
         const ProbeResult netenv_style = probe_broadcast(netenv_text, 50202);
         if (netenv_style.socket_failed) {
@@ -394,6 +513,7 @@ int wmain(int argc, wchar_t **argv) {
 
     if (test_interface_decision_table() != 0) return 1;
     if (test_netenv_style_broadcast() != 0) return 1;
+    if (test_broadcast_classification() != 0) return 1;
     if (test_party_loopback() != 0) return 1;
     if (test_broadcast_interface_forcing(argc, argv) != 0) return 1;
 

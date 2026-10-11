@@ -111,6 +111,15 @@ Real captures of SDHD 2.50 show the game sending its Party, Setting, and Adverti
 
 The directed broadcast is derived from the netmask reported by `GetIpAddrTable`. If the interface uses a point-to-point or host route (`/32`), no directed broadcast exists; the limited and `/24` forms are still matched.
 
+Each pin records which form triggered it, so the log distinguishes the mechanisms:
+
+```text
+INTERFACE  action=force_broadcast socket=3388 service=SETTING port=50201 address=192.168.139.18 if_index=20 matched=directed result=0
+INTERFACE  action=force_broadcast_reuse socket=3388 service=SETTING port=50201 matched=netenv_style if_index=20
+```
+
+The pin is per socket, so it is applied once and later sends to any recognized form are logged as `force_broadcast_reuse`, once per distinct form. This matters when `netenv` is loaded, because the hook may be installed either before or after it in the `sendto` chain and so may see either the game's original directed broadcast or the limited broadcast `netenv` rewrote it into. `matched=directed` is the stronger signal: it means the hook saw the game's own subnet broadcast. `matched=limited` alone does not prove the hook saw the original address, which is why the two are reported separately.
+
 `forceTcpSource=1` binds an unbound client socket to `interfaceAddress` before connecting to TCP 40110 or 50200-50202. Connections to `127.0.0.0/8` are left on the loopback interface so the game's local Join Party path can connect to itself. Listener sockets are not restricted and may continue to listen on `0.0.0.0`.
 
 `strict=1` blocks the affected operation when the configured address is missing, the adapter is down, or Windows rejects the interface selection. This prevents a silent fallback to an unintended adapter. With `strict=0`, the hook reports the problem and lets Windows use its normal routing rules.

@@ -77,6 +77,9 @@ struct SocketState {
     SOCKET socket;
     uint16_t virtual_lan_port;
     bool broadcast_interface_configured;
+    // Which broadcast forms have already been logged for this socket, so the per-send
+    // logging stays readable instead of repeating for every announcement.
+    unsigned broadcast_match_logged;
     bool tcp_source_bound;
     bool route_logged;
     uint64_t tx_bytes;
@@ -825,18 +828,17 @@ void log_route_for(const sockaddr *address, int length) {
     }
 }
 
-// True when the destination is one of the broadcast addresses this hook pins: the
-// limited broadcast, the configured interface's own directed subnet broadcast, or the
-// /24-form directed broadcast the game actually computes through netenv.
-bool broadcast_target(const sockaddr *address, int length) {
+// Classifies the destination through the shared helper, so the pinning decision and the
+// logged "matched=" value can never disagree. Recognized forms: the limited broadcast
+// 255.255.255.255, the configured interface's own directed subnet broadcast, and the
+// /24-form the game actually computes through netenv's synthetic adapter.
+BroadcastMatchKind broadcast_match(const sockaddr *address, int length) {
     if (address == nullptr || address->sa_family != AF_INET ||
-        length < (int)sizeof(sockaddr_in)) return false;
+        length < (int)sizeof(sockaddr_in)) return kBroadcastNotTarget;
     const uint32_t target = reinterpret_cast<const sockaddr_in *>(address)->sin_addr.s_addr;
-    if (target == INADDR_BROADCAST) return true;
-    if (g_interface_directed_broadcast_valid &&
-        target == g_interface_directed_broadcast.s_addr) return true;
-    return g_network_ready &&
-        target == netenv_style_broadcast(g_interface_address.s_addr);
+    return classify_broadcast(target, g_network_ready,
+        g_interface_directed_broadcast_valid, g_interface_directed_broadcast.s_addr,
+        g_interface_address.s_addr);
 }
 
 bool network_failure(const char *operation, uint16_t port, int error) {
@@ -852,11 +854,23 @@ bool network_failure(const char *operation, uint16_t port, int error) {
     return true;
 }
 
-bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
+bool ensure_broadcast_interface(SOCKET socket, uint16_t port, BroadcastMatchKind matched) {
     if (!g_config.network_enable || !g_config.force_limited_broadcast) return true;
     const int saved_error = WSAGetLastError();
     SocketState *state = state_for(socket, true);
     if (state != nullptr && state->broadcast_interface_configured) {
+        // The pin is per socket and already set, but which address form triggered it is
+        // worth recording once per distinct form, because it is what distinguishes the
+        // game's own directed broadcast from netenv's rewritten limited one. Repeating it
+        // for all ~50 announcements would only add noise.
+        const unsigned bit = 1u << (unsigned)matched;
+        if ((state->broadcast_match_logged & bit) == 0) {
+            state->broadcast_match_logged |= bit;
+            log_line("INTERFACE", "action=force_broadcast_reuse socket=%llu service=%s port=%u "
+                "matched=%s if_index=%lu",
+                (unsigned long long)(uintptr_t)socket, service(port), port,
+                broadcast_match_name(matched), g_interface_index);
+        }
         WSASetLastError(saved_error);
         return true;
     }
@@ -867,12 +881,17 @@ bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
     if (result == SOCKET_ERROR) {
         return network_failure("Selecting the broadcast interface", port, WSAGetLastError());
     }
-    if (state != nullptr) state->broadcast_interface_configured = true;
-    human_line("INFO", "%s broadcast is pinned to %s (%s, index %lu).",
-        service(port), g_config.interface_address, g_interface_name, g_interface_index);
-    log_line("INTERFACE", "action=force_broadcast socket=%llu service=%s port=%u address=%s if_index=%lu result=0",
+    if (state != nullptr) {
+        state->broadcast_interface_configured = true;
+        state->broadcast_match_logged |= 1u << (unsigned)matched;
+    }
+    human_line("INFO", "%s broadcast is pinned to %s (%s, index %lu, matched %s).",
+        service(port), g_config.interface_address, g_interface_name, g_interface_index,
+        broadcast_match_name(matched));
+    log_line("INTERFACE", "action=force_broadcast socket=%llu service=%s port=%u address=%s "
+        "if_index=%lu matched=%s result=0",
         (unsigned long long)(uintptr_t)socket, service(port), port,
-        g_config.interface_address, g_interface_index);
+        g_config.interface_address, g_interface_index, broadcast_match_name(matched));
     WSASetLastError(saved_error);
     return true;
 }
@@ -1250,8 +1269,9 @@ int WSAAPI hook_sendto(SOCKET s, const char *buf, int len, int flags, const sock
         state->route_logged = true;
         log_route_for(to, tolen);
     }
-    if (relevant(port) && broadcast_target(to, tolen) &&
-        !ensure_broadcast_interface(s, port)) return SOCKET_ERROR;
+    const BroadcastMatchKind match = relevant(port) ? broadcast_match(to, tolen) : kBroadcastNotTarget;
+    if (match != kBroadcastNotTarget &&
+        !ensure_broadcast_interface(s, port, match)) return SOCKET_ERROR;
     int r = g_next_sendto(s, buf, len, flags, to, tolen); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (state && r > 0) {
         refresh_addresses(state);
@@ -1368,8 +1388,9 @@ int WSAAPI hook_wsasendto(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent,
         state->route_logged = true;
         log_route_for(to, tolen);
     }
-    if (relevant(port) && broadcast_target(to, tolen) &&
-        !ensure_broadcast_interface(s, port)) {
+    const BroadcastMatchKind match = relevant(port) ? broadcast_match(to, tolen) : kBroadcastNotTarget;
+    if (match != kBroadcastNotTarget &&
+        !ensure_broadcast_interface(s, port, match)) {
         if (sent) *sent = 0;
         return SOCKET_ERROR;
     }
