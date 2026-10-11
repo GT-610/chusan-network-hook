@@ -58,6 +58,8 @@ LARGE_INTEGER g_qpc_start;
 wchar_t g_config_path[MAX_PATH];
 wchar_t g_log_path[MAX_PATH];
 in_addr g_interface_address = {};
+in_addr g_interface_directed_broadcast = {};
+bool g_interface_directed_broadcast_valid;
 ULONG g_interface_index;
 ULONG g_interface_prefix_length;
 char g_interface_name[512];
@@ -462,11 +464,44 @@ void wide_to_utf8(const wchar_t *input, char *output, size_t output_size) {
         (int)output_size, nullptr, nullptr);
 }
 
+// GetIpAddrTable is deliberately used instead of GetAdaptersAddresses to obtain the
+// interface index and netmask. segatools' netenv module hooks GetAdaptersAddresses,
+// GetAdaptersInfo, GetBestRoute and GetIfTable so that the game only ever sees a
+// synthetic "Fake Ethernet" adapter with a hardcoded IfIndex of 1. Those hooks belong
+// to a different DLL, so trusting IfIndex from GetAdaptersAddresses yields an index that
+// does not exist in the real IP stack; IP_UNICAST_IF would then select the wrong adapter
+// (index 1 is normally the loopback pseudo-interface). GetIpAddrTable is not hooked, so
+// it still reports the real per-address index and netmask. On each platform it is
+// available from iphlpapi and requires no extra library.
+bool lookup_real_ipv4_interface(const in_addr &address, ULONG *index, ULONG *mask) {
+    ULONG size = 0;
+    if (GetIpAddrTable(nullptr, &size, FALSE) != ERROR_INSUFFICIENT_BUFFER || size == 0) {
+        return false;
+    }
+    MIB_IPADDRTABLE *table = reinterpret_cast<MIB_IPADDRTABLE *>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size));
+    if (table == nullptr) return false;
+    bool found = false;
+    if (GetIpAddrTable(table, &size, FALSE) == NO_ERROR) {
+        for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+            const MIB_IPADDRROW &row = table->table[i];
+            if (row.dwAddr != address.s_addr) continue;
+            if (index != nullptr) *index = row.dwIndex;
+            if (mask != nullptr) *mask = row.dwMask;
+            found = true;
+            break;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, table);
+    return found;
+}
+
 bool resolve_network_interface() {
     g_network_ready = false;
     g_interface_index = 0;
     g_interface_prefix_length = 0;
     g_interface_name[0] = '\0';
+    g_interface_directed_broadcast_valid = false;
     if (!g_config.network_enable) return true;
     if (InetPtonA(AF_INET, g_config.interface_address, &g_interface_address) != 1) {
         human_line("ERROR", "The configured interfaceAddress '%s' is not a valid IPv4 address.",
@@ -509,10 +544,10 @@ bool resolve_network_interface() {
             const sockaddr_in *address = reinterpret_cast<const sockaddr_in *>(
                 unicast->Address.lpSockaddr);
             if (address->sin_addr.s_addr != g_interface_address.s_addr) continue;
-            g_interface_index = adapter->IfIndex;
-            g_interface_prefix_length = unicast->OnLinkPrefixLength;
             wide_to_utf8(adapter->FriendlyName, g_interface_name, sizeof(g_interface_name));
             g_network_ready = adapter->OperStatus == IfOperStatusUp;
+            g_interface_prefix_length = unicast->OnLinkPrefixLength;
+            g_interface_index = adapter->IfIndex;
             if (!g_network_ready) {
                 human_line("ERROR", "The configured interface %s (%s) is not up.",
                     g_config.interface_address, g_interface_name);
@@ -526,9 +561,43 @@ bool resolve_network_interface() {
             g_config.interface_address);
         return false;
     }
-    human_line("INFO", "Using network interface %s (%s, index %lu, prefix /%lu).",
+
+    // Replace the possibly-virtualized IfIndex with the index the IP stack actually
+    // associates with this address, and use its netmask for the directed broadcast.
+    ULONG real_index = 0;
+    ULONG real_mask = 0;
+    if (lookup_real_ipv4_interface(g_interface_address, &real_index, &real_mask)) {
+        if (real_index != g_interface_index) {
+            human_line("INFO", "Interface index for %s is %lu per the IP stack, but the "
+                "adapter enumeration reported %lu; using %lu.",
+                g_config.interface_address, real_index, g_interface_index, real_index);
+            log_line("INTERFACE", "action=correct_if_index address=%s enumerated=%lu actual=%lu",
+                g_config.interface_address, g_interface_index, real_index);
+        }
+        g_interface_index = real_index;
+        // A host mask is unusable for broadcast derivation, and neither is 0.0.0.0.
+        if (real_mask != 0 && real_mask != 0xFFFFFFFFu) {
+            g_interface_directed_broadcast.s_addr = g_interface_address.s_addr | ~real_mask;
+            g_interface_directed_broadcast_valid = true;
+        }
+    } else {
+        log_line("INTERFACE", "action=lookup_if_index address=%s result=not_found",
+            g_config.interface_address);
+    }
+
+    char directed[96] = {};
+    if (g_interface_directed_broadcast_valid) {
+        const uint32_t ip = ntohl(g_interface_directed_broadcast.s_addr);
+        _snprintf_s(directed, sizeof(directed), _TRUNCATE, "%u.%u.%u.%u",
+            (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
+    } else {
+        strcpy_s(directed, sizeof(directed), "(unknown)");
+    }
+    human_line("INFO", "Using network interface %s (%s, index %lu, prefix /%lu, directed broadcast %s).",
         g_config.interface_address, g_interface_name, g_interface_index,
-        g_interface_prefix_length);
+        g_interface_prefix_length, directed);
+    log_line("INTERFACE", "action=resolve address=%s if_index=%lu prefix_len=%lu directed_broadcast=%s",
+        g_config.interface_address, g_interface_index, g_interface_prefix_length, directed);
     return true;
 }
 
@@ -605,10 +674,15 @@ void log_route_for(const sockaddr *address, int length) {
     }
 }
 
-bool limited_broadcast_target(const sockaddr *address, int length) {
-    return address != nullptr && address->sa_family == AF_INET &&
-        length >= (int)sizeof(sockaddr_in) &&
-        reinterpret_cast<const sockaddr_in *>(address)->sin_addr.s_addr == INADDR_BROADCAST;
+// True when the destination is one of the broadcast addresses this hook pins: the
+// limited broadcast, or the configured interface's own directed subnet broadcast.
+bool broadcast_target(const sockaddr *address, int length) {
+    if (address == nullptr || address->sa_family != AF_INET ||
+        length < (int)sizeof(sockaddr_in)) return false;
+    const uint32_t target = reinterpret_cast<const sockaddr_in *>(address)->sin_addr.s_addr;
+    if (target == INADDR_BROADCAST) return true;
+    return g_interface_directed_broadcast_valid &&
+        target == g_interface_directed_broadcast.s_addr;
 }
 
 bool network_failure(const char *operation, uint16_t port, int error) {
@@ -1022,7 +1096,7 @@ int WSAAPI hook_sendto(SOCKET s, const char *buf, int len, int flags, const sock
         state->route_logged = true;
         log_route_for(to, tolen);
     }
-    if (relevant(port) && limited_broadcast_target(to, tolen) &&
+    if (relevant(port) && broadcast_target(to, tolen) &&
         !ensure_broadcast_interface(s, port)) return SOCKET_ERROR;
     int r = g_next_sendto(s, buf, len, flags, to, tolen); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (state && r > 0) {
@@ -1140,7 +1214,7 @@ int WSAAPI hook_wsasendto(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent,
         state->route_logged = true;
         log_route_for(to, tolen);
     }
-    if (relevant(port) && limited_broadcast_target(to, tolen) &&
+    if (relevant(port) && broadcast_target(to, tolen) &&
         !ensure_broadcast_interface(s, port)) {
         if (sent) *sent = 0;
         return SOCKET_ERROR;
