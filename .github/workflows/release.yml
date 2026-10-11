@@ -28,6 +28,38 @@ jobs:
           .\build\network_hook_smoketest_x86.exe .\build\chusan_network_hook_x86.dll
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Directed-broadcast interface forcing only engages against a real local address,
+      # so re-run with one to keep that path covered in CI. The configured address is
+      # written over the packed ini because build.bat copies the repository one in.
+      - name: Run interface forcing test
+        shell: pwsh
+        run: |
+          $address = (Get-NetIPAddress -AddressFamily IPv4 |
+            Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixLength -lt 32 } |
+            Select-Object -First 1).IPAddress
+          if (-not $address) { throw 'No local IPv4 address available for the interface forcing test.' }
+          Write-Host "Using $address"
+          Set-Content build\network_hook.ini -Encoding ascii -Value @"
+          [network]
+          enable=1
+          interfaceAddress=$address
+          forceLimitedBroadcast=1
+          forceTcpSource=1
+          strict=1
+
+          [lanInstall]
+          enable=1
+
+          [log]
+          enable=0
+          detailed=0
+          writeFile=0
+          "@
+          .\build\network_hook_smoketest_x64.exe .\build\chusan_network_hook_x64.dll $address
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\build\network_hook_smoketest_x86.exe .\build\chusan_network_hook_x86.dll $address
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Assemble release archive
         shell: pwsh
         run: |

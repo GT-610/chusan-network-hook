@@ -38,6 +38,14 @@ build\network_hook_smoketest_x64.exe build\chusan_network_hook_x64.dll
 build\network_hook_smoketest_x86.exe build\chusan_network_hook_x86.dll
 ```
 
+Pass the `interfaceAddress` configured in `network_hook.ini` as a second argument to also exercise broadcast interface forcing against a real adapter:
+
+```bat
+build\network_hook_smoketest_x64.exe build\chusan_network_hook_x64.dll 192.168.139.10
+```
+
+Without that argument the forcing assertions are skipped, because they need a local address to derive a directed broadcast from. Note that `build.bat` copies the repository `network_hook.ini` into `build\`, so edit `build\network_hook.ini` after building when testing a modified configuration.
+
 ## Injection
 
 Load the matching DLL as an additional `capnhook` module:
@@ -85,16 +93,25 @@ All Boolean fields use `0` for disabled and `1` for enabled.
 
 `[network] enable=1` activates interface selection. `interfaceAddress` must be an IPv4 address currently assigned to an active Windows adapter. Using the address instead of an interface index avoids relying on an index that may change after adapter installation or reboot.
 
-`forceLimitedBroadcast=1` applies `IP_UNICAST_IF` before relevant UDP packets are sent to `255.255.255.255`. The destination address and packet payload are not changed. The current scope is:
+`forceLimitedBroadcast=1` applies `IP_UNICAST_IF` before relevant UDP packets are sent to a broadcast address. The destination address and packet payload are not changed. Two kinds of broadcast address are recognized:
+
+- `255.255.255.255`, the IPv4 limited broadcast;
+- the configured interface's own directed subnet broadcast, for example `192.168.139.255` for `192.168.139.18/24`.
+
+Real captures of SDHD 2.50 show the game sending its Party, Setting, and Advertise announcements to the directed subnet broadcast rather than to `255.255.255.255`, so matching only the limited broadcast left this option with no effect. The current scope is:
 
 - UDP 40112, when LAN Install virtualization is disabled;
 - UDP 50200 for Party;
 - UDP 50201 for Setting;
 - UDP 50202 for Advertise.
 
+The directed broadcast is derived from the netmask reported by `GetIpAddrTable`. If the interface uses a point-to-point or host route (`/32`), no directed broadcast exists and only `255.255.255.255` is matched.
+
 `forceTcpSource=1` binds an unbound client socket to `interfaceAddress` before connecting to TCP 40110 or 50200-50202. Connections to `127.0.0.0/8` are left on the loopback interface so the game's local Join Party path can connect to itself. Listener sockets are not restricted and may continue to listen on `0.0.0.0`.
 
 `strict=1` blocks the affected operation when the configured address is missing, the adapter is down, or Windows rejects the interface selection. This prevents a silent fallback to an unintended adapter. With `strict=0`, the hook reports the problem and lets Windows use its normal routing rules.
+
+The interface index used for `IP_UNICAST_IF` is resolved through `GetIpAddrTable`, not through the `IfIndex` returned by `GetAdaptersAddresses`. This matters when `segatools` is also loaded: its `netenv` module hooks `GetAdaptersAddresses`, `GetAdaptersInfo`, `GetBestRoute`, and `GetIfTable` so that the game sees a synthetic `Fake Ethernet` adapter with a hardcoded `IfIndex` of 1. That index does not exist in the real IP stack, so a hook that trusts it would pin traffic to the wrong adapter. `GetIpAddrTable` is not hooked and still reports the real per-address index and netmask. The hook logs a correction line whenever the two disagree.
 
 Interface forcing controls the local socket path. It does not rewrite an IPv4 address already serialized inside a game packet. The host address advertised by the game must still be reachable through the selected interface.
 
