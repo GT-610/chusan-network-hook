@@ -6,12 +6,62 @@
 
 #include <stdio.h>
 
+#include "interface_resolution.h"
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 
 static int fail(const char *step, int error) {
     fprintf(stderr, "FAIL: %s (%d)\n", step, error);
     return 1;
+}
+
+// The interface-index decision table. This is where a future segatools release that
+// virtualizes GetIpAddrTable or GetBestRoute2 would surface, so the behaviour on each
+// combination is pinned down here rather than only being exercised on a live host.
+static int test_interface_decision_table() {
+    struct Case {
+        const char *label;
+        bool table_found;
+        unsigned long table_index;
+        bool route_found;
+        unsigned long route_index;
+        InterfaceResolution expected;
+        unsigned long expected_index;
+    };
+    const Case cases[] = {
+        {"both agree",                 true,  10, true,  10, kInterfaceResolvedFromTable, 10},
+        {"both agree on loopback",     true,   1, true,   1, kInterfaceResolvedFromTable,  1},
+        {"disagree, table wins",       true,  10, true,   1, kInterfaceResolvedFromTable, 10},
+        {"disagree, table wins rev",   true,   7, true,  20, kInterfaceResolvedFromTable,  7},
+        {"table only",                 true,  20, false,  0, kInterfaceResolvedFromTable, 20},
+        {"route only",                 false,  0, true,  20, kInterfaceResolvedFromRoute, 20},
+        {"neither, must refuse",       false,  0, false,  0, kInterfaceUnresolved,         0},
+        {"virtualized index 1 caught", true,  20, true,   1, kInterfaceResolvedFromTable, 20},
+    };
+
+    for (const Case &c : cases) {
+        unsigned long index = 0xDEADBEEFul;
+        const InterfaceResolution got = decide_interface_index(
+            c.table_found, c.table_index, c.route_found, c.route_index, &index);
+        if (got != c.expected || index != c.expected_index) {
+            fprintf(stderr, "FAIL: interface decision '%s': got resolution=%d index=%lu, "
+                "expected resolution=%d index=%lu\n",
+                c.label, (int)got, index, (int)c.expected, c.expected_index);
+            return 1;
+        }
+    }
+
+    // A null out-pointer must not crash, since callers may only want the verdict.
+    const InterfaceResolution null_out = decide_interface_index(true, 5, true, 5, nullptr);
+    if (null_out != kInterfaceResolvedFromTable) {
+        fprintf(stderr, "FAIL: interface decision with null out_index returned %d\n", (int)null_out);
+        return 1;
+    }
+
+    printf("PASS: interface index decision table (%zu cases)\n",
+        sizeof(cases) / sizeof(cases[0]));
+    return 0;
 }
 
 static int test_party_loopback() {
@@ -59,44 +109,59 @@ static DWORD pinned_interface_index(SOCKET s) {
     return index;
 }
 
-// Sends one datagram to a broadcast address and reports the interface index that the
-// hook selected for that socket. Returns -1 on a hard socket failure.
-static long probe_broadcast(const char *label, const char *destination_text, unsigned short port) {
+// Result of one broadcast probe.
+struct ProbeResult {
+    bool socket_failed;   // the probe itself could not run; not a verdict about the hook
+    bool send_failed;     // sendto was rejected, which strict mode does on purpose
+    int send_error;
+    long pinned_index;    // interface index the hook selected, 0 when none was applied
+};
+
+// Sends one datagram to a broadcast address and reports the interface index the hook
+// selected for that socket. A rejected sendto is reported rather than treated as a
+// failure, because strict mode blocking the packet is the expected outcome for an
+// unusable interfaceAddress.
+static ProbeResult probe_broadcast(const char *destination_text, unsigned short port) {
+    ProbeResult result = {};
     SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp == INVALID_SOCKET) {
-        fprintf(stderr, "FAIL: %s socket (%d)\n", label, WSAGetLastError());
-        return -1;
+        result.socket_failed = true;
+        result.send_error = WSAGetLastError();
+        return result;
     }
 
     BOOL enabled = TRUE;
     if (setsockopt(udp, SOL_SOCKET, SO_BROADCAST,
             reinterpret_cast<const char *>(&enabled), sizeof(enabled)) == SOCKET_ERROR) {
-        fprintf(stderr, "FAIL: %s SO_BROADCAST (%d)\n", label, WSAGetLastError());
+        result.socket_failed = true;
+        result.send_error = WSAGetLastError();
         closesocket(udp);
-        return -1;
+        return result;
     }
 
     sockaddr_in destination = {};
     destination.sin_family = AF_INET;
     destination.sin_port = htons(port);
     if (InetPtonA(AF_INET, destination_text, &destination.sin_addr) != 1) {
-        fprintf(stderr, "FAIL: %s InetPtonA (%d)\n", label, WSAGetLastError());
+        result.socket_failed = true;
+        result.send_error = WSAGetLastError();
         closesocket(udp);
-        return -1;
+        return result;
     }
 
     const char payload[] = "broadcast probe";
     const int sent = sendto(udp, payload, (int)sizeof(payload), 0,
         reinterpret_cast<const sockaddr *>(&destination), sizeof(destination));
     if (sent != (int)sizeof(payload)) {
-        fprintf(stderr, "FAIL: %s sendto (%d)\n", label, WSAGetLastError());
+        result.send_failed = true;
+        result.send_error = WSAGetLastError();
         closesocket(udp);
-        return -1;
+        return result;
     }
 
-    const DWORD index = pinned_interface_index(udp);
+    result.pinned_index = static_cast<long>(pinned_interface_index(udp));
     closesocket(udp);
-    return static_cast<long>(index);
+    return result;
 }
 
 // Locates the real interface index and mask for an address using GetIpAddrTable, which
@@ -128,18 +193,29 @@ static bool local_interface_for(const char *address_text, DWORD *index, DWORD *m
 //
 // The game announces to the subnet's directed broadcast (for example 192.168.139.255),
 // not to 255.255.255.255, so both must be recognized. When the optional
-// interfaceAddress argument names a local address and the hook has interface forcing
-// enabled, the directed broadcast must pin that address's real interface index; an
-// unrelated broadcast must never be pinned.
+// interfaceAddress argument names an address the real IP stack owns, both must pin that
+// address's real interface index; an unrelated broadcast must never be pinned.
+//
+// The netenv-virtualization scenario itself is covered deterministically by
+// test_interface_decision_table, because this process does not load segatools.
 static int test_broadcast_interface_forcing(int argc, wchar_t **argv) {
-    const long limited = probe_broadcast("limited broadcast probe", "255.255.255.255", 50200);
-    const long unrelated = probe_broadcast("unrelated broadcast probe", "10.99.99.255", 50202);
-    if (limited < 0 || unrelated < 0) return 1;
+    const ProbeResult unrelated = probe_broadcast("10.99.99.255", 50202);
+    if (unrelated.socket_failed) {
+        return fail("unrelated broadcast probe socket", unrelated.send_error);
+    }
+    if (unrelated.send_failed) {
+        // An unrelated destination is never a forcing target, so strict mode must not
+        // interfere with it either.
+        fprintf(stderr, "FAIL: unrelated broadcast send was rejected (%d); strict mode "
+            "should not apply to a non-broadcast-target destination\n", unrelated.send_error);
+        return 1;
+    }
 
     // Holds for every configuration: forcing is scoped to the configured interface's
     // broadcast address, so an unrelated subnet broadcast is never touched.
-    if (unrelated != 0) {
-        fprintf(stderr, "FAIL: unrelated broadcast was pinned to index %ld\n", unrelated);
+    if (unrelated.pinned_index != 0) {
+        fprintf(stderr, "FAIL: unrelated broadcast was pinned to index %ld\n",
+            unrelated.pinned_index);
         return 1;
     }
 
@@ -154,17 +230,44 @@ static int test_broadcast_interface_forcing(int argc, wchar_t **argv) {
 
     DWORD index = 0;
     DWORD mask = 0;
-    const bool usable = local_interface_for(address_text, &index, &mask) &&
-        mask != 0 && mask != 0xFFFFFFFFu;
+    const bool in_real_stack = local_interface_for(address_text, &index, &mask);
+    const ProbeResult limited = probe_broadcast("255.255.255.255", 50200);
+    if (limited.socket_failed) {
+        return fail("limited broadcast probe socket", limited.send_error);
+    }
 
-    if (!usable) {
-        // strict=1 must refuse to pin anything when the configured address cannot be used.
-        if (limited != 0) {
-            fprintf(stderr, "FAIL: forcing applied for unusable interfaceAddress %s (limited=%ld)\n",
-                address_text, limited);
+    if (!in_real_stack) {
+        // No real interface owns this address, so under strict=1 the hook must refuse to
+        // select an interface and block a forcing target rather than fall back to
+        // Windows routing.
+        if (!limited.send_failed) {
+            fprintf(stderr, "FAIL: expected strict mode to block %s, but sendto succeeded "
+                "with pinned index %ld\n", address_text, limited.pinned_index);
             return 1;
         }
-        printf("PASS: no forcing for unusable interfaceAddress %s\n", address_text);
+        printf("PASS: strict mode blocked the limited broadcast for %s, which no real "
+            "interface owns (%d)\n", address_text, limited.send_error);
+        return 0;
+    }
+
+    if (limited.send_failed) {
+        fprintf(stderr, "FAIL: limited broadcast to a usable interfaceAddress %s was "
+            "rejected (%d)\n", address_text, limited.send_error);
+        return 1;
+    }
+    if (limited.pinned_index != static_cast<long>(index)) {
+        fprintf(stderr, "FAIL: limited broadcast pinned index %ld, expected %lu for %s\n",
+            limited.pinned_index, static_cast<unsigned long>(index), address_text);
+        return 1;
+    }
+
+    // A host mask (/32, as used by some VPN adapters) has no directed broadcast, so there
+    // is nothing further to assert beyond the limited broadcast above.
+    const bool subnet_mask = mask != 0 && mask != 0xFFFFFFFFu && (~mask & 1u) == 0;
+    if (!subnet_mask) {
+        printf("PASS: limited broadcast pinned interface index %lu for %s "
+            "(no directed broadcast for mask 0x%08lX)\n",
+            static_cast<unsigned long>(index), address_text, static_cast<unsigned long>(mask));
         return 0;
     }
 
@@ -177,13 +280,18 @@ static int test_broadcast_interface_forcing(int argc, wchar_t **argv) {
     const unsigned char *bytes = reinterpret_cast<const unsigned char *>(&directed_address.s_addr);
     sprintf_s(directed_text, "%u.%u.%u.%u", bytes[0], bytes[1], bytes[2], bytes[3]);
 
-    const long directed = probe_broadcast("directed broadcast", directed_text, 50201);
-    if (directed < 0) return 1;
-
-    if (limited != static_cast<long>(index) || directed != static_cast<long>(index)) {
-        fprintf(stderr, "FAIL: expected index %lu for limited and directed (%s) broadcast, "
-            "got limited=%ld directed=%ld\n",
-            static_cast<unsigned long>(index), directed_text, limited, directed);
+    const ProbeResult directed = probe_broadcast(directed_text, 50201);
+    if (directed.socket_failed) {
+        return fail("directed broadcast probe socket", directed.send_error);
+    }
+    if (directed.send_failed) {
+        fprintf(stderr, "FAIL: directed broadcast %s was rejected (%d)\n",
+            directed_text, directed.send_error);
+        return 1;
+    }
+    if (directed.pinned_index != static_cast<long>(index)) {
+        fprintf(stderr, "FAIL: directed broadcast %s pinned index %ld, expected %lu\n",
+            directed_text, directed.pinned_index, static_cast<unsigned long>(index));
         return 1;
     }
 
@@ -203,6 +311,7 @@ int wmain(int argc, wchar_t **argv) {
     if (hook == nullptr) return fail("LoadLibraryW", GetLastError());
     Sleep(300);
 
+    if (test_interface_decision_table() != 0) return 1;
     if (test_party_loopback() != 0) return 1;
     if (test_broadcast_interface_forcing(argc, argv) != 0) return 1;
 

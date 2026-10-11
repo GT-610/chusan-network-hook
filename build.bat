@@ -17,13 +17,13 @@ if not exist "%OUT%" mkdir "%OUT%"
 
 call "%VSROOT%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++17 /O2 /MT /W4 /DWIN32 /D_WINDOWS /D_USRDLL /LD ^
+cl /nologo /std:c++17 /O2 /MT /W4 /I"%ROOT%src" /DWIN32 /D_WINDOWS /D_USRDLL /LD ^
   "%ROOT%src\network_hook.cpp" ^
   /Fo"%OUT%\network_hook_x64.obj" ^
   /link /MACHINE:X64 /DYNAMICBASE /NXCOMPAT /OUT:"%OUT%\chusan_network_hook_x64.dll" ^
   /PDB:"%OUT%\chusan_network_hook_x64.pdb" ws2_32.lib iphlpapi.lib bcrypt.lib
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++17 /O2 /MT /W4 /DWIN32 /D_WINDOWS ^
+cl /nologo /std:c++17 /O2 /MT /W4 /I"%ROOT%src" /DWIN32 /D_WINDOWS ^
   "%ROOT%tests\smoketest.cpp" ^
   /Fo"%OUT%\network_hook_smoketest_x64.obj" ^
   /link /MACHINE:X64 /SUBSYSTEM:CONSOLE /OUT:"%OUT%\network_hook_smoketest_x64.exe" ws2_32.lib
@@ -31,12 +31,12 @@ if errorlevel 1 exit /b 1
 
 call "%VSROOT%\Common7\Tools\VsDevCmd.bat" -arch=x86 -host_arch=x64 >nul
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++17 /O2 /MT /W4 /DWIN32 /D_WINDOWS ^
+cl /nologo /std:c++17 /O2 /MT /W4 /I"%ROOT%src" /DWIN32 /D_WINDOWS ^
   "%ROOT%tests\smoketest.cpp" ^
   /Fo"%OUT%\network_hook_smoketest_x86.obj" ^
   /link /MACHINE:X86 /SUBSYSTEM:CONSOLE /OUT:"%OUT%\network_hook_smoketest_x86.exe" ws2_32.lib
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++17 /O2 /MT /W4 /DWIN32 /D_WINDOWS /D_USRDLL /LD ^
+cl /nologo /std:c++17 /O2 /MT /W4 /I"%ROOT%src" /DWIN32 /D_WINDOWS /D_USRDLL /LD ^
   "%ROOT%src\network_hook.cpp" ^
   /Fo"%OUT%\network_hook_x86.obj" ^
   /link /MACHINE:X86 /DYNAMICBASE /NXCOMPAT /OUT:"%OUT%\chusan_network_hook_x86.dll" ^
