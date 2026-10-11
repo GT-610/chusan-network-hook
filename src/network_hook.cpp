@@ -11,6 +11,8 @@
 #include <stdarg.h>
 #include <string.h>
 
+#include "interface_resolution.h"
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -464,15 +466,27 @@ void wide_to_utf8(const wchar_t *input, char *output, size_t output_size) {
         (int)output_size, nullptr, nullptr);
 }
 
-// GetIpAddrTable is deliberately used instead of GetAdaptersAddresses to obtain the
-// interface index and netmask. segatools' netenv module hooks GetAdaptersAddresses,
-// GetAdaptersInfo, GetBestRoute and GetIfTable so that the game only ever sees a
-// synthetic "Fake Ethernet" adapter with a hardcoded IfIndex of 1. Those hooks belong
-// to a different DLL, so trusting IfIndex from GetAdaptersAddresses yields an index that
-// does not exist in the real IP stack; IP_UNICAST_IF would then select the wrong adapter
-// (index 1 is normally the loopback pseudo-interface). GetIpAddrTable is not hooked, so
-// it still reports the real per-address index and netmask. On each platform it is
-// available from iphlpapi and requires no extra library.
+// The interface index and netmask cannot be taken from GetAdaptersAddresses. segatools'
+// netenv module hooks GetAdaptersAddresses, GetAdaptersInfo, GetBestRoute and GetIfTable
+// so that the game only ever sees a synthetic "Fake Ethernet" adapter with a hardcoded
+// IfIndex of 1. Those hooks belong to a different DLL, so trusting IfIndex from
+// GetAdaptersAddresses yields an index that does not exist in the real IP stack;
+// IP_UNICAST_IF would then select the wrong adapter (index 1 is normally the loopback
+// pseudo-interface).
+//
+// Three APIs netenv leaves alone are consulted instead, and their answers are
+// cross-checked. Any one of them may be virtualized in a future segatools release, so
+// disagreement is reported loudly rather than silently trusted:
+//
+//   GetIpAddrTable  - which interface owns the configured address, and its netmask
+//   GetBestRoute2   - which interface the stack would egress for that broadcast
+//   GetIfEntry      - whether the chosen index exists and is operational
+//
+// netenv hooks GetIfTable (the table form) but not GetIfEntry (the single-row form), and
+// it hooks GetBestRoute but not GetBestRoute2. All three are available from iphlpapi and
+// require no extra library.
+
+// Which interface owns the configured address, and that address's netmask.
 bool lookup_real_ipv4_interface(const in_addr &address, ULONG *index, ULONG *mask) {
     ULONG size = 0;
     if (GetIpAddrTable(nullptr, &size, FALSE) != ERROR_INSUFFICIENT_BUFFER || size == 0) {
@@ -494,6 +508,39 @@ bool lookup_real_ipv4_interface(const in_addr &address, ULONG *index, ULONG *mas
     }
     HeapFree(GetProcessHeap(), 0, table);
     return found;
+}
+
+// Which interface the stack would egress when sending from the configured address to the
+// given broadcast. Fails when the source address is not present on this host, which is
+// itself a useful signal that the configured address is unusable.
+bool lookup_route_interface_index(const in_addr &source, const in_addr &destination,
+                                  ULONG *index) {
+    SOCKADDR_INET source_address = {};
+    source_address.Ipv4.sin_family = AF_INET;
+    source_address.Ipv4.sin_addr = source;
+    SOCKADDR_INET destination_address = {};
+    destination_address.Ipv4.sin_family = AF_INET;
+    destination_address.Ipv4.sin_addr = destination;
+    SOCKADDR_INET best_source = {};
+    MIB_IPFORWARD_ROW2 route = {};
+    if (GetBestRoute2(nullptr, 0, &source_address, &destination_address,
+            0, &route, &best_source) != NO_ERROR) {
+        return false;
+    }
+    if (index != nullptr) *index = route.InterfaceIndex;
+    return true;
+}
+
+// Confirms that an index exists in the real IP stack and reports its type and operational
+// state. dwType lets the caller reject the loopback adapter, which is what a fully
+// virtualized iphlpapi would fall back to.
+bool interface_operational(ULONG index, ULONG *oper_status, ULONG *if_type) {
+    MIB_IFROW row = {};
+    row.dwIndex = index;
+    if (GetIfEntry(&row) != NO_ERROR) return false;
+    if (oper_status != nullptr) *oper_status = row.dwOperStatus;
+    if (if_type != nullptr) *if_type = row.dwType;
+    return true;
 }
 
 bool resolve_network_interface() {
@@ -562,27 +609,131 @@ bool resolve_network_interface() {
         return false;
     }
 
-    // Replace the possibly-virtualized IfIndex with the index the IP stack actually
-    // associates with this address, and use its netmask for the directed broadcast.
-    ULONG real_index = 0;
-    ULONG real_mask = 0;
-    if (lookup_real_ipv4_interface(g_interface_address, &real_index, &real_mask)) {
-        if (real_index != g_interface_index) {
-            human_line("INFO", "Interface index for %s is %lu per the IP stack, but the "
-                "adapter enumeration reported %lu; using %lu.",
-                g_config.interface_address, real_index, g_interface_index, real_index);
-            log_line("INTERFACE", "action=correct_if_index address=%s enumerated=%lu actual=%lu",
-                g_config.interface_address, g_interface_index, real_index);
-        }
-        g_interface_index = real_index;
-        // A host mask is unusable for broadcast derivation, and neither is 0.0.0.0.
-        if (real_mask != 0 && real_mask != 0xFFFFFFFFu) {
-            g_interface_directed_broadcast.s_addr = g_interface_address.s_addr | ~real_mask;
-            g_interface_directed_broadcast_valid = true;
-        }
-    } else {
-        log_line("INTERFACE", "action=lookup_if_index address=%s result=not_found",
+    // Replace the possibly-virtualized IfIndex with the index the real IP stack
+    // associates with this address, cross-checking two independent APIs so that a
+    // future segatools release cannot silently break interface selection again.
+    ULONG table_index = 0;
+    ULONG table_mask = 0;
+    const bool table_found = lookup_real_ipv4_interface(g_interface_address, &table_index, &table_mask);
+
+    // GetBestRoute2 with the source pinned to the configured address asks the stack
+    // which interface it would egress from for that address. A limited broadcast is
+    // used as the destination because egress selection depends on the source address,
+    // and the directed broadcast cannot be derived until the mask above is known.
+    in_addr probe_destination = {};
+    probe_destination.s_addr = INADDR_BROADCAST;
+    ULONG route_index = 0;
+    const bool route_found = lookup_route_interface_index(
+        g_interface_address, probe_destination, &route_index);
+
+    ULONG resolved_index = 0;
+    const InterfaceResolution resolution = decide_interface_index(
+        table_found, table_index, route_found, route_index, &resolved_index);
+    if (resolution == kInterfaceUnresolved) {
+        human_line("ERROR", "No real IP stack entry describes %s. Refusing to pin any "
+            "socket, because the interface index would come from a virtualized view.",
             g_config.interface_address);
+        log_line("INTERFACE", "action=resolve_failed address=%s reason=no_real_source",
+            g_config.interface_address);
+        // Clear the flag as well: callers use g_network_ready, not this return value, to
+        // decide whether pinning is safe.
+        g_network_ready = false;
+        return false;
+    }
+
+    if (table_found && route_found) {
+        if (table_index != route_index) {
+            // Both APIs are unhooked, so this means something unusual. Report it loudly;
+            // decide_interface_index prefers the address-ownership answer, which is what
+            // interfaceAddress is defined to select.
+            human_line("ERROR", "Interface index disagreement for %s: GetIpAddrTable "
+                "reports %lu, GetBestRoute2 reports %lu. Using %lu.",
+                g_config.interface_address, table_index, route_index, resolved_index);
+            log_line("INTERFACE", "action=index_mismatch address=%s get_ip_addr_table=%lu "
+                "get_best_route2=%lu selected=%lu",
+                g_config.interface_address, table_index, route_index, resolved_index);
+        }
+        log_line("INTERFACE", "action=cross_check address=%s get_ip_addr_table=%lu "
+            "get_best_route2=%lu agreement=%s",
+            g_config.interface_address, table_index, route_index,
+            table_index == route_index ? "yes" : "no");
+    } else if (table_found) {
+        human_line("INFO", "GetBestRoute2 could not corroborate the interface index for %s; "
+            "using the GetIpAddrTable answer %lu.",
+            g_config.interface_address, table_index);
+        log_line("INTERFACE", "action=cross_check address=%s get_ip_addr_table=%lu "
+            "get_best_route2=unavailable", g_config.interface_address, table_index);
+    } else {
+        human_line("INFO", "GetIpAddrTable has no entry for %s; using the GetBestRoute2 "
+            "answer %lu.", g_config.interface_address, route_index);
+        log_line("INTERFACE", "action=cross_check address=%s get_ip_addr_table=unavailable "
+            "get_best_route2=%lu", g_config.interface_address, route_index);
+    }
+
+    // Confirm the chosen index exists in the real stack. GetIfEntry is the single-row
+    // form of the GetIfTable call that netenv virtualizes, and netenv does not hook it.
+    ULONG oper_status = 0;
+    ULONG if_type = 0;
+    if (!interface_operational(resolved_index, &oper_status, &if_type)) {
+        human_line("ERROR", "Interface index %lu for %s does not exist in the IP stack.",
+            resolved_index, g_config.interface_address);
+        log_line("INTERFACE", "action=resolve_failed address=%s if_index=%lu reason=index_missing",
+            g_config.interface_address, resolved_index);
+        // Clear the flag as well: callers use g_network_ready, not this return value, to
+        // decide whether pinning is safe.
+        g_network_ready = false;
+        return false;
+    }
+    // A configurable interfaceAddress resolving to the loopback adapter means every source
+    // above was virtualized at once, since the loopback is real and always present. The
+    // netenv-supplied index is 1, and interface index 1 is the loopback on Windows.
+    if (if_type == IF_TYPE_SOFTWARE_LOOPBACK &&
+        g_interface_address.s_addr != htonl(INADDR_LOOPBACK)) {
+        human_line("ERROR", "%s resolved to the loopback adapter (index %lu), which means "
+            "the interface lookup is being virtualized. Refusing to pin any socket.",
+            g_config.interface_address, resolved_index);
+        log_line("INTERFACE", "action=resolve_failed address=%s if_index=%lu "
+            "reason=loopback_for_non_loopback_address type=%lu",
+            g_config.interface_address, resolved_index, if_type);
+        g_network_ready = false;
+        return false;
+    }
+    log_line("INTERFACE", "action=validate address=%s if_index=%lu type=%lu "
+        "operational_status=%lu result=ok",
+        g_config.interface_address, resolved_index, if_type, oper_status);
+
+    if (resolved_index != g_interface_index) {
+        human_line("INFO", "Interface index for %s is %lu per the IP stack, but the "
+            "adapter enumeration reported %lu; using %lu.",
+            g_config.interface_address, resolved_index, g_interface_index, resolved_index);
+        log_line("INTERFACE", "action=correct_if_index address=%s enumerated=%lu actual=%lu",
+            g_config.interface_address, g_interface_index, resolved_index);
+    }
+    g_interface_index = resolved_index;
+
+    // The reported prefix length also comes from the virtualized enumeration, where
+    // netenv pins it to 24. Derive it from the real mask when one is available so the
+    // logged prefix and the directed broadcast agree with each other.
+    if (table_found && table_mask != 0 && table_mask != 0xFFFFFFFFu) {
+        // dwMask is documented as network byte order, so convert before counting
+        // leading one bits from the most significant end.
+        ULONG host_mask = ntohl(table_mask);
+        ULONG prefix = 0;
+        for (ULONG bit = 0x80000000u; bit != 0 && (host_mask & bit) != 0; bit >>= 1) ++prefix;
+        if (prefix != g_interface_prefix_length) {
+            log_line("INTERFACE", "action=correct_prefix address=%s enumerated=%lu actual=%lu",
+                g_config.interface_address, g_interface_prefix_length, prefix);
+        }
+        g_interface_prefix_length = prefix;
+        // The address and mask are both still in network byte order, so the OR aligns
+        // without further conversion.
+        g_interface_directed_broadcast.s_addr = g_interface_address.s_addr | ~table_mask;
+        g_interface_directed_broadcast_valid = true;
+    } else {
+        // A host mask (or none at all) yields no directed broadcast; only the limited
+        // broadcast stays reachable until a real mask can be determined.
+        log_line("INTERFACE", "action=directed_broadcast address=%s result=unavailable mask=%lu",
+            g_config.interface_address, table_mask);
     }
 
     char directed[96] = {};
