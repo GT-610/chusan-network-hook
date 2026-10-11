@@ -94,10 +94,13 @@ All Boolean fields use `0` for disabled and `1` for enabled.
 
 `[network] enable=1` activates interface selection. `interfaceAddress` must be an IPv4 address currently assigned to an active Windows adapter. Using the address instead of an interface index avoids relying on an index that may change after adapter installation or reboot.
 
-`forceLimitedBroadcast=1` applies `IP_UNICAST_IF` before relevant UDP packets are sent to a broadcast address. The destination address and packet payload are not changed. Two kinds of broadcast address are recognized:
+`forceLimitedBroadcast=1` applies `IP_UNICAST_IF` before relevant UDP packets are sent to a broadcast address. The destination address and packet payload are not changed. Three kinds of broadcast address are recognized:
 
 - `255.255.255.255`, the IPv4 limited broadcast;
-- the configured interface's own directed subnet broadcast, for example `192.168.139.255` for `192.168.139.18/24`.
+- the configured interface's own directed subnet broadcast, for example `192.168.139.255` for `192.168.139.18/24`;
+- `interfaceAddress` with its last octet forced to `255`, for example `172.16.10.255` for `172.16.10.235`.
+
+The third form exists because `netenv` reports its synthetic adapter with a hardcoded `/24` prefix (`OnLinkPrefixLength = 24` in `netenv.c`), so the game computes a `/24` broadcast regardless of the interface's real mask. On an interface whose real mask is wider than `/24` that address is not the same as the interface's own subnet broadcast, and matching only the subnet broadcast would silently stop pinning traffic.
 
 Real captures of SDHD 2.50 show the game sending its Party, Setting, and Advertise announcements to the directed subnet broadcast rather than to `255.255.255.255`, so matching only the limited broadcast left this option with no effect. The current scope is:
 
@@ -106,7 +109,7 @@ Real captures of SDHD 2.50 show the game sending its Party, Setting, and Adverti
 - UDP 50201 for Setting;
 - UDP 50202 for Advertise.
 
-The directed broadcast is derived from the netmask reported by `GetIpAddrTable`. If the interface uses a point-to-point or host route (`/32`), no directed broadcast exists and only `255.255.255.255` is matched.
+The directed broadcast is derived from the netmask reported by `GetIpAddrTable`. If the interface uses a point-to-point or host route (`/32`), no directed broadcast exists; the limited and `/24` forms are still matched.
 
 `forceTcpSource=1` binds an unbound client socket to `interfaceAddress` before connecting to TCP 40110 or 50200-50202. Connections to `127.0.0.0/8` are left on the loopback interface so the game's local Join Party path can connect to itself. Listener sockets are not restricted and may continue to listen on `0.0.0.0`.
 

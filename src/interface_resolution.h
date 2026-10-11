@@ -43,4 +43,20 @@ inline InterfaceResolution decide_interface_index(
     return kInterfaceUnresolved;
 }
 
+// The directed broadcast the game computes through netenv's synthetic adapter.
+//
+// netenv hardcodes OnLinkPrefixLength = 24 (netenv.c, hook_GetAdaptersAddresses), so the
+// game broadcasts to subnet | 0xFF no matter what the real interface's mask is. On an
+// interface whose real mask is wider than /24 - a /16 link-local address, for example -
+// that is NOT the same address as the interface's own subnet broadcast, so broadcast
+// matching has to accept both or it silently stops pinning traffic.
+//
+// The argument and result are in_addr::s_addr, i.e. network byte order. On a little
+// endian host the value therefore reads as 0x128BA8C0 for 192.168.139.18, whose last
+// octet (0x12) is the most significant byte. Masking the low three bytes and forcing the
+// top byte to 0xFF yields 192.168.139.255 as 0xFF8BA8C0.
+inline unsigned long netenv_style_broadcast(unsigned long address_s_addr) {
+    return (address_s_addr & 0x00FFFFFFul) | 0xFF000000ul;
+}
+
 #endif // CHUSAN_NETWORK_HOOK_INTERFACE_RESOLUTION_H

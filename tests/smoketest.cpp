@@ -5,6 +5,7 @@
 #include <iphlpapi.h>
 
 #include <stdio.h>
+#include <string.h>
 
 #include "interface_resolution.h"
 
@@ -60,6 +61,50 @@ static int test_interface_decision_table() {
     }
 
     printf("PASS: interface index decision table (%zu cases)\n",
+        sizeof(cases) / sizeof(cases[0]));
+    return 0;
+}
+
+// The /24-form broadcast the game computes through netenv. This is what the observed
+// "Netenv: sendTo broadcast 192.168.139.255 -> 255.255.255.255" line reports as the
+// original destination, so a wrong answer here silently disables interface forcing.
+static int test_netenv_style_broadcast() {
+    struct Case {
+        const char *address;
+        const char *expected;
+    };
+    const Case cases[] = {
+        {"192.168.139.18", "192.168.139.255"},   // the address in the captured logs
+        {"172.16.10.235",  "172.16.10.255"},     // real mask is /18, still a /24 target
+        {"169.254.158.1",  "169.254.158.255"},   // real mask is /16, still a /24 target
+        {"10.0.0.1",       "10.0.0.255"},
+    };
+
+    for (const Case &c : cases) {
+        in_addr address = {};
+        if (InetPtonA(AF_INET, c.address, &address) != 1) {
+            fprintf(stderr, "FAIL: InetPtonA('%s') failed\n", c.address);
+            return 1;
+        }
+        in_addr expected = {};
+        if (InetPtonA(AF_INET, c.expected, &expected) != 1) {
+            fprintf(stderr, "FAIL: InetPtonA('%s') failed\n", c.expected);
+            return 1;
+        }
+
+        const unsigned long got = netenv_style_broadcast(address.s_addr);
+        if (got != expected.s_addr) {
+            in_addr got_address = {};
+            got_address.s_addr = got;
+            char got_text[INET_ADDRSTRLEN] = {};
+            InetNtopA(AF_INET, &got_address, got_text, sizeof(got_text));
+            fprintf(stderr, "FAIL: netenv broadcast for %s is %s, expected %s\n",
+                c.address, got_text, c.expected);
+            return 1;
+        }
+    }
+
+    printf("PASS: netenv /24 broadcast derivation (%zu cases)\n",
         sizeof(cases) / sizeof(cases[0]));
     return 0;
 }
@@ -295,6 +340,42 @@ static int test_broadcast_interface_forcing(int argc, wchar_t **argv) {
         return 1;
     }
 
+    // The game does not compute this itself: segatools' netenv reports the synthetic
+    // adapter as /24, so the game broadcasts to subnet | 0xFF. On a mask wider than /24
+    // that is a different address from the one derived above, and the captured netenv log
+    // ("sendTo broadcast 192.168.139.255 -> 255.255.255.255") shows it is the address
+    // actually used. It must be pinned too, or forcing silently stops working.
+    //
+    // Built from the first three octets here rather than by calling the hook's own helper,
+    // so the expectation does not come from the code under test.
+    const unsigned char *address_bytes =
+        reinterpret_cast<const unsigned char *>(&configured.s_addr);
+    char netenv_text[64] = {};
+    sprintf_s(netenv_text, "%u.%u.%u.255", address_bytes[0], address_bytes[1], address_bytes[2]);
+
+    if (strcmp(netenv_text, directed_text) != 0) {
+        const ProbeResult netenv_style = probe_broadcast(netenv_text, 50202);
+        if (netenv_style.socket_failed) {
+            return fail("netenv-style broadcast probe socket", netenv_style.send_error);
+        }
+        if (netenv_style.send_failed) {
+            fprintf(stderr, "FAIL: netenv-style broadcast %s was rejected (%d)\n",
+                netenv_text, netenv_style.send_error);
+            return 1;
+        }
+        if (netenv_style.pinned_index != static_cast<long>(index)) {
+            fprintf(stderr, "FAIL: netenv-style broadcast %s pinned index %ld, expected %lu "
+                "(mask 0x%08lX is wider than /24)\n",
+                netenv_text, netenv_style.pinned_index, static_cast<unsigned long>(index),
+                static_cast<unsigned long>(mask));
+            return 1;
+        }
+        printf("PASS: directed broadcast %s and netenv-style /24 broadcast %s both pinned "
+            "interface index %lu\n", directed_text, netenv_text,
+            static_cast<unsigned long>(index));
+        return 0;
+    }
+
     printf("PASS: limited broadcast and directed broadcast %s both pinned interface index %lu\n",
         directed_text, static_cast<unsigned long>(index));
     return 0;
@@ -312,6 +393,7 @@ int wmain(int argc, wchar_t **argv) {
     Sleep(300);
 
     if (test_interface_decision_table() != 0) return 1;
+    if (test_netenv_style_broadcast() != 0) return 1;
     if (test_party_loopback() != 0) return 1;
     if (test_broadcast_interface_forcing(argc, argv) != 0) return 1;
 

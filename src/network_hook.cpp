@@ -826,14 +826,17 @@ void log_route_for(const sockaddr *address, int length) {
 }
 
 // True when the destination is one of the broadcast addresses this hook pins: the
-// limited broadcast, or the configured interface's own directed subnet broadcast.
+// limited broadcast, the configured interface's own directed subnet broadcast, or the
+// /24-form directed broadcast the game actually computes through netenv.
 bool broadcast_target(const sockaddr *address, int length) {
     if (address == nullptr || address->sa_family != AF_INET ||
         length < (int)sizeof(sockaddr_in)) return false;
     const uint32_t target = reinterpret_cast<const sockaddr_in *>(address)->sin_addr.s_addr;
     if (target == INADDR_BROADCAST) return true;
-    return g_interface_directed_broadcast_valid &&
-        target == g_interface_directed_broadcast.s_addr;
+    if (g_interface_directed_broadcast_valid &&
+        target == g_interface_directed_broadcast.s_addr) return true;
+    return g_network_ready &&
+        target == netenv_style_broadcast(g_interface_address.s_addr);
 }
 
 bool network_failure(const char *operation, uint16_t port, int error) {
