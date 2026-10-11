@@ -38,13 +38,14 @@ build\network_hook_smoketest_x64.exe build\chusan_network_hook_x64.dll
 build\network_hook_smoketest_x86.exe build\chusan_network_hook_x86.dll
 ```
 
-Pass the `interfaceAddress` configured in `network_hook.ini` as a second argument to also exercise broadcast interface forcing against a real adapter:
+Pass the `interfaceAddress` configured in `network_hook.ini` as a second argument to also exercise broadcast interface forcing against a real adapter, and to cover the strict-mode refusal path with an address no interface owns:
 
 ```bat
 build\network_hook_smoketest_x64.exe build\chusan_network_hook_x64.dll 192.168.139.10
+build\network_hook_smoketest_x64.exe build\chusan_network_hook_x64.dll 203.0.113.7
 ```
 
-Without that argument the forcing assertions are skipped, because they need a local address to derive a directed broadcast from. Note that `build.bat` copies the repository `network_hook.ini` into `build\`, so edit `build\network_hook.ini` after building when testing a modified configuration.
+Without that argument the forcing assertions are skipped, because they need a local address to derive a directed broadcast from. The interface-index decision table is always tested, and it is the part that covers the `netenv` virtualization case without needing `netenv` loaded. Note that `build.bat` copies the repository `network_hook.ini` into `build\`, so edit `build\network_hook.ini` after building when testing a modified configuration.
 
 ## Injection
 
@@ -111,7 +112,24 @@ The directed broadcast is derived from the netmask reported by `GetIpAddrTable`.
 
 `strict=1` blocks the affected operation when the configured address is missing, the adapter is down, or Windows rejects the interface selection. This prevents a silent fallback to an unintended adapter. With `strict=0`, the hook reports the problem and lets Windows use its normal routing rules.
 
-The interface index used for `IP_UNICAST_IF` is resolved through `GetIpAddrTable`, not through the `IfIndex` returned by `GetAdaptersAddresses`. This matters when `segatools` is also loaded: its `netenv` module hooks `GetAdaptersAddresses`, `GetAdaptersInfo`, `GetBestRoute`, and `GetIfTable` so that the game sees a synthetic `Fake Ethernet` adapter with a hardcoded `IfIndex` of 1. That index does not exist in the real IP stack, so a hook that trusts it would pin traffic to the wrong adapter. `GetIpAddrTable` is not hooked and still reports the real per-address index and netmask. The hook logs a correction line whenever the two disagree.
+The interface index used for `IP_UNICAST_IF` is never taken from `GetAdaptersAddresses`. This matters when `segatools` is also loaded: its `netenv` module hooks `GetAdaptersAddresses`, `GetAdaptersInfo`, `GetBestRoute`, and `GetIfTable` so that the game sees a synthetic `Fake Ethernet` adapter with a hardcoded `IfIndex` of 1. That index does not exist in the real IP stack, so a hook that trusted it would pin traffic to the wrong adapter.
+
+Three APIs that `netenv` leaves alone are consulted instead, and their answers are cross-checked:
+
+| API | Answers | `netenv` hooks it? |
+| --- | --- | --- |
+| `GetIpAddrTable` | which interface owns `interfaceAddress`, and its netmask | no |
+| `GetBestRoute2` | which interface the stack would egress from for a broadcast sent from `interfaceAddress` | no (it hooks the older `GetBestRoute`) |
+| `GetIfEntry` | whether the chosen index exists in the real stack, and its operational state | no (it hooks the table form, `GetIfTable`) |
+
+Because any of these could be virtualized by a future `segatools` release, disagreement is reported rather than silently trusted:
+
+- if `GetIpAddrTable` and `GetBestRoute2` both answer but disagree, the log records `action=index_mismatch` and the `GetIpAddrTable` answer wins, since `interfaceAddress` selects the interface that owns the address;
+- if only one answers, the log records `action=cross_check` with the other marked `unavailable` and the sole answer is used;
+- if neither answers, interface selection fails and no socket is pinned, rather than falling back to a virtualized index;
+- if the resolved index turns out to be the loopback adapter while `interfaceAddress` is not a loopback address, selection fails as well. Index 1 is the loopback on Windows, so this catches the case where all three APIs are virtualized to the netenv default at once and would otherwise agree with each other.
+
+A successful resolution logs `action=cross_check ... agreement=yes` followed by `action=validate`. The reported prefix length is also re-derived from the real netmask, since `netenv` pins the virtualized adapter to `/24`; a mismatch is logged as `action=correct_prefix`.
 
 Interface forcing controls the local socket path. It does not rewrite an IPv4 address already serialized inside a game packet. The host address advertised by the game must still be reachable through the selected interface.
 

@@ -28,8 +28,9 @@ jobs:
           .\build\network_hook_smoketest_x86.exe .\build\chusan_network_hook_x86.dll
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # Directed-broadcast interface forcing only engages against a real local address,
-      # so re-run with one to keep that path covered in CI. The configured address is
+      # Broadcast interface forcing only engages against a real local address, so re-run
+      # with one to keep that path covered in CI. A second run with an address no real
+      # interface owns covers the strict-mode refusal path. The configured address is
       # written over the packed ini because build.bat copies the repository one in.
       - name: Run interface forcing test
         shell: pwsh
@@ -39,10 +40,12 @@ jobs:
             Select-Object -First 1).IPAddress
           if (-not $address) { throw 'No local IPv4 address available for the interface forcing test.' }
           Write-Host "Using $address"
-          Set-Content build\network_hook.ini -Encoding ascii -Value @"
+
+          function Set-TestInterface([string]$configured) {
+            Set-Content build\network_hook.ini -Encoding ascii -Value @"
           [network]
           enable=1
-          interfaceAddress=$address
+          interfaceAddress=$configured
           forceLimitedBroadcast=1
           forceTcpSource=1
           strict=1
@@ -55,9 +58,19 @@ jobs:
           detailed=0
           writeFile=0
           "@
+          }
+
+          Set-TestInterface $address
           .\build\network_hook_smoketest_x64.exe .\build\chusan_network_hook_x64.dll $address
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\build\network_hook_smoketest_x86.exe .\build\chusan_network_hook_x86.dll $address
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # 203.0.113.0/24 is reserved for documentation, so no real interface owns it.
+          Set-TestInterface '203.0.113.7'
+          .\build\network_hook_smoketest_x64.exe .\build\chusan_network_hook_x64.dll 203.0.113.7
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\build\network_hook_smoketest_x86.exe .\build\chusan_network_hook_x86.dll 203.0.113.7
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Assemble release archive
