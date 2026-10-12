@@ -1,2 +1,6 @@
 build/
 *.user
+
+# Per-commit bisect DLLs and object files. Reproducible with bisect_build.bat,
+# which rebuilds one x86+x64 pair per commit in v0.1.0..HEAD.
+artifacts/
