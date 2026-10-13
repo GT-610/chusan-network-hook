@@ -63,12 +63,42 @@ The PE **Rich header** records which toolset contributed which object files. Dec
 
 So the **C/C++ compiler is the same** (35207 / 35228, i.e. `cl.exe` 19.44.35228, matching
 the local `Microsoft (R) C/C++ Optimizing Compiler 19.44.35228`). What differs is the
-**static CRT library**, whose objects were built by an older toolset: 33145 corresponds to
-the v142/14.28 generation, 27412 to 14.26.
+**static CRT library**.
 
-The size delta is 16384 bytes for x86 and 18944 for x64, consistent with a different (and
-slightly newer) static CRT plus the extra `Fls*`/`EncodePointer`/`InitializeCriticalSectionEx`
-imports that the 33145 CRT pulls in.
+### 3.1 Which group is the CRT, verified locally
+
+A one-line DLL built here with each option identifies the roles:
+
+| build | `27412` group | `35207` group |
+|---|---|---|
+| `/MT` (static CRT) | present | present |
+| `/MD` (dynamic CRT) | **absent** | present |
+
+The `27412` group appears only under `/MT`, and `/MD` replaces it with
+`0x93 / 30729` (`Utc1900_C`, the dynamic UCRT). That makes the `27412`/`33145` entries the
+static CRT (`libucrt.lib` + `libvcruntime.lib` + `libcmt.lib`) and the `35207`/`35228`
+entries the compiler itself. The hook DLLs carry both groups, which is consistent.
+
+### 3.2 Why the CRT can differ from the compiler
+
+Microsoft versions the static CRT separately from the compiler. From the CRT library
+documentation: *"The vcruntime library version needs to match the version of the compiler
+you're using"*, and *"Every executable image (EXE or DLL) can have its own statically
+linked CRT... The version of the CRT statically included in or dynamically loaded by a
+particular image depends on the version of the tools and libraries it was built with."*
+A single process may therefore load several CRTs, *"each with its own CRT... may use a
+different allocator, may have different internal structure layouts"*.
+
+The official compiler table lists `_MSC_VER` and the `14.xx` toolset version (14.26 =
+VS2019 16.6, 14.28 = VS2019 16.8/16.9, 14.44 = VS2022 17.14). **Those numbers are not the
+Rich header build numbers.** 35207/35228 match the local `cl.exe` 19.44.35228, so the
+compiler entries are identifiable; **27412 and 33145 are only known to be two different
+builds of the static CRT, and which MSVC versions produced them is not established here.**
+This host has only toolset 14.44 installed, so it cannot be determined by building.
+
+The size delta is 16384 bytes for x86 and 18944 for x64, consistent with a different static
+CRT plus the extra `Fls*`/`EncodePointer`/`InitializeCriticalSectionEx` imports that the
+33145 CRT pulls in.
 
 Consequence: the CI runner image carries a **mixed toolchain** — a current compiler with
 an older static CRT. `build.bat` selects whatever `VsDevCmd` resolves, so the CRT version
