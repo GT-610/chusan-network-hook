@@ -4,9 +4,17 @@
 > still stand. The causal claims in §1 and §3 are **withdrawn** — the comparisons below
 > varied the code and the toolchain at once, so they support no causal conclusion. See
 > [`lessons.md`](lessons.md) for the full list and
-> [`setting-bind-investigation.md`](setting-bind-investigation.md) for the current state.
+> [`setting-bind-investigation.md`](setting-bind-investigation.md) for the resolution.
 >
-> Kept for the raw evidence it contains: the per-commit summary, the 18-log matrix, and
+> **§3 is now answered, and its premise was wrong.** The Child's missing Setting bind is a
+> property of the **DLL build**, not of the branch: every binary in §3 was a *local* build
+> (all nine DLLs in `artifacts/` lack `.fptable`), and a local build of unrelated source
+> fails identically — including `log_port1`, built from code that only adds logging. The CI
+> builds of both v0.1.0 and Port 1 bind. So the "branch loses the bind" contrast in §3.1 is
+> an artifact of never having tested a CI-built branch DLL. §3 is kept as the record of the
+> observation, not as evidence against the branch.
+>
+> Kept for the raw evidence it contains: the per-commit summary, the log matrix, and
 > the clock-jump analysis in §4 that rules out cross-machine delivery.
 
 **Status: archived. The changes described here are not on `main`.**
@@ -124,6 +132,12 @@ branch.
 
 ## 3. Open problem: the Child's Setting bind
 
+> **Answered 2026-10-13; the framing below is the original record.** The Child's missing
+> bind is a property of the **DLL build**. Every `v0.1.0` and branch binary used here was a
+> local build, and a local build of unrelated source fails identically. The CI builds of
+> both v0.1.0 and Port 1 bind. Nothing below is evidence against the branch. See
+> [`setting-bind-investigation.md`](setting-bind-investigation.md) §2.
+
 ### 3.1 The observation
 
 `v0.1.0` in Child mode creates the Setting UDP socket and binds it to the
@@ -176,8 +190,12 @@ So under identical DLL, identical ini and identical netenv timing:
 This rules out "netenv hooking breaks our bind" and "`forceLimitedBroadcast=1` breaks our
 bind" **as blanket explanations for a Parent-vs-Child difference within one run**. Note
 carefully what it does *not* do: the Parent and Child runs in this table share a DLL, so
-this comparison cannot address which DLL is responsible across runs. That question is
-unresolved — see §3.5 and [`lessons.md`](lessons.md).
+this comparison cannot address which DLL is responsible across runs.
+
+That question is now answered, and not in the branch's favour: the responsible variable is
+the **build**, not the DLL's source. Every run in this section used a local build, and a
+local build of unrelated source fails the same way. See
+[`setting-bind-investigation.md`](setting-bind-investigation.md) §2.
 
 ### 3.3 A confounded experiment
 
@@ -194,7 +212,13 @@ all before the socket appears, so that code path never ran in them.
 
 ## 4. Evidence matrix
 
-All 18 hook logs in `references/issues`, ordered by DLL.
+The matrix as originally compiled, ordered by DLL.
+
+**Two caveats on reading it, both established later.** First, every `v0.1.0` and `branch`
+binary below was a **local** build, so the `bind 50201` column tracks the build as much as
+the code — see the note at the top of this document. Second, `logs_2/`, `logs_4/` and
+`bisect_logs/` are no longer on disk; those rows cannot be re-verified from the artifacts
+that remain.
 
 | log | proc | DLL | flb | ADAPTER | bind 50201 |
 |---|---|---|---|---|---|
@@ -258,13 +282,11 @@ cl /nologo /std:c++17 /O2 /MT /W4 /DWIN32 /D_WINDOWS tests\probe_resolve.cpp ^
 
 ## 6. If this is picked up again
 
-In rough priority order:
+Priority 1 is **done** (`74141ba`, verified); the rest stands.
 
-1. **Make `hook_bind` log unconditionally.** Today `log_io()` returns early when
-   the port is not one of 50200/50201/50202/40110/40112, so "the game never
-   called bind" and "bind was called with an unexpected address" are
-   indistinguishable in the captured logs. One unconditional line per bind would
-   settle §3.1 immediately.
+1. ~~**Make `hook_bind` log unconditionally.**~~ **Done.** `74141ba` logs every bind from
+   both paths. The CI-built Port 1 artifact was run and binds, closing §3.1 — see
+   [`setting-bind-investigation.md`](setting-bind-investigation.md).
 2. **Establish whether the netenv install order is deterministic.** Every
    captured run either lists all real adapters or only `Fake Ethernet`, never a
    mix, and the split does not track the DLL version alone. `probe_iat_race.cpp`
@@ -276,13 +298,21 @@ In rough priority order:
 4. **Do not adopt `broadcast_target()` on the strength of §2.2 alone.** That the
    pin engages is proven; that engaging improves anything is not. No captured
    session shows a Child receiving `SettingHostAddress`.
+5. **Only ever A/B CI-built DLLs.** This one cost a night. A CI build and a local build of
+   byte-identical source bind differently; `tools/dump_rich.ps1` tells them apart
+   (33145 + `.fptable` vs 27412).
 
 ## 7. Why it was not merged
 
+Written at the time of archiving; item 2 is now superseded.
+
 - The branch never produced a session with non-zero receive on the Child.
-- Three Child runs with the branch lost the Setting bind; two Parent runs did
-  not. The mechanism is unexplained, and the branch is not established as the cause —
-  nor exonerated. See [`lessons.md`](lessons.md).
+- ~~Three Child runs with the branch lost the Setting bind; two Parent runs did not. The
+  mechanism is unexplained, and the branch is not established as the cause — nor
+  exonerated.~~ **Superseded:** those three Child runs used local builds of a branch that
+  was never CI-built. Local builds lose the bind regardless of source, so this was never
+  evidence against the branch. The branch is now exonerated on this point — see
+  [`setting-bind-investigation.md`](setting-bind-investigation.md) §2.
 - The originating failure was the port exclusion in §2.3, which this branch does
   not address.
 - `main` is `3d5e6df`, one packaging commit past `v0.1.0`. Its DLL behaviour is

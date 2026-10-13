@@ -18,7 +18,7 @@ That is a real egress bug, independent of the bind question. These ports fix it.
 
 | # | from | port | note |
 |---|---|---|---|
-| 1 | — | trace every bind and socket unconditionally | **done**, CI artifact built, awaiting a run |
+| 1 | — | trace every bind and socket unconditionally | **done and verified** — CI artifact binds, see below |
 | 2 | `db6d49a` | accept the directed subnet broadcast; take the ifindex from `GetIpAddrTable` | the actual fix |
 | 3 | `736c485` | cross-check across `GetIpAddrTable`/`GetBestRoute2`/`GetIfEntry`; refuse loopback | needs `src/interface_resolution.h` |
 | 4 | `c620b75` | also accept the netenv-style `/24` form | |
@@ -30,6 +30,21 @@ That is a real egress bug, independent of the bind question. These ports fix it.
 Ports 2-5 are behaviour changes and each needs an on-machine capture showing
 `INTERFACE action=force_broadcast ... matched=<form>`. Ports 6-7 are the tests that make
 them defensible without a machine.
+
+### Port 1's verdict
+
+The CI-built Port 1 artifact was run (`0032f83_release_logs`). It **binds** 50201 twice,
+exactly as CI v0.1.0 does, and its only new lines are the `BIND` traces Port 1 adds. Against
+the locally built DLL from byte-identical source — which does not bind — that is a
+one-variable comparison, and it clears Port 1's code.
+
+It also clears the archived branch generally: the branch's observed bind failures were all
+produced by **local** builds (all nine DLLs in `artifacts/` lack `.fptable`), and a local
+build of unrelated source fails identically. See
+[`setting-bind-investigation.md`](setting-bind-investigation.md) §2 and §5.
+
+**The diagnostic goal is met without another bisect**: a captured log now distinguishes
+"the game never called bind" from "bind was called with an unexpected address".
 
 ## What was done differently
 
@@ -72,8 +87,14 @@ on:
       branch: { required: true, default: main, type: string }
 ```
 
-Use CI artifacts for any A/B — they share one runner image and toolchain. Local builds on
-this host use static CRT 27412 and are **not** comparable to CI artifacts (33145).
+Use CI artifacts for any A/B — they share one runner image and toolchain.
+
+**This is not a nicety.** A CI-built and a locally built DLL from byte-identical source
+behave differently: the CI build binds the Setting socket, the local build does not
+([`setting-bind-investigation.md`](setting-bind-investigation.md) §2). Check with
+`dump_rich.ps1` — a CI build carries Rich build **33145** and a `.fptable` section; a local
+build carries **27412** and no `.fptable`. A local build is fine for a drop-in smoke test,
+never for an A/B.
 
 ## Environment
 
