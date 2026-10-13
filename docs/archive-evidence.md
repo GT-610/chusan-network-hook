@@ -1,23 +1,24 @@
-# Broadcast interface resolution: investigation record
+# Archive evidence: broadcast interface resolution
 
-> **Read with [`docs/retracted-conclusions.md`](retracted-conclusions.md) first.** The
-> evidence below compares a CI-built v0.1.0 artifact against locally built binaries, so it
-> does not isolate the code change — it varied code and toolchain at once and therefore
-> supports no causal conclusion. §3.5's conclusion ("the branch could not have caused
-> the bind") is withdrawn. §4's evidence matrix should be read with the build hash of
-> each run in mind. The verified findings in §2 (netenv hardcodes the values; game
-> traffic uses the directed broadcast) still stand and are unaffected.
+> **Preserved evidence, not a live conclusion set.** The findings in §2 are verified and
+> still stand. The causal claims in §1 and §3 are **withdrawn** — the comparisons below
+> varied the code and the toolchain at once, so they support no causal conclusion. See
+> [`lessons.md`](lessons.md) for the full list and
+> [`setting-bind-investigation.md`](setting-bind-investigation.md) for the current state.
+>
+> Kept for the raw evidence it contains: the per-commit summary, the 18-log matrix, and
+> the clock-jump analysis in §4 that rules out cross-machine delivery.
 
-**Status: unverified. The changes described here are not on `main`.**
+**Status: archived. The changes described here are not on `main`.**
 
-This document records an investigation into broadcast interface pinning that ran
-across nine commits on the `fix-broadcast-interface-resolution` branch
-(`db6d49a` .. `0dfd786`). The work is preserved because some of the underlying
-findings are solid and reusable; the code changes themselves were never shown to
-improve a real session, and are therefore archived rather than merged.
+An investigation into broadcast interface pinning across nine commits on the
+`fix-broadcast-interface-resolution` branch (`db6d49a` .. `0dfd786`). The work is
+preserved because the underlying findings are solid and reusable; the code changes were
+never shown to improve a real session. Porting is tracked in
+[`porting-plan.md`](porting-plan.md).
 
-The archive tag is `archive/fix-broadcast-interface-resolution`. Prebuilt DLLs for
-every commit in the window are in `artifacts/<short-sha>/`.
+The archive tag is `archive/fix-broadcast-interface-resolution`. Per-commit DLLs can be
+rebuilt with `bisect_build.bat` into `artifacts/<short-sha>/`.
 
 ## 1. What the branch changed
 
@@ -56,7 +57,7 @@ between a CI-built binary and a locally built binary of comparable source cannot
 excluded by a source diff, and the one A/B that seemed to demonstrate this
 (§3.5, §4) in fact compared binaries from different toolchains and supports no such
 inference. Treat it as a reason to suspect the source, never as an alibi. See
-[`docs/retracted-conclusions.md`](retracted-conclusions.md) W1.
+[`lessons.md`](lessons.md) W1.
 
 ## 2. Verified findings
 
@@ -176,7 +177,7 @@ This rules out "netenv hooking breaks our bind" and "`forceLimitedBroadcast=1` b
 bind" **as blanket explanations for a Parent-vs-Child difference within one run**. Note
 carefully what it does *not* do: the Parent and Child runs in this table share a DLL, so
 this comparison cannot address which DLL is responsible across runs. That question is
-unresolved — see §3.5 and [`docs/retracted-conclusions.md`](retracted-conclusions.md).
+unresolved — see §3.5 and [`lessons.md`](lessons.md).
 
 ### 3.3 A confounded experiment
 
@@ -281,7 +282,7 @@ In rough priority order:
 - The branch never produced a session with non-zero receive on the Child.
 - Three Child runs with the branch lost the Setting bind; two Parent runs did
   not. The mechanism is unexplained, and the branch is not established as the cause —
-  nor exonerated. See [`docs/retracted-conclusions.md`](retracted-conclusions.md).
+  nor exonerated. See [`lessons.md`](lessons.md).
 - The originating failure was the port exclusion in §2.3, which this branch does
   not address.
 - `main` is `3d5e6df`, one packaging commit past `v0.1.0`. Its DLL behaviour is
