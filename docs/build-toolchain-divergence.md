@@ -131,7 +131,20 @@ and no further log reading will answer it.
 Both take a path and print plain text. Run them on any candidate DLL before comparing
 builds; the Rich header's first four entries are the fastest toolchain fingerprint.
 
+They require **PowerShell 7+** (`pwsh`); Windows PowerShell 5.1 cannot parse them. Invoke
+from the repository root so the relative path resolves:
+
 ```powershell
-powershell -File tools\dump_imports.ps1 -Path build\chusan_network_hook_x86.dll
-powershell -File tools\dump_rich.ps1    -Path build\chusan_network_hook_x86.dll
+pwsh -File tools\dump_rich.ps1    -Path build\chusan_network_hook_x86.dll
+pwsh -File tools\dump_imports.ps1 -Path build\chusan_network_hook_x86.dll
+```
+
+Expected output for the local build — note `27412`:
+
+```text
+RICH_HEADER_FOUND key=0x8DD52DFB span=96
+  0x103    27412   10
+  0x105    27412   139
+  0x104    27412   18
+  0x103    35207   18
 ```

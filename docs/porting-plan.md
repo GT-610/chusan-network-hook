@@ -77,8 +77,8 @@ them defensible without a machine.
    without a hash cannot be compared to anything.
 2. **Both sides of an A/B must come from the same build.** Not "same source", not "same
    tag" — same toolchain.
-3. **Check the Rich header** (`tools/dump_rich.ps1`) when a build looks unfamiliar. The
-   first four entries identify the CRT generation in one command.
+3. **Check the Rich header** (`pwsh -File tools/dump_rich.ps1`) when a build looks
+   unfamiliar. The first four entries identify the CRT generation in one command.
 4. **Count log categories by their category column (index 4), not by substring.**
    `bind_skipped` contains `bind`; counting substrings mixes categories.
 5. **Record the `ADAPTER` section** of every run. `broadcast-interface-regression.md` §6.2:
@@ -101,8 +101,9 @@ investigation needed:
 ```powershell
 git worktree add --detach ..\wt_v010 v0.1.0
 ..\wt_v010\build.bat
-powershell -File tools\dump_rich.ps1 -Path ..\wt_v010\build\chusan_network_hook_x86.dll
+pwsh -File tools\dump_rich.ps1 -Path ..\wt_v010\build\chusan_network_hook_x86.dll
 ```
 
 The Rich header should report CRT build 27412, matching the failing Port 1 build and
-differing from the working release binary's 33145.
+differing from the working release binary's 33145. The tools need `pwsh`; Windows
+PowerShell 5.1 cannot parse them.
