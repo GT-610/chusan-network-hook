@@ -1,14 +1,22 @@
 # Triage of `fix-broadcast-interface-resolution` (db6d49a..0dfd786)
 
+> **Superseded in part.** The conclusion in §2 ("the branch could not have caused the bind
+> regression, it is a game-side guard") was reached from log shape alone and is **not
+> established**. A controlled A/B on 2026-10-13 later showed the opposite: a locally
+> built v0.1.0 and Port 1 differ in behaviour, and the real variable turned out to be the
+> **build toolchain**, not the source. See
+> [`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md), which supersedes
+> the causal claim in §2. §1 (per-commit verdicts), §3 (what was right) and §4.1 (method
+> failures) remain valid; §4.2 and §5 are revised.
+
 **Purpose.** Read every commit on the archived branch on its own terms, decide what was
 right and what was wrong, and decide what to port to `main`. This replaces the previous
 framing ("the branch failed, so archive it") with a per-commit verdict.
 
 **Headline conclusion.** The branch fixed a real bug that was never the reported
-failure. The Setting bind regression on the Child is a game-side guard evaluating false,
-and no commit on the branch could have caused it — see §2. Porting the branch is worth
-doing for its own sake (the interface forcing genuinely never engaged), but it will not
-fix the bind.
+failure: interface forcing genuinely never engaged. Porting it is worth doing on its own
+merits. Whether it relates to the Setting bind is **still open**, and is now known to be
+confounded by a build difference rather than settled by the reasoning below.
 
 ## 1. The commits
 
@@ -26,9 +34,11 @@ fix the bind.
 Every commit is ported. The reasons the branch was archived are addressed in §3 and §4,
 not by dropping code.
 
-## 2. Why the branch could not have caused the bind regression
+## 2. The bind: what the disassembly shows, and where this section is wrong
 
-This is the finding that changes the plan, so it is worth stating precisely.
+This section originally concluded that the bind failure was a game-side guard evaluating
+false and therefore unrelated to the hook. **That conclusion was wrong in its causal
+claim.** The disassembly facts below still hold; the inference drawn from them does not.
 
 ### 2.1 What the archive record said
 
@@ -37,7 +47,7 @@ This is the finding that changes the plan, so it is worth stating precisely.
 "consistent with `FUN_00a79710` having run and the guarded `FUN_00a79b80` not having
 run. That is suggestive, not conclusive."
 
-### 2.2 What the disassembly settles
+### 2.2 What the disassembly shows
 
 `FUN_00a56010` at `0x00a56010`:
 
@@ -64,60 +74,48 @@ Two separate socket objects, created by two separate calls:
 - `FUN_00a79710` does `socket(2,2,0)` then `setsockopt(SO_BROADCAST)`. It never binds.
 - `FUN_00a79b80` does `socket(2,2,0)` **and then** `bind(s, &addr, 16)`.
 
-So each attempt that passes the guard produces **two** `socket()` calls, one of which is
-immediately followed by a `bind`. Each attempt that fails the guard produces **one**.
+`FUN_00a57060` constructs `Setting::Host` and `Setting::Client` into the **same
+allocation** (`puVar2` is passed to both `FUN_00a7d440` and `FUN_00a80c40`), which is
+why reading `client+0xb4` is well defined.
 
-### 2.3 The logs agree, in both directions
+### 2.3 The counting argument was wrong
 
-Working Child, `v0.1.0` (`bisect_logs/..._005404_pid21292.log`):
+This section used to claim that the guard could be read off the *number* of `socket()`
+calls per attempt. **It cannot.** Measured across all available logs:
 
-```
-+65682.391ms  SOCKET api=socket af=2 type=2 result=5696
-+65685.545ms  NET    bind sock=5696 service=SETTING local=192.168.139.17:50201 result=0
-+86345.666ms  CLOSE  socket=5696 service=SETTING
-+86355.739ms  SOCKET api=socket af=2 type=2 result=5196
-+86359.320ms  NET    bind sock=5196 service=SETTING local=192.168.139.17:50201 result=0
-```
+| log | role | `socket()` per attempt | `bind` |
+|---|---|---|---|
+| `logs_3/B_main/..._222903_pid5808` | Parent, bound | 1 | yes |
+| `bisect_logs/..._005404_pid21292` | Child, bound | 1 | yes |
+| `logs_3/B_guest/..._223601_pid8684` | Child, no bind | 1 | no |
 
-One socket per retry, then a bind 3 ms later. Repeats on the same ~20.6 s cadence.
+All three are 1:1. `FUN_00a79b80`'s own `socket()` is never visible in any log, so the
+count carries no information. The only reliable indicator is whether a `bind` line
+appears at all — which is why Port 1 added unconditional bind tracing.
 
-Failing Child, branch (`logs_3/B_guest/..._223601_pid8684.log`):
+### 2.4 The guard field is not identified
 
-```
-+68677.117ms  SOCKET api=socket af=2 type=2 result=5696
-+89345.150ms  SOCKET api=socket af=2 type=2 result=5672
-```
+The guarded value is `*( *(*(client+0xb4) + 0xc) + 0x50 )`. Its sibling `+0x54` is an
+IPv4 string with the usual SSO capacity field at `+0x14`. A setting dump function
+(`FUN_00a576a0`) prints a field labelled `isRetryEnable` through vtable slot `+0x50`,
+but that is a **virtual slot on a different object**, not a field at offset `+0x50`, and
+conflating the two is a mistake this file previously made. The writer of the guarded
+field has not been identified.
 
-One socket per retry, and **no second socket and no bind**, on the same ~20.6 s cadence.
+### 2.5 Why the causal claim collapsed
 
-The socket handle `5696` appearing in both is only coincidence, but the shape is the
-point: the failing log has exactly one `socket()` per attempt where the working log has
-`bind` on that same socket. Since `FUN_00a79b80` allocates its own socket before
-binding, a passing guard would have added a *second* `socket()` line. It did not.
+The reasoning "same `hook_bind` source, so the hook cannot be responsible" assumed the
+two DLLs under comparison were the same build. They were not:
 
-**Therefore the guard `*( *( *(client+0xb4) + 0xc ) + 0x50 ) == 0` was false.** The game
-decided not to bind. The hook is not swallowing anything.
+- the "working v0.1.0" was the **GitHub Release binary**, built by CI;
+- the "broken Port 1" was built **on this machine**.
 
-### 2.4 The guard is a configuration field, not a socket
-
-`thunk_FUN_007e42a0` is `*( *(p + 0xc) + 0x50 )`, and its sibling
-`thunk_FUN_007e0940` is `*( *(p + 0xc) + 0x54 )`, used as an IPv4 string with the usual
-`capacity < 0x10` SSO test at `+0x14`. Two adjacent fields on one shared structure: a
-32-bit value at `+0x50` and a `std::string` at `+0x54`.
-
-That structure is the Child's own Setting configuration — the address it is told to bind
-and the port/flag beside it. It is populated by the game from its runtime settings
-(`FUN_00de4230` / `FUN_00a57f00` configure Setting; `role == 0` selects Parent). The
-hook never writes it.
-
-### 2.5 Consequence
-
-The open question is no longer "what did the hook break". It is "why does this machine's
-Child have that field zero", which is a configuration or game-state question, and it
-was the same on both DLL versions — the three failing runs used the branch, but so did
-the two Parent runs that bound fine, and `v0.1.0` Child runs on the same machine did
-bind. The DLL version is not the axis; the machine's configuration at the moment of
-launch is.
+Those two binaries differ in CRT library version, size and import set — see
+[`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md). A controlled A/B
+on 2026-10-13 then showed the locally built v0.1.0 also fails to bind, which removes the
+source change as the variable and points at the build. **Source equivalence does not imply
+binary equivalence**, and that assumption was the reason this investigation went in
+circles.
 
 ## 3. What was right
 
@@ -149,9 +147,9 @@ Not one commit is wrong on its own. The failure was in method:
 
 1. **The branch was treated as the explanation for the bind regression before the
    mechanism was known.** Three Child runs lost the bind, so the branch was presumed
-   guilty and the work archived. The mechanism in §2 shows the branch was not in the
-   code path at all. The archive record did note the counter-evidence (§3.2) but did not
-   resolve it.
+   guilty and the work archived. The archive record did note the counter-evidence
+   (§3.2) but did not resolve it. Presuming the newest change is at fault is the default
+   trap; the correct move was to reproduce the *old* build locally and A/B it.
 2. **No run isolated a variable.** The one experiment that "fixed" it
    (`forceLimitedBroadcast=0`) also changed netenv state, so it proved nothing. With the
    analysis in §2, `forceLimitedBroadcast` could not have been the variable: it gates
@@ -160,22 +158,29 @@ Not one commit is wrong on its own. The failure was in method:
 3. **The blocking question was identified late.** `broadcast-interface-regression.md` §6
    lists "make `hook_bind` log unconditionally" as priority 1, but `log_io` still drops
    any bind whose port is not one of the five known ones — so a bind with an unexpected
-   address is invisible. That gap is what made §2.3 above take a night of bisecting
-   instead of one line of static analysis.
+   address is invisible. Port 1 closed this gap.
 4. **The netenv install-order race was left open** (§6.2). Every captured run shows
    either all real adapters or only `Fake Ethernet`, never a mix, and it does not track
-   the DLL version. Until it is pinned down, any A/B on one machine is not an experiment.
-   This is a live risk for the porting work and is called out in `docs/porting-plan.md`.
+   the DLL version. Until it is pinned down, any A/B on one machine is suspect. This is
+   called out in `docs/porting-plan.md`.
+5. **Source equivalence was treated as binary equivalence — the costliest mistake.**
+   Because `git diff v0.1.0 main -- src/` is empty, the two DLLs were assumed to be the
+   same program. They are not: the release binary was built by CI, the comparison binary
+   on this machine, and they differ in CRT library version. Every A/B drawn between them
+   was therefore measuring two variables at once. This is now the primary finding; see
+   [`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md).
 
 ## 5. What this means for porting
 
-The broadcast and interface-resolution work is ported to `main` because it fixes a real
-egress bug, verified separately from the bind issue. It is not expected to fix the bind.
+The broadcast and interface-resolution work is ported because it fixes a real egress bug,
+verified separately from the bind issue. Whether it also affects the bind is **unknown**:
+that question is now blocked on reproducing the CI build locally, not on more log reading.
 
-Two things are done differently:
+Three things are done differently:
 
 - **Ported in dependency order, one concern per commit**, each building and smoke-tested
   on its own, so a regression can be attributed to a single change.
 - **The diagnostic gap is closed first**, before any behaviour changes, so the next
-  on-machine run answers the bind question without another bisect. See
-  `docs/porting-plan.md` for the per-commit plan and the test procedure.
+  on-machine run answers the bind question without another bisect.
+- **Every A/B must hold the build constant.** Compare only binaries built by the same
+  toolchain, and record which one was used. See `docs/porting-plan.md`.

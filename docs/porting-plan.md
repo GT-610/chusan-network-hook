@@ -3,24 +3,27 @@
 Branch `port/broadcast-interface-resolution`. One port per commit, in dependency order.
 Each port is verified on-machine before the next one starts.
 
-Read `docs/broadcast-interface-triage.md` first: it contains the per-commit verdicts
-(all eight commits are worth porting) and the static-analysis finding that explains why
-none of them can fix the Setting bind regression.
+Read these two first:
 
-## Why the diagnostic comes first
+- [`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md) — **the blocker.**
+  The v0.1.0 release binary is a CI build; a local build of the same tag behaves
+  differently. Until the build is held constant, no A/B on the bind is meaningful.
+- [`docs/broadcast-interface-triage.md`](broadcast-interface-triage.md) — per-commit
+  verdicts (all eight commits are worth porting).
+
+## Why Port 1 is diagnostics
 
 The archived branch was abandoned because three Child runs lost the Setting bind and the
-mechanism was never found. Reading `FUN_00a56010` settles it: the bind is guarded by a
-game-side condition, and the branch never touched that code path. So the broadcast work
-is worth porting on its own merits, but it is not the bind fix.
+mechanism was never found. Port 1 changes no behaviour: it only closes the logging gap
+that made the bind question require a bisect, by logging every bind unconditionally rather
+than only those on the five known ports.
 
-Porting it blind would repeat the original mistake. So Port 1 changes no behaviour at
-all — it only closes the logging gap that made the bind question require a bisect — and
-is meant to be run and inspected before anything else lands.
+It is kept separate from the behaviour ports so that a later run can attribute an effect
+to exactly one change.
 
 ## Port 1 — trace every bind and every socket unconditionally
 
-**Status: ready to verify.**
+**Status: built and smoke-tested locally. On-machine run done; verification incomplete.**
 
 `log_io` drops any call whose port is not one of the five known services, so a captured
 log could not distinguish "the game never called bind" from "the game called bind with an
@@ -29,54 +32,33 @@ address we did not expect". `broadcast-interface-regression.md` §6 named this a
 
 Adds a `BIND` category logged unconditionally from `hook_bind`, for both the real and
 the virtualized (LAN Install) path, carrying the socket, `sa_family`, the requested
-endpoint, `namelen`, the result and the Winsock error. `hook_socket` and `hook_wsasocketw`
-comments now record why socket calls are logged unconditionally too — they already were,
-but the reason was not written down anywhere.
+endpoint, `namelen`, the result and the Winsock error.
 
-No behaviour change: `hook_bind`'s control flow and return values are untouched.
+### What the on-machine run showed
 
-### What to look for in the next Child run
+The Child log (`references/issues/log_port1/..._094037_pid22192`) contains **zero** `BIND`
+lines, while amdaemon from the same run contains 77. The category works, and the Child made
+no bind call on any address or port — not `0.0.0.0`, not the virtualized one. That is what
+distinguishes "no bind" from "bind we failed to log", which was the point of the port.
 
-Setting's guarded bind is `FUN_00a79b80` (`0x00a79b80`), which calls `socket(2,2,0)` and
-then `bind`. The broadcast socket from `FUN_00a79710` is a *different* socket and is never
-bound. So per attempt:
+### What that run also showed
 
-| observed | reading |
-|---|---|
-| one `SOCKET af=2 type=2`, then a `BIND` on that same socket | the guard passed and the bind ran |
-| one `SOCKET af=2 type=2`, no `BIND` at all | the guard evaluated false; the game chose not to bind |
-| two `SOCKET af=2 type=2` before any `BIND` | both socket objects were created |
-| a `BIND` with `requested=` an address or port we did not expect | previously invisible; this is what `log_io` was hiding |
-
-The third failing capture (`logs_3/B_guest/..._223601_pid8684.log`) shows one `SOCKET` per
-retry and no `bind`, on the ~20.6 s cadence. If the new run reproduces that shape and the
-`BIND` category is silent, the guard is confirmed false and the question moves to the
-game's Setting configuration — the field read by
-`*( *(*(client+0xb4) + 0xc) + 0x50 )`, adjacent to the bind address string at `+0x54`.
-
-If instead a `BIND` line appears that `log_io` would have dropped, that is a different
-bug and the new line is the only evidence of it.
-
-Note that `detailed=1` in `[log]` is required for any of this to be written; with the
-default `detailed=0` the lines are suppressed as usual. The captured logs in
-`references/issues` were all taken with `detailed=1 writeFile=1`.
-
-### Verified locally
-
-Builds clean at `/W4` for x86 and x64. Smoke test passes. With `detailed=1` the new lines
-appear for both paths:
-
-```text
-BIND  bind sock=360 af=2 requested=127.0.0.1:50200 namelen=16 result=0 error=0/OK
-BIND  bind_virtualized sock=360 af=2 requested=0.0.0.0:40110 namelen=16 result=0 error=0/OK
-```
+A more useful result than the bind itself: a controlled A/B. The CI-built v0.1.0 binds
+50201 twice; the locally built Port 1 does not bind at all — under byte-identical
+configuration and identical adapter enumeration. See `docs/build-toolchain-divergence.md`
+§2. That comparison is what redirected the investigation, and it is why the behaviour ports
+below are blocked.
 
 ## Remaining ports
 
-Not started. Each depends on the one before it and gets its own verification pass.
+Not started. Each depends on the one before it and needs its own verification pass. **All
+of them are blocked on the toolchain question above**: porting behaviour changes and then
+A/B-ing them against a CI-built binary would repeat the exact mistake this document exists
+to prevent.
 
 | # | from | port | note |
 |---|---|---|---|
+| 0 | — | reproduce the CI build locally, or build on CI | **prerequisite** |
 | 2 | `db6d49a` | accept the directed subnet broadcast; take the ifindex from `GetIpAddrTable` | the real fix; the hook currently never pins anything |
 | 3 | `736c485` | cross-check across `GetIpAddrTable`/`GetBestRoute2`/`GetIfEntry`; refuse loopback | needs `src/interface_resolution.h` |
 | 4 | `c620b75` | also accept the netenv-style `/24` form | |
@@ -85,18 +67,42 @@ Not started. Each depends on the one before it and gets its own verification pas
 | 7 | `4389370` | unit-test the decision table | |
 | 8 | `493436c`, `6fa6a88` | docs, `build.bat` include path, CI steps | |
 
-Ports 2-5 are behaviour changes and each one needs an on-machine capture showing the
-`INTERFACE action=force_broadcast ... matched=<form>` line. Port 6-7 are the tests that
-make them defensible without a machine.
+Ports 2-5 are behaviour changes and each needs an on-machine capture showing
+`INTERFACE action=force_broadcast ... matched=<form>`. Ports 6-7 are the tests that make
+them defensible without a machine.
 
-## Known confounder to control for
+## Rules for the next session
 
-`broadcast-interface-regression.md` §6.2: every captured run shows either all real
-adapters or only `Fake Ethernet`, never a mix, and the split does not track the DLL
-version. Until that is pinned down, an A/B on one machine is not an experiment. Record
-the `ADAPTER` section of each run's log alongside the result, and do not attribute a
-difference to a code change unless the adapter list matches across both runs.
+1. **Hash the DLL before every run.** Record `Get-FileHash -Algorithm SHA256`. A run
+   without a hash cannot be compared to anything.
+2. **Both sides of an A/B must come from the same build.** Not "same source", not "same
+   tag" — same toolchain.
+3. **Check the Rich header** (`tools/dump_rich.ps1`) when a build looks unfamiliar. The
+   first four entries identify the CRT generation in one command.
+4. **Count log categories by their category column (index 4), not by substring.**
+   `bind_skipped` contains `bind`; counting substrings mixes categories.
+5. **Record the `ADAPTER` section** of every run. `broadcast-interface-regression.md` §6.2:
+   every captured run shows either all real adapters or only `Fake Ethernet`, never a mix,
+   and the split does not track the DLL version.
 
-This machine currently has no excluded port ranges covering 50200-50202
-(`netsh interface ipv4 show excludedportrange`), and `winnat` is stopped, so the
-`10013/WSAEACCES` failure in §2.3 of the archive record does not apply here.
+## Environment notes
+
+This machine has no excluded port ranges covering 50200-50202
+(`netsh interface ipv4 show excludedportrange`) and `winnat` is stopped, so the
+`10013/WSAEACCES` failure in §2.3 of `broadcast-interface-regression.md` does not apply
+here.
+
+Local toolchain: MSVC `cl.exe` 19.44.35228, static CRT build **27412**. The CI runner
+produced static CRT build **33145** — see the divergence document.
+
+Building `v0.1.0` locally reproduces the failing behaviour, which is the control the
+investigation needed:
+
+```powershell
+git worktree add --detach ..\wt_v010 v0.1.0
+..\wt_v010\build.bat
+powershell -File tools\dump_rich.ps1 -Path ..\wt_v010\build\chusan_network_hook_x86.dll
+```
+
+The Rich header should report CRT build 27412, matching the failing Port 1 build and
+differing from the working release binary's 33145.
