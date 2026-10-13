@@ -1,11 +1,12 @@
 # Broadcast interface resolution: investigation record
 
-> **Read with [`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md).** The
+> **Read with [`docs/retracted-conclusions.md`](retracted-conclusions.md) first.** The
 > evidence below compares a CI-built v0.1.0 artifact against locally built binaries, so it
-> does not isolate the code change. §3.5's conclusion ("the branch could not have caused
-> the bind") is withdrawn for that reason, and §4's evidence matrix should be read with
-> the build hash of each run in mind. The verified findings in §2 (netenv hardcodes the
-> values; game traffic uses the directed broadcast) still stand and are unaffected.
+> does not isolate the code change — it varied code and toolchain at once and therefore
+> supports no causal conclusion. §3.5's conclusion ("the branch could not have caused
+> the bind") is withdrawn. §4's evidence matrix should be read with the build hash of
+> each run in mind. The verified findings in §2 (netenv hardcodes the values; game
+> traffic uses the directed broadcast) still stand and are unaffected.
 
 **Status: unverified. The changes described here are not on `main`.**
 
@@ -47,9 +48,15 @@ Two behavioural changes, both confined to `resolve_network_interface()` and to t
 those identifiers appear anywhere in `git diff v0.1.0 0dfd786 -- src/`. The only
 hunks are in `resolve_network_interface()`, the new `lookup_real_ipv4_interface()`,
 `broadcast_target()`, `network_failure()`, `ensure_broadcast_interface()`,
-`hook_sendto()` and `hook_wsasendto()`. This matters because it means the branch
-cannot have removed a bind call — whatever the Child does differently, it is the
-game deciding not to call `bind`, not the hook swallowing it.
+`hook_sendto()` and `hook_wsasendto()`.
+
+**What this does and does not license.** It is a *source-level* statement: the branch
+did not edit the bind path. It is not a *behavioural* statement. A runtime difference
+between a CI-built binary and a locally built binary of comparable source cannot be
+excluded by a source diff, and the one A/B that seemed to demonstrate this
+(§3.5, §4) in fact compared binaries from different toolchains and supports no such
+inference. Treat it as a reason to suspect the source, never as an alibi. See
+[`docs/retracted-conclusions.md`](retracted-conclusions.md) W1.
 
 ## 2. Verified findings
 
@@ -165,10 +172,11 @@ So under identical DLL, identical ini and identical netenv timing:
 | Parent | 26 / 14 OK | — |
 | Child | — | 0 in 3 runs |
 
-This rules out "netenv hooking breaks our bind", "`forceLimitedBroadcast=1`
-breaks our bind", and "the branch removed the bind call" as blanket
-explanations. The failure is specific to the Child's bind-to-interface-address
-path.
+This rules out "netenv hooking breaks our bind" and "`forceLimitedBroadcast=1` breaks our
+bind" **as blanket explanations for a Parent-vs-Child difference within one run**. Note
+carefully what it does *not* do: the Parent and Child runs in this table share a DLL, so
+this comparison cannot address which DLL is responsible across runs. That question is
+unresolved — see §3.5 and [`docs/retracted-conclusions.md`](retracted-conclusions.md).
 
 ### 3.3 A confounded experiment
 
@@ -272,7 +280,8 @@ In rough priority order:
 
 - The branch never produced a session with non-zero receive on the Child.
 - Three Child runs with the branch lost the Setting bind; two Parent runs did
-  not. The mechanism is unexplained.
+  not. The mechanism is unexplained, and the branch is not established as the cause —
+  nor exonerated. See [`docs/retracted-conclusions.md`](retracted-conclusions.md).
 - The originating failure was the port exclusion in §2.3, which this branch does
   not address.
 - `main` is `3d5e6df`, one packaging commit past `v0.1.0`. Its DLL behaviour is

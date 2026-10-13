@@ -2,12 +2,16 @@
 
 > **Superseded in part.** The conclusion in §2 ("the branch could not have caused the bind
 > regression, it is a game-side guard") was reached from log shape alone and is **not
-> established**. A controlled A/B on 2026-10-13 later showed the opposite: a locally
-> built v0.1.0 and Port 1 differ in behaviour, and the real variable turned out to be the
-> **build toolchain**, not the source. See
-> [`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md), which supersedes
-> the causal claim in §2. §1 (per-commit verdicts), §3 (what was right) and §4.1 (method
-> failures) remain valid; §4.2 and §5 are revised.
+> established**. §1 (per-commit verdicts), §3 (what was right) and §4.1 (method
+> failures) remain valid. §2's causal claim, §2.5, §4.5 and §5's final bullet are
+> withdrawn or revised below.
+>
+> **The replacement for the toolchain explanation is weaker than it first appeared.**
+> The 2026-10-13 A/B changed *two* variables at once, so it shows neither that the
+> build is responsible nor that the source is innocent. The build is constant across all
+> CI artifacts, which removes it as a CI-vs-CI variable but exonerates nothing. The
+> decisive cell — CI-built Port 1 — has never been run. See
+> [`docs/retracted-conclusions.md`](retracted-conclusions.md).
 
 **Purpose.** Read every commit on the archived branch on its own terms, decide what was
 right and what was wrong, and decide what to port to `main`. This replaces the previous
@@ -15,8 +19,8 @@ framing ("the branch failed, so archive it") with a per-commit verdict.
 
 **Headline conclusion.** The branch fixed a real bug that was never the reported
 failure: interface forcing genuinely never engaged. Porting it is worth doing on its own
-merits. Whether it relates to the Setting bind is **still open**, and is now known to be
-confounded by a build difference rather than settled by the reasoning below.
+merits. Whether it relates to the Setting bind is **unknown and currently
+underdetermined** — the only A/B on the question changed two variables at once.
 
 ## 1. The commits
 
@@ -102,7 +106,7 @@ but that is a **virtual slot on a different object**, not a field at offset `+0x
 conflating the two is a mistake this file previously made. The writer of the guarded
 field has not been identified.
 
-### 2.5 Why the causal claim collapsed
+### 2.5 Why the causal claim collapsed — and what replaced it
 
 The reasoning "same `hook_bind` source, so the hook cannot be responsible" assumed the
 two DLLs under comparison were the same build. They were not:
@@ -110,12 +114,18 @@ two DLLs under comparison were the same build. They were not:
 - the "working v0.1.0" was the **GitHub Release binary**, built by CI;
 - the "broken Port 1" was built **on this machine**.
 
-Those two binaries differ in CRT library version, size and import set — see
-[`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md). A controlled A/B
-on 2026-10-13 then showed the locally built v0.1.0 also fails to bind, which removes the
-source change as the variable and points at the build. **Source equivalence does not imply
-binary equivalence**, and that assumption was the reason this investigation went in
-circles.
+That A/B therefore moved the code, the toolchain (CRT 33145 vs 27412) and possibly the
+machine state at once. **It exonerates nothing and convicts nothing.**
+
+It was briefly over-read as pointing at the toolchain. That is also not supported: all
+three CI artifacts (v0.1.0, `main`, Port 1) share CRT 33145, so the toolchain is
+*constant* across CI and cannot explain a difference between two of them. It is a live
+hypothesis only for CI-vs-local comparisons.
+
+**Source equivalence does not imply binary equivalence, and neither implies behavioural
+equivalence.** What is left is a two-way question with one unmeasured cell — the
+CI-built Port 1. See [`docs/retracted-conclusions.md`](retracted-conclusions.md) for
+the full list of withdrawn claims.
 
 ## 3. What was right
 
@@ -166,17 +176,23 @@ Not one commit is wrong on its own. The failure was in method:
 5. **Source equivalence was treated as binary equivalence — the costliest mistake.**
    Because `git diff v0.1.0 main -- src/` is empty, the two DLLs were assumed to be the
    same program. They are not: the release binary was built by CI, the comparison binary
-   on this machine, and they differ in CRT library version. Every A/B drawn between them
-   was therefore measuring two variables at once. This is now the primary finding; see
-   [`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md).
+   on this machine. Every A/B drawn between them was therefore measuring two variables
+   at once. The follow-on error was over-correcting: the toolchain divergence was then
+   treated as *the* cause, when it is merely *a* difference, and one that is constant
+   across CI. See [`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md)
+   and [`docs/retracted-conclusions.md`](retracted-conclusions.md).
+6. **Over-reading one cell of a 2×2 as the whole table.** See §2.5. This is the direct
+   descendant of pitfall 5 and is the single most important rule here: an A/B that
+   changes two variables is not an A/B.
 
 ## 5. What this means for porting
 
 The broadcast and interface-resolution work is ported because it fixes a real egress bug,
-verified separately from the bind issue. Whether it also affects the bind is **unknown**:
-that question is now blocked on reproducing the CI build locally, not on more log reading.
+verified separately from the bind issue. Whether it also affects the bind is **unknown**,
+and the reason is a measurement gap rather than an analytical one: the only A/B on the
+question moved two variables at once, so it established nothing either way.
 
-Three things are done differently:
+Four things are done differently:
 
 - **Ported in dependency order, one concern per commit**, each building and smoke-tested
   on its own, so a regression can be attributed to a single change.
@@ -184,3 +200,5 @@ Three things are done differently:
   on-machine run answers the bind question without another bisect.
 - **Every A/B must hold the build constant.** Compare only binaries built by the same
   toolchain, and record which one was used. See `docs/porting-plan.md`.
+- **Every A/B must hold the machine constant.** Adapter enumeration and netenv install
+  order vary between runs and are not currently controlled.

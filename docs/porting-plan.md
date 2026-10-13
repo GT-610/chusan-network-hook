@@ -3,11 +3,15 @@
 Branch `port/broadcast-interface-resolution`. One port per commit, in dependency order.
 Each port is verified on-machine before the next one starts.
 
-Read these two first:
+Read these three first:
 
-- [`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md) — **the blocker.**
-  The v0.1.0 release binary is a CI build; a local build of the same tag behaves
-  differently. Until the build is held constant, no A/B on the bind is meaningful.
+- [`docs/retracted-conclusions.md`](retracted-conclusions.md) — **read this first.** Every
+  conclusion this investigation asserted and then withdrew, and the one unmeasured cell
+  that the whole bind question now reduces to.
+- [`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md) — the toolchain
+  difference is real and CI-wide, but it is **constant across CI builds**, so it cannot
+  distinguish binds from does-not-bind between two CI binaries. It is no longer the
+  blocker; see below.
 - [`docs/broadcast-interface-triage.md`](broadcast-interface-triage.md) — per-commit
   verdicts (all eight commits are worth porting).
 
@@ -43,22 +47,32 @@ distinguishes "no bind" from "bind we failed to log", which was the point of the
 
 ### What that run also showed
 
-A more useful result than the bind itself: a controlled A/B. The CI-built v0.1.0 binds
-50201 twice; the locally built Port 1 does not bind at all — under byte-identical
-configuration and identical adapter enumeration. See `docs/build-toolchain-divergence.md`
-§2. That comparison is what redirected the investigation, and it is why the behaviour ports
-below are blocked.
+A controlled A/B, which turned out to control nothing. The CI-built v0.1.0 binds 50201
+twice; the locally built Port 1 does not bind at all — under byte-identical configuration
+and identical adapter enumeration.
+
+**This comparison changed two variables**: the code (Port 1's logging) and the toolchain
+(CRT 33145 vs 27412). It supports no conclusion in either direction. It was initially
+read as "the toolchain is the variable", which is also unsupported — all three CI
+artifacts share CRT 33145, so the toolchain is constant across CI and cannot distinguish
+two CI binaries. See [`docs/retracted-conclusions.md`](retracted-conclusions.md) W1/W2.
+
+**The build prerequisite is no longer a blocker.** CI artifacts for v0.1.0, `main` and
+Port 1 now all exist and are mutually comparable, so the original "reproduce the CI
+toolchain locally" step is obsolete. What remains is one unmeasured cell: **the CI-built
+Port 1 artifact has never been run.**
 
 ## Remaining ports
 
-Not started. Each depends on the one before it and needs its own verification pass. **All
-of them are blocked on the toolchain question above**: porting behaviour changes and then
-A/B-ing them against a CI-built binary would repeat the exact mistake this document exists
-to prevent.
+Not started. Each depends on the one before it and needs its own verification pass.
+
+Port 0 is **no longer a build prerequisite**. The build question is settled: the CI
+artifacts are the reference. Port 0 is now the single on-machine run of the CI-built
+Port 1 artifact, which answers the bind question in one step.
 
 | # | from | port | note |
 |---|---|---|---|
-| 0 | — | reproduce the CI build locally, or build on CI | **prerequisite** |
+| 0 | — | run the **CI-built Port 1** artifact | **the one missing measurement** |
 | 2 | `db6d49a` | accept the directed subnet broadcast; take the ifindex from `GetIpAddrTable` | the real fix; the hook currently never pins anything |
 | 3 | `736c485` | cross-check across `GetIpAddrTable`/`GetBestRoute2`/`GetIfEntry`; refuse loopback | needs `src/interface_resolution.h` |
 | 4 | `c620b75` | also accept the netenv-style `/24` form | |
@@ -69,7 +83,15 @@ to prevent.
 
 Ports 2-5 are behaviour changes and each needs an on-machine capture showing
 `INTERFACE action=force_broadcast ... matched=<form>`. Ports 6-7 are the tests that make
-them defensible without a machine.
+them defensible without a machine. These ports are worth doing on their own merits —
+they fix a verified egress bug — and do **not** depend on the bind question being
+resolved first.
+
+### Building CI artifacts for comparison
+
+`.github/workflows/build-artifact.yml` (on `main`, added in `01450ac`) builds any branch
+on demand and uploads an artifact without creating a release. Trigger it for
+`port/broadcast-interface-resolution`, download the zip, and hash the DLLs before use.
 
 ## Rules for the next session
 
@@ -84,6 +106,9 @@ them defensible without a machine.
 5. **Record the `ADAPTER` section** of every run. `broadcast-interface-regression.md` §6.2:
    every captured run shows either all real adapters or only `Fake Ethernet`, never a mix,
    and the split does not track the DLL version.
+6. **An A/B that changes two variables is not an A/B.** The 2026-10-13 comparison varied
+   code and toolchain at once and established nothing. Before running one, list the
+   variables and confirm each is held constant — including machine state.
 
 ## Environment notes
 
@@ -93,10 +118,13 @@ This machine has no excluded port ranges covering 50200-50202
 here.
 
 Local toolchain: MSVC `cl.exe` 19.44.35228, static CRT build **27412**. The CI runner
-produced static CRT build **33145** — see the divergence document.
+produced static CRT build **33145** — see the divergence document. **Both of those
+artifacts exist and are stored under `references/issues/`:** `v0.1.0_release`,
+`main_release` and `0032f83_release`. They are the reference builds; prefer them over
+local builds for any A/B, and hash whichever is used.
 
-Building `v0.1.0` locally reproduces the failing behaviour, which is the control the
-investigation needed:
+Rebuilding `v0.1.0` locally reproduces the failing behaviour, which is itself a useful
+data point (CI-local is the only measured non-diagonal in the table above):
 
 ```powershell
 git worktree add --detach ..\wt_v010 v0.1.0
@@ -104,6 +132,5 @@ git worktree add --detach ..\wt_v010 v0.1.0
 pwsh -File tools\dump_rich.ps1 -Path ..\wt_v010\build\chusan_network_hook_x86.dll
 ```
 
-The Rich header should report CRT build 27412, matching the failing Port 1 build and
-differing from the working release binary's 33145. The tools need `pwsh`; Windows
+The Rich header should report CRT build 27412. The tools need `pwsh`; Windows
 PowerShell 5.1 cannot parse them.

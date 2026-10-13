@@ -1,7 +1,12 @@
 # Build toolchain divergence: the v0.1.0 release binary is not a local build
 
-**Status: superseded in part. See §0. The toolchain divergence is real, but it is NOT
-the cause of the bind difference and it is NOT a CI-vs-local-only effect.**
+**Read [`docs/retracted-conclusions.md`](retracted-conclusions.md) first.**
+
+**Status: the difference is confirmed; its role as the cause is withdrawn.** CI and local
+builds genuinely differ (static CRT 33145 vs 27412), but three CI-built artifacts show the
+toolchain is **constant across CI**, so it cannot distinguish binds from does-not-bind
+between any two CI binaries. This document records a real difference, not a proven cause.
+§0 supersedes the original conclusion; §4's causal framing is withdrawn.
 
 ## 0. Correction (2026-10-13, after CI-built Port 1 and CI-built main became available)
 
@@ -251,9 +256,19 @@ implementation differs between the two builds:
 - The `Fls*` fibre-local-storage path used by the CRT for thread-local state.
 
 Any of these could change behaviour in a hook that runs inside a third-party process and
-is loaded from a launcher that may itself install hooks. **None of this is proven to be
-the cause of the bind failure.** It is the first thing that differs and therefore the
-first thing to eliminate.
+is loaded from a launcher that may itself install hooks.
+
+**None of this is proven to be the cause of the bind failure, and §0 now argues it
+cannot be.** The toolchain is constant across all three CI artifacts (CRT 33145), so it
+does not distinguish any two of them. It is only a live hypothesis for **CI-vs-local**
+comparisons, where the difference is real. That cell was measured on 2026-10-13 — CI
+v0.1.0 binds, local v0.1.0 does not — and it remains unexplained; what it cannot do is
+generalise to CI-vs-CI, because there the toolchain is identical.
+
+The earlier framing of this section ("the first thing that differs and therefore the first
+thing to eliminate") is withdrawn. It was a single-cell observation promoted to a general
+explanation, which is the same error as the original one in the opposite direction. See
+[`docs/retracted-conclusions.md`](retracted-conclusions.md) W2.
 
 ## 5. Pitfalls this investigation hit
 
