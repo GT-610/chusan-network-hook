@@ -564,9 +564,14 @@ void log_adapters() {
     for (IP_ADAPTER_ADDRESSES *adapter = addresses; adapter != nullptr; adapter = adapter->Next) {
         char friendly[512] = {};
         wide_to_utf8(adapter->FriendlyName, friendly, sizeof(friendly));
-        log_line("ADAPTER", "if_index=%lu metric=%lu oper_status=%u type=%u name=\"%s\"",
+        // Every adapter the host has is listed, but only the one resolve_network_interface()
+        // picked is ever used by the hooks. Without this marker the listing reads as if the
+        // hook were operating on all of them, which is how an unrelated adapter's address
+        // gets mistaken for the variable in an A/B.
+        const bool selected = g_network_ready && adapter->IfIndex == g_interface_index;
+        log_line("ADAPTER", "if_index=%lu metric=%lu oper_status=%u type=%u selected=%s name=\"%s\"",
             adapter->IfIndex, adapter->Ipv4Metric, (unsigned)adapter->OperStatus,
-            adapter->IfType, friendly);
+            adapter->IfType, selected ? "yes" : "no", friendly);
         for (IP_ADAPTER_UNICAST_ADDRESS *unicast = adapter->FirstUnicastAddress;
              unicast != nullptr; unicast = unicast->Next) {
             if (unicast->Address.lpSockaddr == nullptr ||
@@ -574,12 +579,29 @@ void log_adapters() {
             char address[96] = {};
             endpoint(unicast->Address.lpSockaddr, unicast->Address.iSockaddrLength,
                 address, sizeof(address));
-            log_line("ADDRESS", "if_index=%lu address=%s prefix_len=%u dad_state=%u",
-                adapter->IfIndex, address, unicast->OnLinkPrefixLength,
-                (unsigned)unicast->DadState);
+            log_line("ADDRESS", "if_index=%lu selected=%s address=%s prefix_len=%u dad_state=%u",
+                adapter->IfIndex, selected ? "yes" : "no", address,
+                unicast->OnLinkPrefixLength, (unsigned)unicast->DadState);
         }
     }
     HeapFree(GetProcessHeap(), 0, addresses);
+    // Close the listing with the one thing a reader actually needs: which interface the
+    // hooks will use, and whether any traffic was pinned to it. Everything above is
+    // observation; this line is the hook's decision.
+    if (!g_config.network_enable) {
+        log_line("INTERFACE", "network disabled; interfaceAddress is ignored");
+    } else if (!g_network_ready) {
+        log_line("INTERFACE", "no interface selected for %s; traffic is not pinned",
+            g_config.interface_address);
+    } else {
+        log_line("INTERFACE", "selected=%s index=%lu name=\"%s\" prefix=/%lu "
+            "broadcast_pin=%s tcp_source_pin=%s strict=%s",
+            g_config.interface_address, g_interface_index, g_interface_name,
+            g_interface_prefix_length,
+            g_config.force_limited_broadcast ? "on" : "off",
+            g_config.force_tcp_source ? "on" : "off",
+            g_config.strict ? "on" : "off");
+    }
 }
 
 void log_route_for(const sockaddr *address, int length) {
