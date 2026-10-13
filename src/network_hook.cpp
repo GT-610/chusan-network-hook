@@ -907,11 +907,35 @@ void feed_stream(SocketState *state, const char *direction,
 
 SOCKET WSAAPI hook_socket(int af, int type, int protocol) {
     SOCKET s = g_next_socket ? g_next_socket(af, type, protocol) : INVALID_SOCKET;
+    // Logged unconditionally. Setting's bind path (FUN_00a79b80 at 0x00a79b80) opens its
+    // own socket immediately before calling bind, so "a socket appeared but no bind
+    // followed" and "the guarded bind ran and failed" are told apart by the *count* of
+    // socket calls, not by the bind lines. Counting them is what makes a captured Child
+    // log decisive: one socket per attempt means the game's guard evaluated false; two
+    // means the bind was attempted.
     log_line("SOCKET", "api=socket af=%d type=%d protocol=%d result=%lld error=%d/%s",
         af, type, protocol, (long long)s,
         s == INVALID_SOCKET ? WSAGetLastError() : 0,
         s == INVALID_SOCKET ? wsa_name(WSAGetLastError()) : "OK");
     return s;
+}
+
+// Traces every bind, including binds on ports this hook has no interest in.
+//
+// log_io drops any call whose port is not one of the five known services, which makes
+// "the game never called bind" and "the game called bind with an address we did not
+// expect" indistinguishable in a captured log. That ambiguity is what left the Setting
+// bind question on the Child open: the child's Setting bind is guarded by a game-side
+// condition, and until the disassembly was read it was not possible to tell a missing
+// bind from an unlogged one. One line per bind is cheap and settles it.
+void log_bind_always(const char *op, SOCKET s, int result, int error,
+                     const sockaddr *name, int namelen) {
+    char requested[96] = "-";
+    endpoint(name, namelen, requested, sizeof(requested));
+    log_line("BIND", "%s sock=%llu af=%d requested=%s namelen=%d result=%d error=%d/%s",
+        op, (unsigned long long)(uintptr_t)s,
+        name != nullptr ? (int)name->sa_family : -1,
+        requested, namelen, result, error, wsa_name(error));
 }
 
 int WSAAPI hook_bind(SOCKET s, const sockaddr *name, int namelen) {
@@ -921,11 +945,13 @@ int WSAAPI hook_bind(SOCKET s, const sockaddr *name, int namelen) {
         if (state) { state->virtual_lan_port = port; save_address(state, name, namelen, false); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
         log_line("LAN_VIRT", "bind_skipped port=%u requested=%s result=0", port, requested);
+        log_bind_always("bind_virtualized", s, 0, 0, name, namelen);
         return 0;
     }
     int r = g_next_bind(s, name, namelen);
     int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (r == 0) { SocketState *st = state_for(s, true); if (st) save_address(st, name, namelen, false); }
+    log_bind_always("bind", s, r, e, name, namelen);
     log_io("bind", s, r, e, name, namelen, nullptr, 0); if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1096,6 +1122,9 @@ int WSAAPI hook_shutdown(SOCKET s, int how) {
 
 SOCKET WSAAPI hook_wsasocketw(int af, int type, int protocol, LPWSAPROTOCOL_INFOW info, GROUP group, DWORD flags) {
     SOCKET s = g_next_wsasocketw ? g_next_wsasocketw(af, type, protocol, info, group, flags) : INVALID_SOCKET;
+    // Unconditional for the same reason as hook_socket: FUN_00a79b80 uses plain socket(),
+    // so a WSASocketW without a matching bind narrows the diagnosis further rather than
+    // being noise. See the note on hook_socket.
     log_line("SOCKET", "api=WSASocketW af=%d type=%d protocol=%d flags=0x%lX result=%lld error=%d/%s",
         af, type, protocol, flags, (long long)s,
         s == INVALID_SOCKET ? WSAGetLastError() : 0,
