@@ -1,8 +1,85 @@
 # Build toolchain divergence: the v0.1.0 release binary is not a local build
 
-**Status: confirmed by binary evidence. Root cause of the bind investigation's dead end.**
+**Status: superseded in part. See §0. The toolchain divergence is real, but it is NOT
+the cause of the bind difference and it is NOT a CI-vs-local-only effect.**
 
-## 1. The finding
+## 0. Correction (2026-10-13, after CI-built Port 1 and CI-built main became available)
+
+Two CI artifacts were built from the same runner image, which removes the confound:
+
+- `references/issues/v0.1.0_release` — the GitHub Release artifact for `v0.1.0` (binds)
+- `references/issues/main_release` — CI build of `main` @ `01450ac`
+- `references/issues/0032f83_release` — CI build of Port 1 @ `0032f83`
+
+### 0.1 CI v0.1.0 and CI main are the same binary
+
+| property | CI v0.1.0 | CI main |
+|---|---|---|
+| x86 size | 150528 | 150528 |
+| identical bytes | — | **150497 / 150528 = 99.98 %** |
+| `.rdata` string diff | — | **0 differences** |
+
+All 31 differing bytes are accounted for:
+
+- `0x80`–`0xDF` — the XOR-encoded Rich header, because the XOR key differs
+  (`0x89F632A5` → `0x89F632A9`). The only decoded difference is the linker entries
+  `0x102`/`0x105`, build `35228` → `35229`.
+- `0x100`–`0x102` and `0x2101C`–`0x2101E` — the PE `TimeDateStamp`
+  (`0x6AAA5FD5` → `0x6ACDA199`), stored once in the COFF header and once in the
+  debug directory.
+
+**So `main` really does rebuild to the same binary as `v0.1.0`.** The user's
+expectation here was correct, and the earlier claim that the two were materially
+different binaries does not hold between two CI builds.
+
+### 0.2 CI Port 1 vs CI main: 83.6 % of bytes differ, but the code is the same code
+
+| property | CI main | CI Port 1 |
+|---|---|---|
+| x86 size | 150528 | 150528 |
+| byte diff | — | 125891 (83.6 %) |
+| `.text` per-section identical | — | **3.2 %** |
+| `.text` shared 4-byte words (multiset) | — | **94.9 %** |
+| `.rdata` string diff | — | exactly 2: `bind_virtualized`, the new format string |
+| `.text` growth | 0x198B0 | 0x19980 (**+0xD0 = 208 bytes**) |
+| `.reloc` growth | 0x16A0 | 0x16B8 (**+0x18 = 6 relocation entries**) |
+
+The byte-position comparison is dominated by a **layout shift**: the 208 extra
+bytes of `.text` move everything after the insertion point, so a naive
+position-wise diff reports ~84 %. Measured as a multiset of 4-byte words
+(shift-insensitive), 94.9 % of the code words are shared, and the visible
+strings differ by exactly the two Port 1 log strings — nothing else.
+
+A constant-delta model does **not** fit cleanly (best delta `+0xD0` matches
+86.2 %, common prefix under that delta is 0 bytes), so the insertion is not one
+contiguous block; `log_bind_always` is called from two sites in `hook_bind`,
+which would produce exactly this shape.
+
+**Conclusion: Port 1's CI build is a faithful CI build of Port 1.** The 84 % figure
+is a measurement artifact, not evidence of a different program.
+
+### 0.3 What this does and does not settle
+
+- It **does** settle the Port 0 prerequisite from the original plan. Reproducing
+  CRT 33145 locally, or building both sides on CI, is **no longer needed**: the
+  release artifact and Port 1 are already CI-built and mutually comparable.
+- It **does** confirm the toolchain divergence is real and CI-wide, but shows it
+  is **constant across CI builds** — v0.1.0 and Port 1 both use CRT 33145 and
+  linker 35228/35229. The toolchain therefore cannot distinguish "binds" from
+  "does not bind" between two CI builds; it only distinguishes CI from this host
+  (CRT 27412).
+- It **does not** prove Port 1's code causes the bind difference. Port 1 adds
+  logging only and does not alter control flow, so a CI-built Port 1 is expected
+  to behave like a locally built Port 1. Testing it is still worthwhile only to
+  confirm that expectation; it cannot by itself find the cause.
+
+**The remaining unknown is the runtime environment, not the binary.** Given a
+CI-built binary that provably contains the same code, if it still fails to bind
+on a given machine while the v0.1.0 artifact binds, the difference must come from
+the environment (adapter count, whether netenv loaded, `Fake Ethernet` presence),
+not from the DLL.
+
+## 1. The original finding (still valid for CI-vs-local)
 
 `git diff v0.1.0 main -- src/` produces **no output**. The source is identical. That was
 taken to mean the two DLLs are equivalent, and every subsequent A/B relied on it.
@@ -135,23 +212,32 @@ first thing to eliminate.
    checked, all three cases were 1:1 and it carried no information.
 6. **Matching a vtable slot against a field offset.** `isRetryEnable` printed via vtable
    slot `+0x50` was briefly treated as the field at offset `+0x50`. They are unrelated.
+7. **Reading a raw byte-diff percentage as a measure of program difference.** CI Port 1
+   vs CI main differ in 83.6 % of bytes, but 94.9 % of `.text` 4-byte words are shared
+   and the string sets differ by exactly the two new log strings. A code insertion shifts
+   every later byte; position-wise diffing cannot distinguish that from a rewrite.
+   Compare shift-insensitively (word multiset, or string sets) before concluding.
+8. **Assuming two builds differ because the source differs.** The correct comparison of
+   CI v0.1.0 against CI main is 99.98 % identical bytes, all 31 differences explained by
+   the Rich XOR key and the PE timestamp.
 
-## 6. Next step (needs a machine)
+## 6. Next step
 
-Reproduce the CI binary locally, then bisect between the two builds.
+**Original step 1–3 are obsolete.** Reproducing CRT 33145 locally, or building Port 1
+on CI, was the proposed prerequisite. Both CI artifacts now exist (§0), so both sides
+of the comparison come from the same runner image. That work is unnecessary.
 
-1. Determine which toolset directory the CI runner resolved. The `windows-2022` image
-   plus run `35078996453` used `VsDevCmd.bat`; the Rich header says CRT build 33145, which
-   pins it to a specific MSVC version directory.
-2. Build the same tag with that toolset/CRT on this machine and confirm the Rich header
-   reports 33145 and the size returns to 150528/184832. If it does, the two builds become
-   directly comparable and every difference from that point is a real code difference.
-3. If the local host cannot produce 33145, run the experiment the other way: build Port 1
-   **on CI** and test that artifact, so both sides come from the same image.
-4. Only after the build is held constant does a Port 1 A/B mean anything.
+The open question is no longer the toolchain. It is:
 
-Until step 1 or 3 completes, the bind question has no controlled experiment available,
-and no further log reading will answer it.
+1. Run the CI-built Port 1 artifact and the CI-built `main`/v0.1.0 artifact on the same
+   machine under the same conditions, and record the `ADAPTER` section plus the
+   `BIND`-category line count (category column index 4, never a substring match).
+2. If CI-built Port 1 still does not bind while CI-built main does, the binary is
+   exonerated and the **environment** is the variable: adapter count, netenv
+   installation order, `Fake Ethernet` presence.
+3. Only then return to the porting queue (`docs/porting-plan.md`), starting at
+   `db6d49a` — the directed-broadcast fix — which addresses a real, independently
+   verified defect regardless of the bind question.
 
 ## 7. Tools added
 
