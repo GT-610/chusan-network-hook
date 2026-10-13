@@ -58,6 +58,65 @@ which would produce exactly this shape.
 **Conclusion: Port 1's CI build is a faithful CI build of Port 1.** The 84 % figure
 is a measurement artifact, not evidence of a different program.
 
+### 0.2.1 The x64 half of the same experiment
+
+Every measurement above was repeated on x64 to confirm it is not an x86 artifact.
+
+**CI v0.1.0 vs CI main (x64):** 99.84 % identical bytes, 295 differing. The count is
+higher than x86's 31 for a specific structural reason:
+
+- `e_lfanew` is `0xF0` in v0.1.0 and `0xF8` in main. The linker placed the PE header
+  8 bytes later, so the whole header block is shifted by 8.
+- Once the shift is removed, the **section tables are byte-identical (0 / 240 bytes
+  differ)**, and every section compares equal at its own raw pointer:
+
+| section | identical |
+|---|---|
+| `.text` | **100.00 %** (117248 / 117248) |
+| `.rdata` | 99.99 % (53245 / 53248) |
+| `.data` | 100.00 % |
+| `.pdata` | 100.00 % |
+| `.fptable` | 100.00 % |
+| `.reloc` | 100.00 % |
+
+- Remaining differences: the Rich XOR key (linker `35228` → `35229`), the PE
+  `TimeDateStamp` at `0xF8`/`0x100` and its debug-directory copy, and the 8-byte
+  header shift itself. The 3 non-timestamp bytes in `.rdata` are the shifted
+  `TimeDateStamp` fields.
+
+**CI main vs CI Port 1 (x64):** the same picture as x86.
+
+| property | CI main | CI Port 1 |
+|---|---|---|
+| x64 size | 184832 | 185856 |
+| byte diff | — | 157467 (85.2 %) |
+| `.text` per-section identical | — | 3.60 % |
+| `.text` shared 4-byte words (multiset) | — | **92.3 %** |
+| `.text` growth (virtual) | 0x1C8F0 | 0x1CA30 (**+0x140 = 320 bytes**) |
+| `.text` growth (raw) | 0x1CA00 | 0x1CC00 (**+0x200**) |
+| `.reloc` growth | 0x71C | 0x71C (**unchanged**) |
+
+String diff, CI v0.1.0 vs CI Port 1 (x64): nothing removed, 5 added —
+the two Port 1 log strings plus three artefacts of the new function's x64
+prologue (`SUVWAVAWH`, `A_A^_^][`, `t2@8-Q[`), which are register-save
+sequences that happen to be printable ASCII.
+
+**Why x64 (92.3 %) is slightly below x86 (94.9 %):** both show the same profile
+once `.text` is split, with the half containing the insertion scoring lower:
+
+| | first half | second half |
+|---|---|---|
+| x86 | 91.8 % | 97.6 % |
+| x64 | 89.9 % | 93.9 % |
+
+That is the expected signature of an insertion: everything before it stays
+aligned, everything after shifts by the inserted length. It is consistent across
+both architectures.
+
+**Conclusion: x64 independently reproduces the x86 result.** `main` and `v0.1.0`
+are the same program on both architectures; Port 1 adds only the expected logging
+on both. No x64-specific divergence exists.
+
 ### 0.3 What this does and does not settle
 
 - It **does** settle the Port 0 prerequisite from the original plan. Reproducing
@@ -218,8 +277,14 @@ first thing to eliminate.
    every later byte; position-wise diffing cannot distinguish that from a rewrite.
    Compare shift-insensitively (word multiset, or string sets) before concluding.
 8. **Assuming two builds differ because the source differs.** The correct comparison of
-   CI v0.1.0 against CI main is 99.98 % identical bytes, all 31 differences explained by
-   the Rich XOR key and the PE timestamp.
+   CI v0.1.0 against CI main is 99.98 % identical bytes on x86 and 99.84 % on x64, with
+   every difference explained by the Rich XOR key, the PE timestamp, and — on x64 only —
+   an 8-byte `e_lfanew` header shift.
+9. **Comparing sections at the wrong offset when the header moved.** On x64 the two CI
+   builds differ in `e_lfanew` (0xF0 vs 0xF8), so subtracting that shift from section
+   *content* offsets produced a bogus 6 % match, while comparing at each section's own
+   raw pointer gave 100 %. Section raw pointers live in the section table, which was
+   byte-identical in both.
 
 ## 6. Next step
 
