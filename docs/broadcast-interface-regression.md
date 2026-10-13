@@ -1,5 +1,12 @@
 # Broadcast interface resolution: investigation record
 
+> **Read with [`docs/build-toolchain-divergence.md`](build-toolchain-divergence.md).** The
+> evidence below compares a CI-built v0.1.0 artifact against locally built binaries, so it
+> does not isolate the code change. §3.5's conclusion ("the branch could not have caused
+> the bind") is withdrawn for that reason, and §4's evidence matrix should be read with
+> the build hash of each run in mind. The verified findings in §2 (netenv hardcodes the
+> values; game traffic uses the directed broadcast) still stand and are unaffected.
+
 **Status: unverified. The changes described here are not on `main`.**
 
 This document records an investigation into broadcast interface pinning that ran
