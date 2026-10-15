@@ -1337,6 +1337,15 @@ bool install_iat_hooks(HMODULE module) {
     if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
     const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (!dir.VirtualAddress) return false;
+    // Coverage is recorded per socket function, not just as a total, because
+    // "iat=installed" only means at least one slot was rewritten. A build that
+    // patched socket() but silently failed to patch bind() would still report
+    // installed, and the resulting gap would only show up as a missing call in
+    // the log. The counters below make that gap explicit.
+    const LONG patched_before = g_hook_count;
+    LONG candidates = 0;
+    LONG already_patched = 0;
+    LONG failed = 0;
     IMAGE_IMPORT_DESCRIPTOR *desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(base + dir.VirtualAddress);
     for (; desc->Name; ++desc) {
         const char *dll = reinterpret_cast<const char *>(base + desc->Name);
@@ -1366,7 +1375,8 @@ bool install_iat_hooks(HMODULE module) {
             for (auto &hook : g_hooks) {
                 if ((by_ordinal && ordinal != hook.ordinal) || (!by_ordinal && (!name || strcmp(name, hook.name)))) continue;
                 void **slot = reinterpret_cast<void **>(&iat->u1.Function);
-                if (*slot == hook.replacement) break;
+                if (*slot == hook.replacement) { ++already_patched; break; }
+                ++candidates;
                 if (*hook.next == nullptr) *hook.next = *slot;
                 DWORD old = 0;
                 if (VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old)) {
@@ -1374,10 +1384,30 @@ bool install_iat_hooks(HMODULE module) {
                     DWORD ignored; VirtualProtect(slot, sizeof(void *), old, &ignored);
                     FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void *));
                     InterlockedIncrement(&g_hook_count);
+                } else {
+                    // Never silent: a slot left unpatched means every call through
+                    // it bypasses the hook and is invisible in the log.
+                    const DWORD protect_error = GetLastError();
+                    ++failed;
+                    log_line("IAT", "patch_failed function=%s slot=%p error=%lu/%s",
+                        hook.name, (void *)slot, protect_error, "WIN32_ERROR");
                 }
                 break;
             }
         }
+    }
+    const LONG patched_now = g_hook_count - patched_before;
+    log_line("IAT", "coverage module_base=%p candidates=%ld patched=%ld already=%ld failed=%ld total=%ld",
+        (void *)base, candidates, patched_now, already_patched, failed, g_hook_count);
+    // Any function in the table that was never seen in this module's imports is
+    // reported too: that is how a build ends up hooking fewer paths than intended.
+    // ordinal==0 marks a table entry matched by name, so print the name only.
+    for (auto &hook : g_hooks) {
+        if (*hook.next != nullptr) continue;
+        if (hook.ordinal != 0)
+            log_line("IAT", "not_present function=%s ordinal=%u", hook.name, hook.ordinal);
+        else
+            log_line("IAT", "not_present function=%s", hook.name);
     }
     return g_hook_count != 0;
 }
