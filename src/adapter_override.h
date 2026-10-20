@@ -91,6 +91,11 @@ struct AdapterPresentation {
     bool gateway_fallback_enabled = false;
     in_addr gateway_fallback = {};
 
+    // GetBestRoute rewrite: keeps route lookups pointing at the presented interface when
+    // the real lookup would send the packet somewhere else.
+    bool route_override_enabled = false;
+    DWORD route_next_hop = 0;
+
     // amdaemon's gateway check is an ICMP echo (altrIcmpSendEcho @ 0x1403f0b00 ->
     // IcmpSendEcho2), and netenv made every echo succeed. Without that, a host whose
     // presented interface has no reachable router fails the check even though the LAN
@@ -119,6 +124,7 @@ using adapter_log_sink = void (*)(const char *message);
 inline volatile LONG g_info_calls = 0;
 inline volatile LONG g_addresses_calls = 0;
 inline volatile LONG g_icmp_calls = 0;
+inline volatile LONG g_route_calls = 0;
 
 inline adapter_log_sink &log_sink() {
     static adapter_log_sink sink = nullptr;
@@ -140,6 +146,7 @@ using get_adapters_info_fn = ULONG (WINAPI *)(PIP_ADAPTER_INFO, PULONG);
 using get_adapters_addresses_fn = ULONG (WINAPI *)(ULONG, ULONG, PVOID,
                                                    PIP_ADAPTER_ADDRESSES, PULONG);
 using get_if_table_fn = ULONG (WINAPI *)(PMIB_IFTABLE, PULONG, BOOL);
+using get_best_route_fn = DWORD (WINAPI *)(DWORD, DWORD, PMIB_IPFORWARDROW);
 using icmp_send_echo2_fn = ULONG (WINAPI *)(HANDLE, HANDLE, void *, PVOID, IPAddr,
                                             LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID,
                                             DWORD, DWORD);
@@ -154,6 +161,10 @@ inline get_adapters_addresses_fn &next_addresses() {
 }
 inline get_if_table_fn &next_table() {
     static get_if_table_fn fn = nullptr;
+    return fn;
+}
+inline get_best_route_fn &next_best_route() {
+    static get_best_route_fn fn = nullptr;
     return fn;
 }
 inline icmp_send_echo2_fn &next_icmp() {
@@ -529,6 +540,46 @@ inline ULONG WINAPI hook_GetIfTable(PMIB_IFTABLE table, PULONG size, BOOL order)
     return result;
 }
 
+// amdaemon resolves the gateway for its own checks through GetBestRoute
+// (FUN_1403bbbc0: GetBestRoute(0, dest, &row)). netenv hooked this and always reported
+// subnet|routerSuffix with IfIndex 1, which is why the baseline never had to care what
+// the adapter itself said. Reporting the presented interface keeps the two consistent.
+inline DWORD WINAPI hook_GetBestRoute(DWORD source, DWORD destination,
+                                      PMIB_IPFORWARDROW route) {
+    const AdapterPresentation &p = state();
+    if (!p.present || route == nullptr || !p.route_override_enabled) {
+        return next_best_route() ? next_best_route()(source, destination, route)
+                                 : ERROR_NOT_SUPPORTED;
+    }
+
+    // Scope matters more here than anywhere else in this hook. amdaemon also asks for
+    // routes to the game server; rewriting those onto a LAN-only adapter would break the
+    // server connection, which is the one thing this hook must not do. Only destinations
+    // inside the presented subnet are candidates.
+    const uint32_t mask = ntohl(p.presented_mask.s_addr);
+    const uint32_t network = ntohl(p.presented_network.s_addr) & mask;
+    const uint32_t target = ntohl(destination);
+    const bool inside = mask != 0 && mask != 0xFFFFFFFFu && (target & mask) == network;
+    if (!inside) {
+        return next_best_route()(source, destination, route);
+    }
+
+    const DWORD result = next_best_route()(source, destination, route);
+    if (result != ERROR_SUCCESS) return result;
+    if (route->dwForwardIfIndex == p.if_index) return result;
+
+    route->dwForwardIfIndex = p.if_index;
+    route->dwForwardNextHop = p.route_next_hop;
+    const LONG call = InterlockedIncrement(&g_route_calls);
+    if (call <= 4) {
+        adapter_hook_log("GetBestRoute: rewrote egress to if_index %lu next_hop %lu.%lu.%lu.%lu",
+            p.if_index,
+            (ntohl(p.route_next_hop) >> 24) & 255, (ntohl(p.route_next_hop) >> 16) & 255,
+            (ntohl(p.route_next_hop) >> 8) & 255, ntohl(p.route_next_hop) & 255);
+    }
+    return result;
+}
+
 // amdaemon measures the gateway with an ICMP echo:
 //   altrIcmpSendEcho @ 0x1403f0b00 -> IcmpSendEcho2(h, Event, NULL, NULL, dest, ...)
 // and treats getlastError() == 0x3E5 (ERROR_IO_PENDING) as success. netenv answered
@@ -554,6 +605,14 @@ inline ULONG WINAPI hook_IcmpSendEcho2(HANDLE icmp, HANDLE event, void *apc,
     const uint32_t mask = ntohl(p.presented_mask.s_addr);
     const uint32_t network = ntohl(p.presented_network.s_addr) & mask;
     const bool inside = mask != 0 && mask != 0xFFFFFFFFu && (host & mask) == network;
+    {
+        const LONG call = InterlockedIncrement(&g_icmp_calls);
+        if (call <= 8) {
+            adapter_hook_log("IcmpSendEcho2 #%ld: destination %lu.%lu.%lu.%lu -> %s",
+                call, (host >> 24) & 255, (host >> 16) & 255, (host >> 8) & 255, host & 255,
+                inside ? "virtualized success" : "passed through");
+        }
+    }
     if (!inside) {
         return next_icmp() ? next_icmp()(icmp, event, apc, apc_context, destination,
             request_data, request_size, request_options, reply_buffer, reply_size, timeout)

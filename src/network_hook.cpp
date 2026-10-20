@@ -47,6 +47,7 @@ struct Config {
     bool allow_loopback = false;
     bool force_directed_broadcast = true;
     bool virtualize_icmp = true;
+    bool override_best_route = true;
     bool force_limited_broadcast = true;
     bool force_tcp_source = true;
     bool strict = true;
@@ -326,6 +327,7 @@ void load_config() {
     g_config.exclusive = config_bool(L"network", L"exclusive", true);
     g_config.allow_loopback = config_bool(L"network", L"allowLoopback", false);
     g_config.virtualize_icmp = config_bool(L"network", L"virtualizeIcmp", true);
+    g_config.override_best_route = config_bool(L"network", L"overrideBestRoute", true);
     g_config.force_directed_broadcast =
         config_bool(L"network", L"forceDirectedBroadcast", true);
     g_config.force_limited_broadcast =
@@ -1640,6 +1642,10 @@ HookSpec g_iphlp_hooks[] = {
     // successes. See hook_IcmpSendEcho2 for why that matters on a router-less segment.
     {"IcmpSendEcho2", 0, (void *)adapter_override::hook_IcmpSendEcho2,
         (void **)&adapter_override::next_icmp()},
+    // amdaemon resolves egress through GetBestRoute too (FUN_1403bbbc0), and netenv
+    // hooked it for the same reason.
+    {"GetBestRoute", 0, (void *)adapter_override::hook_GetBestRoute,
+        (void **)&adapter_override::next_best_route()},
 };
 
 struct InstallReport { LONG candidates; LONG patched; LONG already; LONG failed; };
@@ -1823,6 +1829,12 @@ void configure_presentation() {
         presentation.presented_network.s_addr =
             htonl(ntohl(g_interface_address.s_addr) & ntohl(g_interface_mask.s_addr));
         presentation.virtualize_icmp = g_config.virtualize_icmp;
+        presentation.route_override_enabled = g_config.override_best_route;
+        // The next hop must be an address that is meaningful on the segment. The
+        // synthesised gateway is the only candidate this hook can vouch for.
+        presentation.route_next_hop = g_segatools.found
+            ? segatools::router_address(g_segatools).s_addr
+            : 0;
         {
             // Prefer the real MAC so anything that keys on it stays consistent.
             ULONG size = 0;
@@ -2015,6 +2027,11 @@ void prepare() {
                 (adapter_override::icmp_send_echo2_fn)GetProcAddress(iphlpapi, "IcmpSendEcho2");
             if (adapter_override::next_icmp() == nullptr) {
                 adapter_override::state().virtualize_icmp = false;
+            }
+            adapter_override::next_best_route() =
+                (adapter_override::get_best_route_fn)GetProcAddress(iphlpapi, "GetBestRoute");
+            if (adapter_override::next_best_route() == nullptr) {
+                adapter_override::state().route_override_enabled = false;
             }
         }
         adapter_override::log_sink() = [](const char *message) {
