@@ -527,7 +527,21 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
     // is the address to present, not merely a fallback for an empty field, so a real gateway
     // that sits outside the presented subnet has to be replaced here too.
     if (p.gateway_fallback_enabled) {
-        const bool replaced = chain_has_ipv4(keep->FirstGatewayAddress);
+        // Report only a real substitution: compare the address the adapter actually
+        // carries against the one being presented. `chain_has_ipv4` alone cannot tell
+        // them apart, because when the adapter's own gateway is already the right one the
+        // value is rewritten with itself.
+        in_addr previous = {};
+        bool had_previous = false;
+        if (keep->FirstGatewayAddress != nullptr &&
+            keep->FirstGatewayAddress->Address.lpSockaddr != nullptr &&
+            keep->FirstGatewayAddress->Address.lpSockaddr->sa_family == AF_INET) {
+            previous = reinterpret_cast<const sockaddr_in *>(
+                keep->FirstGatewayAddress->Address.lpSockaddr)->sin_addr;
+            had_previous = previous.s_addr != 0;
+        }
+        const bool substituted = !had_previous || previous.s_addr != p.gateway_fallback.s_addr;
+
         GatewayFallbackEntry &fallback = gateway_fallback_entry();
         memset(&fallback, 0, sizeof(fallback));
         fallback.entry.Length = sizeof(fallback.entry);
@@ -536,13 +550,23 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
         fallback.address.sin_family = AF_INET;
         fallback.address.sin_addr = p.gateway_fallback;
         keep->FirstGatewayAddress = &fallback.entry;
+
         static volatile LONG reported = 0;
-        if (replaced && InterlockedExchange(&reported, 1) == 0) {
+        if (substituted && InterlockedExchange(&reported, 1) == 0) {
             char text[INET_ADDRSTRLEN] = "-";
+            char was[INET_ADDRSTRLEN] = "-";
             InetNtopA(AF_INET, &p.gateway_fallback, text, sizeof(text));
-            adapter_hook_log("Adapter %lu's own gateway is not on the presented segment; "
-                "presenting %s as the gateway and the route next hop instead.", p.if_index,
+            if (had_previous) InetNtopA(AF_INET, &previous, was, sizeof(was));
+            adapter_hook_log("Adapter %lu %s; presenting %s as the gateway and the route "
+                "next hop instead.", p.if_index,
+                had_previous
+                    ? "reports a gateway that is not on the presented segment"
+                    : "reports no gateway",
                 text);
+            if (had_previous) {
+                adapter_hook_trace("replaced gateway %s with %s for if_index %lu", was, text,
+                    p.if_index);
+            }
         }
     }
 
