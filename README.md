@@ -1,75 +1,64 @@
 # chusan Network Hook
 
-An experimental pair of injection DLLs for controlling and diagnosing the local network behavior of `chusan`.
+Two injection DLLs that take over the local-network behaviour of `chusan` from segatools'
+`[netenv]`, so that in-store LAN play works with the stock `segatools.ini` unchanged.
 
-The project provides four related features:
+- chooses one network interface and presents it to the game the way `[netenv]` did, without
+  inventing an address;
+- pins the game's LAN broadcasts to that interface, including the directed subnet broadcast
+  the game actually uses;
+- binds outgoing game TCP connections to the same address;
+- answers the network-test items that otherwise fail on a segment with no router;
+- optionally virtualises LAN Install so UDP 40112 and TCP 40110 never reach the network.
 
-- choose one network interface and present it to the game the way segatools' `[netenv]`
-  did, without inventing an address;
-- pin the game's LAN broadcasts to that interface, including the directed subnet
-  broadcast the game actually uses;
-- bind outgoing game TCP connections to the same local IPv4 address;
-- optionally virtualize LAN Install so that UDP 40112 and TCP 40110 never reach the network.
-
-With no configuration at all, the hook reads `segatools.ini` and reuses the address
-segatools already tells the game to expect. See
-[`docs/netenv-takeover.md`](docs/netenv-takeover.md) for the design and
-[`docs/adapter-selection.md`](docs/adapter-selection.md) for the evidence behind it.
+See [`docs/adapter-selection.md`](docs/adapter-selection.md) for the disassembly and
+measurements behind all of it.
 
 ## Version support
 
-Tested with:
-
-- SDHD 2.50
-
-Other versions have not been tested.
+Tested with SDHD 2.50. Other versions have not been tested.
 
 ## Build
 
-Run the build script from an MSVC Developer Command Prompt, or from a regular command prompt on a machine with Visual Studio Build Tools installed:
+From an MSVC Developer Command Prompt, or any prompt on a machine with Visual Studio Build
+Tools:
 
 ```bat
 build.bat
 ```
 
-The script builds:
+That produces:
 
 - `build\chusan_network_hook_x64.dll` for `amdaemon.exe`;
 - `build\chusan_network_hook_x86.dll` for `chusanApp.exe`;
 - x64 and x86 smoke-test executables;
+- `build\probe_icmp_x64.exe`, which exercises the ICMP behaviour directly;
 - a copy of `network_hook.ini` beside the DLLs.
-
-Run the smoke tests with:
 
 ```bat
 build\network_hook_smoketest_x64.exe build\chusan_network_hook_x64.dll
 build\network_hook_smoketest_x86.exe build\chusan_network_hook_x86.dll
+build\probe_icmp_x64.exe
 ```
 
 ## Injection
 
-Load the matching DLL as an additional `capnhook` module:
-
-```bat
-inject_x64 -d -k chusanhook_x64.dll -k chusan_network_hook_x64.dll amdaemon.exe ...
-inject_x86 -d -k chusanhook_x86.dll -k chusan_network_hook_x86.dll chusanApp.exe
-```
-
-Place `network_hook.ini` in the same directory as each injected DLL. Both processes may share one configuration when both DLLs are stored together.
-
-For a normal `chusan` launch, load both architecture-specific DLLs. `amdaemon.exe` is a 64-bit process and owns LAN Install ports 40110 and 40112. `chusanApp.exe` is a 32-bit process and owns the Party, Setting, and Advertise traffic on ports 50200-50202. Loading only one DLL leaves the other process unmodified. If LAN Install virtualization is disabled and only Party/Setting/Advertise traffic is being tested, the x86 DLL is the relevant network hook, while the standard `chusanhook_x64.dll` is still required for the normal `amdaemon.exe` startup.
-
-A matching `launch.bat` therefore contains both injections:
+Load the matching DLL as an additional `capnhook` module. `amdaemon.exe` is the 64-bit
+process and owns LAN Install ports 40110/40112; `chusanApp.exe` is the 32-bit process and
+owns Party/Setting/Advertise on 50200-50202. Loading only one leaves the other unmodified.
 
 ```bat
 start "AM Daemon" /min inject_x64 -d -k chusanhook_x64.dll -k chusan_network_hook_x64.dll amdaemon.exe -c config_common.json config_server.json config_client.json config_cvt.json config_sp.json config_hook.json
 inject_x86 -d -k chusanhook_x86.dll -k chusan_network_hook_x86.dll chusanApp.exe
 ```
 
+Place `network_hook.ini` in the same directory as each injected DLL. Both processes may
+share one configuration when both DLLs are stored together.
+
 ## Configuration
 
-The supplied configuration enables interface selection with automatic choice, LAN Install
-virtualization, and concise console logging.
+The supplied file enables everything with automatic interface choice. All Boolean fields
+use `0` and `1`.
 
 ```ini
 [network]
@@ -80,6 +69,8 @@ exclusive=1
 allowLoopback=0
 forceDirectedBroadcast=1
 forceLimitedBroadcast=1
+virtualizeIcmp=1
+overrideBestRoute=1
 forceTcpSource=1
 strict=1
 
@@ -95,93 +86,98 @@ detailed=0
 writeFile=0
 ```
 
-All Boolean fields use `0` for disabled and `1` for enabled.
-
 ### Choosing the interface
 
 `[network] interface` accepts an IPv4 address, an adapter friendly name, or a numeric
-interface index. Leave it empty to let the hook decide:
+interface index. Left empty, the hook decides:
 
-1. the address implied by `segatools.ini` — `[keychip] subnet` combined with
-   `[netenv] addrSuffix` — **if a real adapter owns it**;
+1. the address implied by `segatools.ini` — `[keychip] subnet` with `[netenv] addrSuffix` —
+   **if a real adapter owns it**. This is the common case and what makes the stock file
+   work;
 2. the only acceptable adapter inside `[keychip] subnet`;
 3. the only acceptable adapter with a routable IPv4.
 
 "Acceptable" means a link type the game can use: Ethernet, or wireless (rewritten to
-Ethernet). TAP, Tailscale and similar virtual adapters report a link type the game
-rejects anyway, so they are not counted — which prevents them from making the choice
-look ambiguous.
+Ethernet). TAP, Tailscale and similar adapters report a link type the game rejects anyway,
+so they are not counted, which keeps them from making the choice look ambiguous.
 
-`mode` selects the policy when nothing real qualifies:
-
-| value | behaviour |
-| --- | --- |
-| `auto` | the order above; if nothing qualifies, no adapter is presented and the hook says so |
-| `native` | never synthesise; fail loudly |
-| `compat` | reproduce netenv's synthetic adapter, for hosts where nothing real qualifies |
+`mode=compat` additionally reproduces netenv's synthetic adapter when nothing real
+qualifies. It is off by default because that fake address is owned by no adapter, so
+`bind()` to it fails with `10049 WSAEADDRNOTAVAIL` unless it happens to be real. With
+`mode=auto` nothing is fabricated: the hook says what it could not find and leaves the real
+list alone.
 
 ### How the adapter is presented
 
-The hook rewrites **only the fields the game refuses**, and keeps the real identity:
+The hook rewrites **only the fields the game refuses** and keeps the real identity:
 
 - `chusanApp.exe` accepts `IP_ADAPTER_INFO.Type == 6` and nothing else, so a wireless
   adapter is reported as Ethernet. Ethernet needs no rewrite at all.
-- `IfIndex`, the IPv4 address and the prefix stay real. That is what makes
-  `bind()` and `IP_UNICAST_IF` work on the real stack, and what keeps `amdaemon`, which
-  looks adapters up by index through a second API, consistent.
+- `IfIndex`, the IPv4 address and the prefix stay real. That is what makes `bind()` and
+  `IP_UNICAST_IF` work on the real stack, and what keeps `amdaemon`, which looks adapters up
+  by index through a second API, consistent.
 - `exclusive=1` presents only the chosen adapter, so a lower-index adapter cannot win by
-  accident.
+  accident — the game takes the lowest index, which may be the wrong NIC.
 
-The adapter's DNS server list is preserved when it has one, and falls back to the
-`[netenv] routerSuffix` address when it does not, because `chusanApp` reads
-`FirstDnsServerAddress` during enumeration. Name resolution itself is untouched: that is
-segatools' separate `[dns]` component and stays active regardless of `[netenv] enable`.
+The gateway and the DNS server list are the two substituted values. Both must be usable on
+the presented segment, so the hook keeps a real gateway only when it lies inside
+`address & mask` and otherwise supplies the segment router — `[keychip] subnet` with
+`[netenv] routerSuffix`, which is the address netenv invented. The same value feeds the
+adapter field, the `GetAdaptersInfo` string and the route next hop, because the game
+cross-checks them. An empty DNS list, likewise, is a state netenv never produced.
 
 `[netenv] enable=1` in `segatools.ini` takes precedence: segatools patches the same three
-functions at the executable entry point and would overwrite these hooks, so the hook does
-not fight it. It reports the conflict instead, naming the file to edit. Set
-`[netenv] enable=0` to hand adapter presentation to this hook.
+functions at the executable entry point and would overwrite these hooks, so the hook does not
+fight it. It reports the conflict, naming the file to edit. Set `[netenv] enable=0` to hand
+adapter presentation to this hook.
 
 ### Interface pinning
 
-`forceLimitedBroadcast` covers `255.255.255.255`; `forceDirectedBroadcast` covers the
-subnet broadcast the game actually addresses, e.g. `192.168.139.255`. Both apply
-`IP_UNICAST_IF` with the **real** interface index before the packet is sent, leaving the
-destination and payload untouched. The scope is UDP 50200 for Party, 50201 for Setting,
-50202 for Advertise, and UDP 40112 when LAN Install virtualization is disabled.
+`forceLimitedBroadcast` covers `255.255.255.255`; `forceDirectedBroadcast` covers the subnet
+broadcast the game actually addresses, e.g. `192.168.139.255`. Both apply `IP_UNICAST_IF`
+with the **real** interface index before the packet is sent, leaving destination and payload
+untouched. The scope is UDP 50200 for Party, 50201 for Setting, 50202 for Advertise, and UDP
+40112 when LAN Install virtualization is disabled.
 
-`virtualizeIcmp=1` answers ICMP echoes as successes, in the same asynchronous form
-segatools' netenv used. Two network-test items depend on it: GATEWAY, which echoes the
-presented gateway, and NUMBER OF HOP, whose traceroute targets the ALL.Net authentication
-server. On a segment with no router - ZeroTier and other flat L2 networks - the gateway
-check fails without it.
+`forceTcpSource=1` binds an unbound client socket to the interface address before connecting
+to TCP 40110 or 50200-50202. Connections to `127.0.0.0/8` are left alone so the game's local
+Join Party path can reach itself. Listener sockets are never restricted.
 
-`icmpScope=all` (default) answers every destination, as netenv did: NUMBER OF HOP reads 1,
-which is what it has always read under netenv. `icmpScope=subnet` answers only inside the
-presented subnet, which leaves the hop traceroute running against the real network; if
-that path does not answer, the item stays at CHECKING and the network test never finishes,
-so the game does not start.
-
-The reported number is display-only - no game logic branches on it beyond the item's own
-verdict line - so a fabricated 1 is as good as any other value, and it is the one this
-launcher has always produced. See `docs/adapter-selection.md` §15 for the full chain and
-for why a "real" hop count is not obtainable from a hook.
-
-`forceTcpSource=1` binds an unbound client socket to the interface address before
-connecting to TCP 40110 or 50200-50202. Connections to `127.0.0.0/8` are left alone so the
-game's local Join Party path can reach itself. Listener sockets are never restricted.
+`overrideBestRoute=1` answers `GetBestRoute` from the presented adapter for every
+destination, as netenv did. It is a query only: real egress still follows the routing table,
+so the game server keeps its own path.
 
 `strict=1` turns a **misconfigured** interface into a hard block: if `interface` names
-something that cannot be resolved, the affected operation fails instead of silently using
-a different adapter. A hook that simply has not worked out an interface is reported once
-and left unpinned rather than blocked — an absent configuration is not a misconfiguration.
+something that cannot be resolved, the affected operation fails instead of silently using a
+different adapter. A hook that simply has not worked out an interface is reported once and
+left unpinned — an absent configuration is not a misconfiguration.
+
+### ICMP and the network-test items
+
+`virtualizeIcmp=1` answers every ICMP echo as a success, in the same asynchronous form
+`netenv` used (`IP_SUCCESS` in the reply, `ERROR_IO_PENDING` returned, the caller's event
+signalled). Two items depend on it:
+
+- **GATEWAY** echoes the presented gateway. On a segment with no router — ZeroTier and other
+  flat L2 networks — this fails without it, because the item has no address to compare
+  against.
+- **NUMBER OF HOP** is a traceroute to the ALL.Net authentication server. Answering every
+  probe holds it at **1**, which is exactly what it has always read under netenv: the trace
+  starts at TTL 1 and terminates on its first answered probe. That number is not a
+  measurement of the real path, and the game only compares it against zero.
+
+Answering every destination is not cosmetic for the second item. Scoping the answer to the
+presented subnet sends the traceroute's probes to a public address out on the real network;
+when that path does not answer, the item stays at `CHECKING`, the network test never
+finishes, and the game does not start. `virtualizeIcmp=0` is available for a host whose real
+ICMP path is known to work, and the hook warns at start-up that both items then depend on it.
 
 ### Preflight diagnostics
 
 Every decision is reported before the game starts: which `segatools.ini` was found, the
 subnet and suffix read from it, the resolved adapter with its address, mask, prefix and
-index, whether any field had to be rewritten, and every problem as an explicit `ERROR`
-line with the fix. Notable checks:
+index, whether any field had to be rewritten, and every problem as an explicit `ERROR` line
+with the fix. Notable checks:
 
 - the chosen address is not inside `[keychip] subnet`;
 - several interfaces could each carry the LAN;
@@ -190,56 +186,80 @@ line with the fix. Notable checks:
 
 ### LAN Install virtualization
 
-`[lanInstall] enable=1` preserves the existing isolated LAN Install behavior:
+`[lanInstall] enable=1` keeps LAN Install off the network entirely:
 
 - `bind` for ports 40110 and 40112 reports success without binding the socket;
-- TCP 40110 `listen`, `connect`, `accept`, and related WSA calls are simulated locally;
-- UDP 40112 sends report success without transmitting a packet;
+- TCP 40110 `listen`, `connect`, `accept` and the related WSA calls are simulated locally;
+- UDP 40112 sends report success without transmitting;
 - LAN Install receives report `WSAEWOULDBLOCK` without reading network data;
-- the known x64 `amdaemon.exe` duplicate-server check is patched to return `false` after its prologue is verified.
+- the known x64 `amdaemon.exe` duplicate-server check is patched to return `false` after its
+  prologue is verified.
 
-Set `enable=0` to pass real 40110 and 40112 traffic through WinSock. In that case the duplicate-server patch is not installed, and the `[network]` settings can pin real LAN Install traffic to the configured adapter.
+Set `enable=0` to pass real 40110/40112 traffic through WinSock. The duplicate-server patch
+is then not installed, and the `[network]` settings can pin real LAN Install traffic to the
+configured adapter.
 
-LAN Install virtualization does not fabricate a remote server, transfer installation data, or complete an `amdaemon` state machine that requires a valid received beacon.
+This does not fabricate a remote server, transfer installation data, or complete an
+`amdaemon` state machine that requires a valid received beacon.
 
 ### Logging
 
-`[log] enable=0` disables all hook logging.
+`[log] enable=0` silences everything except one `STATUS` line, always printed to `stderr` and
+`OutputDebugStringA`. That line is the proof the DLL loaded: it names the process, the
+architecture, whether the WinSock and LAN Install hooks installed, whether adapter
+presentation is active, and which interface was chosen.
 
-Two `STATUS` lines are always printed to `stderr` and `OutputDebugStringA`, even when `log.enable=0`. The first line shows the configuration path and the loaded Boolean values. The second line reports the process architecture, IAT hook result, LAN Install hook result, and network-interface state. These lines are intended to confirm that the DLL loaded and which settings it applied.
+With `enable=1` and `detailed=0` there are three lines at start-up — the status, the chosen
+interface, and any decision that changed what the game will see. Failures print as `ERROR`
+with the operation, the service, the address and the fix.
 
-With `enable=1` and `detailed=0`, the DLL prints concise English messages for startup, configuration, selected interfaces, forced routes, and actionable failures. Messages are sent to both `OutputDebugStringA` and `stderr`, so they are visible in an `inject -d` console.
+`detailed=1` adds the diagnostic stream: every hook installation and its coverage, adapter
+tables, route lookups, socket lifecycle, endpoints, byte counters, hexadecimal payload
+summaries, TCP stream framing and UDP frame parsing for 50200-50202, and AES-128-ECB prefix
+decoding with known message names where the packet format matches.
 
-Set `detailed=1` to enable the diagnostic logger ported from `chusan_netdiag`. Detailed output includes:
-
-- adapter addresses, metrics, interface indexes, and route selection;
-- socket lifecycle and WinSock return values;
-- local, remote, and target endpoints;
-- byte counters and hexadecimal payload summaries;
-- TCP stream framing and UDP frame parsing for ports 50200-50202;
-- AES-128-ECB prefix decoding with known message names when the packet format matches the recovered game protocol.
-
-`writeFile=1` additionally writes the same output to:
+`writeFile=1` writes the same output to:
 
 ```text
 network_hook_logs\network_hook_YYYYMMDD_HHMMSS_pidNNNN.log
 ```
 
-The directory is created beside the injected DLL. File output is flushed after every line to preserve evidence if the process exits unexpectedly.
+The directory is created beside the injected DLL. Each line is flushed, so evidence survives
+an unexpected exit.
+
+## How this differs from `[netenv]`
+
+| | netenv | this hook |
+|---|---|---|
+| adapter identity | invented: `subnet \| addrSuffix`, mask `/24`, `IfIndex = 1`, MAC `01:02:03:04:05:06` | the real adapter: real address, mask, prefix, `IfIndex`, MAC |
+| acceptance by the game | fakes the whole enumeration | rewrites only `Type`/`IfType` when the link type is not Ethernet |
+| `IP_UNICAST_IF` | `1`, a hardcoded index that pins nothing (`netenv.c:253`) | the real index (`probe_unicast_if.cpp` proves the egress moves) |
+| directed broadcast | rewritten to `255.255.255.255` (`redirectBroadcast`), hiding a subnet mismatch | sent as the game addressed it, pinned to the real interface |
+| `bind()` | only safe when the fake address happens to equal a real one; otherwise `10049 WSAEADDRNOTAVAIL` | always safe, because the address is owned |
+| `GetBestRoute` | fixed row, `IfIndex 1` | presented interface, next hop consistent with the adapter |
+| gateway | always `subnet \| routerSuffix` | the real one when it is on the presented segment, else the same fallback |
+| DNS server list | always `subnet \| routerSuffix` | the real list when present, else the same fallback |
+| ICMP | every echo `IP_SUCCESS`, TTL ignored | same, deliberately |
+| configuration | `[netenv]` must be edited per host | reads `segatools.ini` and works with it unmodified |
+| conflicts | patches process-wide, including over other hooks | reports a `[netenv] enable=1` conflict instead of fighting it |
+| failures | silent until the game cannot start | a start-up `ERROR` naming the operation and the fix |
+
+In one sentence: **netenv made an adapter that was internally consistent by inventing all of
+it; this hook keeps the real adapter and enforces the same consistency on the two fields the
+game cross-checks.**
 
 ## Limitations
-
-This project cannot guarantee connectivity under all circumstances. If you are still unable to connect, please check the following:
 
 | Symptom | Protocol and port | Possible causes |
 | --- | --- | --- |
 | LAN Install cannot find a server | UDP 40112, TCP 40110 | `lanInstall.enable`, duplicate-server filtering, firewall rules, adapter selection, or a network that does not pass the beacon |
-| Setting does not complete | UDP/TCP 50201 | The limited broadcast used the wrong adapter, or the host address in the broadcast payload is not reachable |
-| Recruitment is not visible | UDP 50200 | Wrong broadcast interface, firewall rules, VLAN isolation, router broadcast handling, or VPN limitations |
-| An invitation is visible but clicking it does nothing | TCP 50200 | The advertised host address is unreachable, TCP uses the wrong source interface, or the peer connection is blocked |
-| Advertise state does not synchronize | UDP 50202 | Wrong interface, firewall rules, or broadcast isolation |
-| The game reports no usable network adapter | adapter enumeration | Every adapter was refused: on Wi-Fi, [netenv] enable=1 in segatools.ini |
-| Startup prints [netenv] enable=1 ... leaving it alone | adapter enumeration | segatools owns adapter presentation; set [netenv] enable=0 so this hook can take over |
+| Setting does not complete | UDP/TCP 50201 | the broadcast used the wrong adapter, or the host address in its payload is not reachable |
+| Recruitment is not visible | UDP 50200 | wrong broadcast interface, firewall rules, VLAN isolation, router broadcast handling, or VPN limitations |
+| An invitation is visible but clicking it does nothing | TCP 50200 | the advertised host address is unreachable, TCP uses the wrong source interface, or the peer connection is blocked |
+| Advertise state does not synchronize | UDP 50202 | wrong interface, firewall rules, or broadcast isolation |
+| The game reports no usable network adapter | adapter enumeration | every adapter was refused: on Wi-Fi, `[netenv] enable=1` is still in control |
+| Startup prints `[netenv] enable=1 ... leaving it alone` | adapter enumeration | segatools owns adapter presentation; set `[netenv] enable=0` so this hook can take over |
+| `Setting` bind fails with `10013 WSAEACCES` | TCP 50201 | the port falls inside a Windows excluded range, not that it is occupied. Exclusion ranges are per protocol. Remove the range or stop `winnat` |
 
 ## License
 

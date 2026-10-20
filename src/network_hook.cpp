@@ -42,12 +42,14 @@ struct Config {
     bool network_enable = false;
     char interface_address[INET_ADDRSTRLEN] = {};
     char interface_selector[128] = {};
-    int mode = 0; // 0 auto, 1 native, 2 compat
+    // `compat` is the only mode that changes behaviour: it reproduces netenv's synthetic
+    // adapter when no real one qualifies. `auto` (the default) never fabricates; it
+    // reports what it could not find and leaves the real list alone.
+    bool fabricate_allowed = false;
     bool exclusive = true;
     bool allow_loopback = false;
     bool force_directed_broadcast = true;
     bool virtualize_icmp = true;
-    int icmp_scope = 0; // 0 all (netenv parity), 1 presented subnet only
     bool override_best_route = true;
     bool force_limited_broadcast = true;
     bool force_tcp_source = true;
@@ -59,14 +61,11 @@ struct Config {
     wchar_t segatools_path[MAX_PATH] = {};
 };
 
-enum class Mode { Auto, Native, Compat };
-
 HMODULE g_dll;
 SRWLOCK g_log_lock = SRWLOCK_INIT;
 SRWLOCK g_state_lock = SRWLOCK_INIT;
 Config g_config;
 HANDLE g_log_file = INVALID_HANDLE_VALUE;
-volatile LONG g_hook_count;
 volatile LONG g_duplicate_checks;
 LARGE_INTEGER g_qpc_frequency;
 LARGE_INTEGER g_qpc_start;
@@ -318,9 +317,10 @@ void load_config() {
 
     wchar_t mode[16] = {};
     GetPrivateProfileStringW(L"network", L"mode", L"auto", mode, _countof(mode), g_config_path);
-    if (_wcsicmp(mode, L"native") == 0) g_config.mode = 1;
-    else if (_wcsicmp(mode, L"compat") == 0) g_config.mode = 2;
-    else g_config.mode = 0;
+    // Only `compat` differs from the default. `auto` and `native` both refuse to
+    // fabricate; they were documented as different but never were, so there is one
+    // switch left rather than two names for the same behaviour.
+    g_config.fabricate_allowed = _wcsicmp(mode, L"compat") == 0;
 
     GetPrivateProfileStringW(L"segatools", L"path", L"", g_config.segatools_path,
         MAX_PATH, g_config_path);
@@ -328,15 +328,6 @@ void load_config() {
     g_config.exclusive = config_bool(L"network", L"exclusive", true);
     g_config.allow_loopback = config_bool(L"network", L"allowLoopback", false);
     g_config.virtualize_icmp = config_bool(L"network", L"virtualizeIcmp", true);
-    {
-        // all (default) reproduces netenv: every echo succeeds, so the traceroute that
-        // produces NUMBER OF HOP finishes on its first probe. subnet keeps the strict
-        // reading, at the cost of the traceroute running against the real internet path.
-        wchar_t scope[16] = {};
-        GetPrivateProfileStringW(L"network", L"icmpScope", L"all", scope, _countof(scope),
-            g_config_path);
-        g_config.icmp_scope = _wcsicmp(scope, L"subnet") == 0 ? 1 : 0;
-    }
     g_config.override_best_route = config_bool(L"network", L"overrideBestRoute", true);
     g_config.force_directed_broadcast =
         config_bool(L"network", L"forceDirectedBroadcast", true);
@@ -933,6 +924,16 @@ bool network_unresolved(const char *operation, uint16_t port) {
     return true;
 }
 
+// Per-socket detail. These used to be printed at INFO, which meant a working run
+// announced the same pin for every socket it pinned - one line per socket, all saying
+// the same thing. The start-up line already says pinning is on; this belongs in the
+// detailed log.
+void log_action(const char *service_name, const char *action, SOCKET socket, uint16_t port,
+                const char *detail) {
+    log_line("INTERFACE", "action=%s socket=%llu service=%s port=%u %s",
+        action, (unsigned long long)(uintptr_t)socket, service_name, port, detail);
+}
+
 bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
     if (!g_config.network_enable ||
         (!g_config.force_limited_broadcast && !g_config.force_directed_broadcast)) return true;
@@ -950,11 +951,10 @@ bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
         return network_failure("Selecting the broadcast interface", port, WSAGetLastError());
     }
     if (state != nullptr) state->broadcast_interface_configured = true;
-    human_line("INFO", "%s broadcast is pinned to %s (%s, index %lu).",
-        service(port), g_interface_ready_text(), g_interface_name, g_interface_index);
-    log_line("INTERFACE", "action=force_broadcast socket=%llu service=%s port=%u address=%s if_index=%lu result=0",
-        (unsigned long long)(uintptr_t)socket, service(port), port,
+    char detail[160] = {};
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "address=%s if_index=%lu",
         g_interface_ready_text(), g_interface_index);
+    log_action(service(port), "pin_broadcast", socket, port, detail);
     WSASetLastError(saved_error);
     return true;
 }
@@ -965,10 +965,10 @@ bool ensure_tcp_source(SOCKET socket, uint16_t port,
     if (loopback_target(target, target_length)) {
         char destination[96] = {};
         endpoint(target, target_length, destination, sizeof(destination));
-        human_line("INFO", "%s TCP loopback connection to %s keeps the loopback source.",
-            service(port), destination);
-        log_line("INTERFACE", "action=skip_tcp_source socket=%llu service=%s port=%u target=%s reason=loopback",
-            (unsigned long long)(uintptr_t)socket, service(port), port, destination);
+        char detail[128] = {};
+        _snprintf_s(detail, sizeof(detail), _TRUNCATE, "target=%s reason=loopback",
+            destination);
+        log_action(service(port), "keep_loopback_source", socket, port, detail);
         return true;
     }
     const int saved_error = WSAGetLastError();
@@ -1002,11 +1002,9 @@ bool ensure_tcp_source(SOCKET socket, uint16_t port,
         state->tcp_source_bound = true;
         save_address(state, reinterpret_cast<const sockaddr *>(&source), sizeof(source), false);
     }
-    human_line("INFO", "%s TCP connections are pinned to source address %s.",
-        service(port), g_interface_ready_text());
-    log_line("INTERFACE", "action=bind_tcp_source socket=%llu service=%s port=%u address=%s result=0",
-        (unsigned long long)(uintptr_t)socket, service(port), port,
-        g_interface_ready_text());
+    char detail[128] = {};
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "address=%s", g_interface_ready_text());
+    log_action(service(port), "bind_tcp_source", socket, port, detail);
     WSASetLastError(saved_error);
     return true;
 }
@@ -1224,24 +1222,6 @@ SOCKET WSAAPI hook_socket(int af, int type, int protocol) {
     return s;
 }
 
-// Traces every bind, including binds on ports this hook has no interest in.
-//
-// log_io drops any call whose port is not one of the five known services, which makes
-// "the game never called bind" and "the game called bind with an address we did not
-// expect" indistinguishable in a captured log. That ambiguity is what left the Setting
-// bind question open on the Child: its Setting bind is guarded by a game-side
-// condition, and a missing bind could not be told apart from an unlogged one.
-// Ported from the Port 1 branch, where it settled that question.
-void log_bind_always(const char *op, SOCKET s, int result, int error,
-                     const sockaddr *name, int namelen) {
-    char requested[96] = "-";
-    endpoint(name, namelen, requested, sizeof(requested));
-    log_line("BIND", "%s sock=%llu af=%d requested=%s namelen=%d result=%d error=%d/%s",
-        op, (unsigned long long)(uintptr_t)s,
-        name != nullptr ? (int)name->sa_family : -1,
-        requested, namelen, result, error, wsa_name(error));
-}
-
 int WSAAPI hook_bind(SOCKET s, const sockaddr *name, int namelen) {
     const uint16_t port = port_of(name, namelen);
     if (g_config.lan_install_enable && lan_install_port(port)) {
@@ -1249,13 +1229,11 @@ int WSAAPI hook_bind(SOCKET s, const sockaddr *name, int namelen) {
         if (state) { state->virtual_lan_port = port; save_address(state, name, namelen, false); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
         log_line("LAN_VIRT", "bind_skipped port=%u requested=%s result=0", port, requested);
-        log_bind_always("bind_virtualized", s, 0, 0, name, namelen);
         return 0;
     }
     int r = g_next_bind(s, name, namelen);
     int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (r == 0) { SocketState *st = state_for(s, true); if (st) save_address(st, name, namelen, false); }
-    log_bind_always("bind", s, r, e, name, namelen);
     log_io("bind", s, r, e, name, namelen, nullptr, 0); if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1640,7 +1618,7 @@ HookSpec g_hooks[] = {
 
 // Adapter presentation is installed separately from the WinSock table because it
 // comes from iphlpapi.dll and, unlike the WinSock hooks, it has to be in place
-// before the game enumerates adapters. See docs/netenv-takeover.md #7.
+// before the game enumerates adapters. See docs/adapter-selection.md #4.
 HookSpec g_iphlp_hooks[] = {
     {"GetAdaptersInfo", 0, (void *)adapter_override::hook_GetAdaptersInfo,
         (void **)&adapter_override::next_info()},
@@ -1662,12 +1640,15 @@ HookSpec g_iphlp_hooks[] = {
 struct InstallReport { LONG candidates; LONG patched; LONG already; LONG failed; };
 
 // `quiet` is required when this runs from DllMain: the normal loggers take a lock and
-// touch the filesystem, which is forbidden under the loader lock.
+// touch the filesystem, which is forbidden under the loader lock. In that mode the whole
+// table collapses into one line, because "which functions did it manage to hook" is a
+// single fact and printing it five times is how a working start-up comes to look busy.
 InstallReport install_hook_table(HMODULE module, const char *dll_a, const char *dll_b,
                                  HookSpec *specs, size_t spec_count, const char *tag,
                                  bool quiet) {
     InstallReport report = {};
     if (!module) return report;
+    char patched_names[512] = {};
     unsigned char *base = reinterpret_cast<unsigned char *>(module);
     IMAGE_DOS_HEADER *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return report;
@@ -1717,11 +1698,12 @@ InstallReport install_hook_table(HMODULE module, const char *dll_a, const char *
                     *slot = hook.replacement;
                     DWORD ignored; VirtualProtect(slot, sizeof(void *), old, &ignored);
                     FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void *));
-                    InterlockedIncrement(&g_hook_count);
                     ++report.patched;
-                    // Name every patched function. "3 slots" could not be told apart from
-                    // "the three I expected" without guessing which three they were.
-                    if (quiet) defer_info("[%s] patched %s", tag, hook.name);
+                    if (quiet) {
+                        _snprintf_s(patched_names + strlen(patched_names),
+                            sizeof(patched_names) - strlen(patched_names), _TRUNCATE,
+                            "%s%s", patched_names[0] ? ", " : "", hook.name);
+                    }
                 } else {
                     // Never silent: a slot left unpatched means every call through
                     // it bypasses the hook and is invisible in the log.
@@ -1741,8 +1723,10 @@ InstallReport install_hook_table(HMODULE module, const char *dll_a, const char *
 
     if (quiet) {
         if (report.patched)
-            human_line("INFO", "[%s] installed %ld hook slot(s) in module %p.", tag, report.patched,
-                (void *)base);
+            defer_info("[%s] hooked %ld function(s): %s", tag, report.patched, patched_names);
+        if (report.failed)
+            defer_info("[%s] %ld function(s) could not be hooked; calls through them are "
+                "not intercepted", tag, report.failed);
     } else {
         log_line("IAT", "coverage table=%s module_base=%p candidates=%ld patched=%ld already=%ld failed=%ld",
             tag, (void *)base, report.candidates, report.patched, report.already, report.failed);
@@ -1811,6 +1795,26 @@ extern "C" __declspec(noinline) bool lan_duplicate_server_false() {
 #endif
 
 
+// The address this hook presents as the segment router.
+//
+// With segatools.ini present that is the address netenv invented for the same purpose -
+// [keychip] subnet with [netenv] routerSuffix, default .254. Without it there is no
+// configured value, and a flat L2 segment often reports no gateway of its own, so the
+// last usable host of the presented subnet is used instead. Either way the answer is
+// inside the subnet, which is the property the game's gateway check tests for.
+in_addr segment_router_address() {
+    if (g_segatools.found) {
+        const in_addr configured = segatools::router_address(g_segatools);
+        if (configured.s_addr != 0) return configured;
+    }
+    const uint32_t mask = ntohl(g_interface_mask.s_addr);
+    if (mask == 0 || mask == 0xFFFFFFFFu) return in_addr{};
+    const uint32_t network = ntohl(g_interface_address.s_addr) & mask;
+    in_addr result = {};
+    result.s_addr = htonl((network | ~mask) - 1);
+    return result;
+}
+
 // Decides whether this process presents a shaped adapter list to the game, and
 // fills in the shape. Runs from DllMain, so it may only call defer_line().
 void configure_presentation() {
@@ -1837,40 +1841,13 @@ void configure_presentation() {
         presentation.address = g_interface_address;
         presentation.mask = g_interface_mask;
         presentation.prefix_length = g_interface_prefix_length;
-        // The presented subnet bounds which ICMP echoes are answered when the scope is
-        // restricted; see hook_IcmpSendEcho2 and the NUMBER OF HOP note there.
-        presentation.presented_mask = g_interface_mask;
-        presentation.presented_network.s_addr =
-            htonl(ntohl(g_interface_address.s_addr) & ntohl(g_interface_mask.s_addr));
         presentation.virtualize_icmp = g_config.virtualize_icmp;
-        presentation.icmp_all_destinations = g_config.icmp_scope == 0;
         if (!g_config.virtualize_icmp) {
-            defer_line("ICMP virtualisation is disabled, so the GATEWAY and NUMBER OF HOP "
-                "items run against the real network. Both can stall the network test on a "
-                "segment without a reachable router; set [network] virtualizeIcmp=1 to "
-                "answer them instead.");
-        } else if (g_config.icmp_scope == 0) {
-            defer_info("ICMP echoes to every destination are answered, as segatools' "
-                "netenv did. NUMBER OF HOP will read 1, which is what it has always shown "
-                "under netenv; it is not a measurement of the real path.");
-        } else {
-            defer_info("ICMP echoes are answered only inside the presented subnet. The "
-                "NUMBER OF HOP traceroute targets the ALL.Net authentication server, so "
-                "those probes use the real network and can leave that item at CHECKING. "
-                "Set [network] icmpScope=all to finish the test.");
+            defer_info("ICMP virtualisation is off, so the GATEWAY and NUMBER OF HOP items "
+                "run against the real network. On a segment without a reachable router both "
+                "fail, and NUMBER OF HOP can hold the whole network test at CHECKING.");
         }
         presentation.route_override_enabled = g_config.override_best_route;
-        // The next hop must be an address that is meaningful on the segment. The
-        // synthesised gateway is the only candidate this hook can vouch for.
-        if (g_segatools.found) {
-            presentation.route_next_hop = segatools::router_address(g_segatools).s_addr;
-        } else {
-            // No segatools.ini: the highest host address on the presented subnet is the
-            // only next hop this hook can justify.
-            const uint32_t network =
-                ntohl(g_interface_address.s_addr) & ntohl(g_interface_mask.s_addr);
-            presentation.route_next_hop = htonl(network | 0xFEu);
-        }
         {
             // Prefer the real MAC so anything that keys on it stays consistent.
             ULONG size = 0;
@@ -1892,76 +1869,42 @@ void configure_presentation() {
                                     g_interface_name, (unsigned long)a->IfType,
                                     a->IfType == kWirelessType ? "wireless" : "other");
                             }
-                            // chusanApp walks FirstDnsServerAddress while enumerating, so
-                            // an adapter with no DNS server must not hand it a blank list.
-                            // Keep the real server when there is one; otherwise fall back
-                            // to the router, which is what netenv always reported.
+                            // chusanApp walks FirstDnsServerAddress while enumerating, so an
+                            // adapter with no DNS server must not hand it a blank list. Keep
+                            // the real server when there is one; otherwise fall back to the
+                            // router, which is the only value netenv ever reported.
+                            const in_addr segment_router = segment_router_address();
                             if (chain_has_ipv4(a->FirstDnsServerAddress)) {
                                 presentation.dns_fallback_enabled = false;
                             } else {
-                                presentation.dns_fallback_enabled = true;
-                                presentation.dns_fallback = g_segatools.found
-                                    ? segatools::router_address(g_segatools)
-                                    : in_addr{};
-                                if (presentation.dns_fallback.s_addr == 0) {
-                                    presentation.dns_fallback_enabled = false;
-                                } else {
-                                    char text[INET_ADDRSTRLEN] = {};
-                                    InetNtopA(AF_INET, &presentation.dns_fallback, text, sizeof(text));
-                                    defer_info("Adapter %s reports no DNS server; presenting %s "
-                                        "(the [netenv] routerSuffix address) so the game does "
-                                        "not enumerate an empty DNS list.", g_interface_name, text);
-                                }
+                                presentation.dns_fallback = segment_router;
+                                presentation.dns_fallback_enabled =
+                                    presentation.dns_fallback.s_addr != 0;
                             }
 
-                            // The presented gateway has to be reachable on the presented
-                            // segment. netenv guaranteed that by construction: it invented
-                            // subnet|routerSuffix. A real adapter does not, and a gateway
-                            // outside the adapter's own subnet is not a usable default
-                            // gateway for that adapter anyway.
+                            // The presented gateway has to sit on the presented segment.
+                            // netenv guaranteed that by inventing subnet|routerSuffix; a real
+                            // adapter does not, and a gateway outside the adapter's own subnet
+                            // is not a usable default gateway for it anyway. One address
+                            // serves the adapter field, the GetAdaptersInfo string and the
+                            // route next hop, because the game cross-checks them.
+                            const uint32_t mask = ntohl(g_interface_mask.s_addr);
+                            const uint32_t network = ntohl(g_interface_address.s_addr) & mask;
+                            in_addr gateway = {};
                             bool gateway_usable = false;
-                            in_addr real_gateway = {};
                             if (chain_has_ipv4(a->FirstGatewayAddress)) {
-                                real_gateway = reinterpret_cast<const sockaddr_in *>(
+                                gateway = reinterpret_cast<const sockaddr_in *>(
                                     a->FirstGatewayAddress->Address.lpSockaddr)->sin_addr;
-                                const uint32_t mask = ntohl(g_interface_mask.s_addr);
-                                const uint32_t network =
-                                    ntohl(g_interface_address.s_addr) & mask;
                                 gateway_usable = mask != 0 &&
-                                    ((ntohl(real_gateway.s_addr) & mask) == network);
-                                char text[INET_ADDRSTRLEN] = {};
-                                InetNtopA(AF_INET, &real_gateway, text, sizeof(text));
-                                defer_info("Adapter %s reports gateway %s; %s.",
-                                    g_interface_name, text,
-                                    gateway_usable
-                                        ? "it is inside the presented subnet and is kept"
-                                        : "it is outside the presented subnet, so it is "
-                                          "replaced with the segment router address");
+                                    (ntohl(gateway.s_addr) & mask) == network;
                             }
-
-                            // One address serves both the adapter field and the route next
-                            // hop. Deriving them separately let the two disagree, and a
-                            // disagreement between "what the adapter says the gateway is"
-                            // and "where the route says traffic goes" is exactly the kind
-                            // of inconsistency netenv never produced.
-                            if (gateway_usable) {
-                                presentation.gateway_effective = real_gateway;
-                                presentation.gateway_fallback_enabled = false;
-                            } else {
-                                const in_addr segment_router = g_segatools.found
-                                    ? segatools::router_address(g_segatools)
-                                    : in_addr{};
-                                presentation.gateway_effective = segment_router;
-                                if (segment_router.s_addr != 0) {
-                                    presentation.gateway_fallback = segment_router;
-                                    presentation.gateway_fallback_enabled = true;
-                                    char text[INET_ADDRSTRLEN] = {};
-                                    InetNtopA(AF_INET, &segment_router, text, sizeof(text));
-                                    defer_info("Adapter %s has no on-segment gateway; presenting "
-                                        "%s for both the adapter field and the route next hop.",
-                                        g_interface_name, text);
-                                }
-                            }
+                            if (!gateway_usable) gateway = segment_router;
+                            presentation.gateway_fallback = gateway;
+                            presentation.gateway_fallback_enabled = gateway.s_addr != 0;
+                            presentation.route_next_hop = gateway.s_addr;
+                            // Reported by the hook itself, at the moment it actually
+                            // substitutes the value, rather than here where it is only
+                            // being decided. One line, once, and only when it changed.
                             break;
                         }
                     }
@@ -1972,7 +1915,7 @@ void configure_presentation() {
         return;
     }
 
-    if (g_config.mode == 2 && g_segatools.found) {
+    if (g_config.fabricate_allowed && g_segatools.found) {
         // Explicit compat: reproduce netenv's synthetic adapter. Only reachable when
         // asked for, because the fake address is not owned by any adapter and
         // bind() to it fails with WSAEADDRNOTAVAIL unless it happens to be real.
@@ -2100,7 +2043,10 @@ void prepare() {
             }
         }
         adapter_override::log_sink() = [](const char *message) {
-            human_line("ADAPTER_HOOK", "%s", message);
+            human_line("ADAPTER", "%s", message);
+        };
+        adapter_override::trace_sink() = [](const char *message) {
+            log_line("ADAPTER", "%s", message);
         };
         if (adapter_override::next_info() == nullptr ||
             adapter_override::next_addresses() == nullptr ||
@@ -2132,32 +2078,8 @@ DWORD WINAPI initialize(void *) {
     // the diagnostics appear in the order the decisions were made.
     flush_pending();
 
-    status_line("config=%s network.enable=%d interface=%s mode=%d exclusive=%d strict=%d "
-        "lanInstall.enable=%d log.enable=%d log.detailed=%d log.writeFile=%d",
-        config_path, g_config.network_enable ? 1 : 0,
-        g_config.interface_selector[0] ? g_config.interface_selector : "(auto)",
-        g_config.mode, g_config.exclusive ? 1 : 0, g_config.strict ? 1 : 0,
-        g_config.lan_install_enable ? 1 : 0, g_config.log_enable ? 1 : 0,
-        g_config.log_detailed ? 1 : 0, g_config.log_write_file ? 1 : 0);
-
-    human_line("INFO", "Starting in %s (%s).", exe,
-#ifdef _WIN64
-        "x64"
-#else
-        "x86"
-#endif
-    );
     if (g_config.log_write_file && g_log_file == INVALID_HANDLE_VALUE)
         human_line("ERROR", "File logging was requested, but the log file could not be created.");
-    if (g_network_ready) {
-        char text[INET_ADDRSTRLEN] = {};
-        char mask[INET_ADDRSTRLEN] = {};
-        InetNtopA(AF_INET, &g_interface_address, text, sizeof(text));
-        InetNtopA(AF_INET, &g_interface_mask, mask, sizeof(mask));
-        human_line("INFO", "Using %s (%s) address=%s mask=%s prefix=/%lu index=%lu.",
-            g_interface_name, "interface", text, mask, g_interface_prefix_length,
-            g_interface_index);
-    }
     initialize_crypto();
     log_adapters();
     bool iat = install_iat_hooks(process);
@@ -2174,42 +2096,52 @@ DWORD WINAPI initialize(void *) {
     log_line("START", "process=%s architecture=x86 image_base=%p iat=%s ports=40110,40112,50200,50201,50202 lan_duplicate_hook=not_available",
         exe, process, iat ? "installed" : "not_installed");
 #endif
-    const char *network_status = !g_config.network_enable ? "disabled" :
-        (g_network_ready ? "ready" : "failed");
-    char interface_text[INET_ADDRSTRLEN] = "(not selected)";
-    if (g_network_ready) InetNtopA(AF_INET, &g_interface_address, interface_text, sizeof(interface_text));
-    status_line("startup process=%s architecture=%s iat_hooks=%s lanInstallHook=%s network=%s "
-        "adapter_presentation=%s interface=%s config=%s",
-        exe,
-#ifdef _WIN64
-        "x64",
-#else
-        "x86",
-#endif
-        iat ? "installed" : "not_installed", lan_hook_status, network_status,
-        adapter_override::state().present ? "active" : "off",
-        interface_text, config_path);
-    human_line("INFO", "WinSock hooks are %s. LAN Install virtualization is %s.",
-        iat ? "active" : "not active", g_config.lan_install_enable ? "enabled" : "disabled");
-    human_line("INFO", "Logging is in %s mode%s.",
-        g_config.log_detailed ? "detailed diagnostic" : "concise",
-        g_config.log_write_file ? " and is also written to a file" : "");
     log_line("CONFIG",
         "network_enable=%d interface_selector=%s interface_address=%s interface_index=%lu "
-        "mode=%d exclusive=%d allow_loopback=%d force_limited_broadcast=%d "
-        "force_directed_broadcast=%d force_tcp_source=%d strict=%d "
-        "virtualize_icmp=%d icmp_scope=%d "
+        "compat=%d exclusive=%d allow_loopback=%d force_limited_broadcast=%d "
+        "force_directed_broadcast=%d force_tcp_source=%d strict=%d virtualize_icmp=%d "
         "lan_install_enable=%d log_enable=%d log_detailed=%d log_write_file=%d",
         g_config.network_enable ? 1 : 0,
         g_config.interface_selector[0] ? g_config.interface_selector : "(auto)",
         g_interface_ready_text(), g_interface_index,
-        g_config.mode, g_config.exclusive ? 1 : 0, g_config.allow_loopback ? 1 : 0,
+        g_config.fabricate_allowed ? 1 : 0, g_config.exclusive ? 1 : 0,
+        g_config.allow_loopback ? 1 : 0,
         g_config.force_limited_broadcast ? 1 : 0,
         g_config.force_directed_broadcast ? 1 : 0,
         g_config.force_tcp_source ? 1 : 0, g_config.strict ? 1 : 0,
-        g_config.virtualize_icmp ? 1 : 0, g_config.icmp_scope,
+        g_config.virtualize_icmp ? 1 : 0,
         g_config.lan_install_enable ? 1 : 0, g_config.log_enable ? 1 : 0,
         g_config.log_detailed ? 1 : 0, g_config.log_write_file ? 1 : 0);
+
+    // One line that answers the three questions a start-up log exists for: did the DLL
+    // load, which process is it in, and what did it decide. Printed to stderr and the
+    // debugger regardless of log.enable, because its whole purpose is to prove the DLL
+    // is present when nothing else appears.
+    {
+        char interface_text[INET_ADDRSTRLEN] = "(not selected)";
+        if (g_network_ready)
+            InetNtopA(AF_INET, &g_interface_address, interface_text, sizeof(interface_text));
+        status_line("process=%s architecture=%s iat_hooks=%s lanInstallHook=%s network=%s "
+            "adapter_presentation=%s interface=%s log=%s config=%s",
+            exe,
+#ifdef _WIN64
+            "x64",
+#else
+            "x86",
+#endif
+            iat ? "installed" : "not_installed", lan_hook_status,
+            !g_config.network_enable ? "disabled" : (g_network_ready ? "ready" : "failed"),
+            adapter_override::state().present ? "active" : "off", interface_text,
+            g_config.log_detailed ? "detailed" : "concise", config_path);
+    }
+    if (g_network_ready) {
+        char text[INET_ADDRSTRLEN] = {};
+        char mask[INET_ADDRSTRLEN] = {};
+        InetNtopA(AF_INET, &g_interface_address, text, sizeof(text));
+        InetNtopA(AF_INET, &g_interface_mask, mask, sizeof(mask));
+        human_line("INFO", "LAN traffic uses %s (index %lu, %s/%s).",
+            g_interface_name, g_interface_index, text, mask);
+    }
     return 0;
 }
 
@@ -2223,8 +2155,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         QueryPerformanceCounter(&g_qpc_start);
         // Adapter presentation has to be in place before the game enumerates, and the
         // game does that from its own startup path, not from a thread this DLL owns.
-        // Deferring it to the worker thread made the outcome depend on scheduling,
-        // which is what docs/broadcast-interface-regression.md could not explain.
+        // Deferring it to the worker thread made the outcome depend on scheduling:
+        // whichever patched last won, and with segatools' netenv also in the process
+        // that outcome varied between runs.
         prepare();
         HANDLE thread = CreateThread(nullptr, 0, initialize, nullptr, 0, nullptr);
         if (thread) CloseHandle(thread);

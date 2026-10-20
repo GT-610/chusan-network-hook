@@ -1,7 +1,7 @@
 // Presents one chosen interface to the game through the three adapter-enumeration
 // APIs, in place, without inventing an identity.
 //
-// Rationale and evidence: docs/adapter-selection.md and docs/netenv-takeover.md.
+// Rationale and evidence: docs/adapter-selection.md.
 // In short:
 //   * chusanApp accepts only IP_ADAPTER_INFO.Type == 6;
 //   * amdaemon additionally rejects Type 1 and 24, and looks adapters up by IfIndex
@@ -11,7 +11,7 @@
 //
 // Therefore the normal path rewrites only the fields the game refuses and filters
 // the rest of the chain. Fabrication (netenv's approach) is kept solely as the
-// legacpath for hosts where no acceptable adapter exists at all.
+// legacy path for hosts where no acceptable adapter exists at all.
 #pragma once
 
 #include <winsock2.h>
@@ -62,7 +62,6 @@ struct AdapterPresentation {
     bool exclusive = true;      // hide adapters other than the chosen one
     bool fabricate = false;     // no acceptable real adapter: synthesise one
     bool forced_type = false;   // Type/IfType had to be rewritten to Ethernet
-    bool allow_loopback = false;
 
     // Real adapter, used when !fabricate.
     ULONG if_index = 0;
@@ -85,41 +84,35 @@ struct AdapterPresentation {
     in_addr dns_fallback = {};
 
     // ZeroTier and similar flat L2 segments report no gateway at all. netenv always
-    // supplied subnet|routerSuffix, and the gateway check has nothing to probe when the
-    // list is empty, so it reports BAD before any ICMP is sent. Synthesise one only when
-    // the adapter genuinely has none.
+    // supplied subnet|routerSuffix, and the gateway check has nothing to compare when the
+    // list is empty, so it reports BAD before anything is sent. One address serves both
+    // enumeration APIs and the route next hop, because the game cross-checks them, and the
+    // two APIs disagree in practice: the addresses API returns a node list, while
+    // IP_ADAPTER_INFO signals "no gateway" with the literal string "0.0.0.0".
     bool gateway_fallback_enabled = false;
     in_addr gateway_fallback = {};
-
-    // The single gateway address this process presents, through both enumeration APIs.
-    // Kept in one place because the two APIs disagree in practice: the addresses API
-    // returns a node list, while IP_ADAPTER_INFO signals "no gateway" with the literal
-    // string "0.0.0.0" rather than an empty one.
-    in_addr gateway_effective = {};
 
     // GetBestRoute rewrite: keeps route lookups pointing at the presented interface when
     // the real lookup would send the packet somewhere else.
     bool route_override_enabled = false;
     DWORD route_next_hop = 0;
 
-    // amdaemon answers two separate network-test items with IcmpSendEcho2:
-    //   - GATEWAY,      alwAuthPhaseGateway   @ 0x1403c0270 phase 0xb, target = the
-    //                   presented gateway (inside our subnet);
-    //   - NUMBER OF HOP, alwAuthPhaseTraceroute @ 0x1403c1a00, target = the ALL.Net
-    //                   authentication server (a public address).
-    // The hop count is the TTL the traceroute needed to reach that server, so it cannot
-    // be faked by answering one echo -- but it can be held at 1 by answering every echo,
-    // which is what netenv did (see hook_IcmpSendEcho2).
+    // amdaemon answers two network-test items with IcmpSendEcho2:
+    //   - GATEWAY,        alwAuthPhaseGateway    0x1403c0270, echo to the presented gateway;
+    //   - NUMBER OF HOP,  alwAuthPhaseTraceroute 0x1403c1a00, TTL probes to the ALL.Net
+    //                     authentication server, counted by altrGetResultTtl.
+    // netenv answered every echo of every destination with IP_SUCCESS, ignoring TTL
+    // (netenv.c:490-559), so the first TTL=1 probe looked like it had reached the server
+    // and the item read 1 for the whole segatools era. That number was a constant, not a
+    // measurement, and the game only compares it against zero.
     //
-    // icmp_all_destinations selects netenv's semantics: answer every destination.
-    // false restricts this to the presented subnet, which leaves the traceroute to the
-    // authentication server running against the real network; when that path does not
-    // answer, NUMBER OF HOP stays at CHECKING and the network test never finishes, which
-    // blocks the game from starting.
+    // Answering every destination reproduces exactly that, and is also the only shape that
+    // lets the network test finish: the traceroute target is a public address, so anything
+    // narrower would send those probes out on the real network, and when that path does
+    // not answer the item never leaves CHECKING and the test - hence the game start -
+    // hangs on it. virtualize_icmp=false disables the answer entirely, for a host where
+    // the real ICMP path is known to work.
     bool virtualize_icmp = true;
-    bool icmp_all_destinations = true;
-    in_addr presented_network = {};
-    in_addr presented_mask = {};
 };
 
 namespace adapter_override {
@@ -133,6 +126,11 @@ inline AdapterPresentation &state() {
 // did to the game's view instead of the outcome being inferred from a screenshot. A sink
 // rather than an extern function because the host's logger lives in an anonymous
 // namespace.
+//
+// Two sinks, because two kinds of message: `log_sink` carries a decision the user may
+// have to act on and is always shown; `trace_sink` carries per-call detail and belongs to
+// the detailed log only. Keeping them apart is what stops a working run from printing a
+// dozen lines about calls that all did the expected thing.
 using adapter_log_sink = void (*)(const char *message);
 
 // Call counters: the difference between "the game never asked" and "we answered and it
@@ -147,14 +145,30 @@ inline adapter_log_sink &log_sink() {
     return sink;
 }
 
-inline void adapter_hook_log(const char *format, ...) {
-    if (log_sink() == nullptr) return;
+inline adapter_log_sink &trace_sink() {
+    static adapter_log_sink sink = nullptr;
+    return sink;
+}
+
+inline void emit(adapter_log_sink sink, const char *format, va_list args) {
+    if (sink == nullptr) return;
     char message[512] = {};
+    _vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args);
+    sink(message);
+}
+
+inline void adapter_hook_log(const char *format, ...) {
     va_list args;
     va_start(args, format);
-    _vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args);
+    emit(log_sink(), format, args);
     va_end(args);
-    log_sink()(message);
+}
+
+inline void adapter_hook_trace(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    emit(trace_sink(), format, args);
+    va_end(args);
 }
 
 
@@ -351,8 +365,8 @@ inline ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO info, PULONG size) {
     if (keep == nullptr) {
         const LONG call = InterlockedIncrement(&g_info_calls);
         if (call <= 4)
-            adapter_hook_log("GetAdaptersInfo #%ld: presented if_index %lu not in the "
-                "returned list, nothing rewritten", call, p.if_index);
+            adapter_hook_trace("GetAdaptersInfo #%ld: if_index %lu is not in the returned "
+                "list, nothing rewritten", call, p.if_index);
         return result; // adapter vanished; do not lie
     }
 
@@ -453,7 +467,7 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
     if (keep == nullptr) {
         const LONG call = InterlockedIncrement(&g_addresses_calls);
         if (call <= 4)
-            adapter_hook_log("GetAdaptersAddresses #%ld: presented if_index %lu not in the "
+            adapter_hook_trace("GetAdaptersAddresses #%ld: if_index %lu is not in the "
                 "returned list, nothing rewritten", call, p.if_index);
         return result;
     }
@@ -463,8 +477,10 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
     // "dhcp": true. netenv always set the flag; a real adapter frequently does not.
     if ((keep->Flags & IP_ADAPTER_DHCP_ENABLED) == 0) {
         keep->Flags |= IP_ADAPTER_DHCP_ENABLED;
-        adapter_hook_log("GetAdaptersAddresses: adapter if_index %lu did not report DHCP; "
-            "presenting it as DHCP-enabled", p.if_index);
+        static volatile LONG reported = 0;
+        if (InterlockedExchange(&reported, 1) == 0)
+            adapter_hook_log("Adapter %lu does not report DHCP; presenting it as "
+                "DHCP-enabled, which is what config_common.json asks for.", p.if_index);
     }
 
     if (p.forced_type) {
@@ -487,19 +503,21 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
         fallback.address.sin_family = AF_INET;
         fallback.address.sin_addr = p.dns_fallback;
         keep->FirstDnsServerAddress = &fallback.entry;
-        adapter_hook_log("GetAdaptersAddresses: injected DNS server for if_index %lu",
-            p.if_index);
+        static volatile LONG reported = 0;
+        if (InterlockedExchange(&reported, 1) == 0) {
+            char text[INET_ADDRSTRLEN] = "-";
+            InetNtopA(AF_INET, &p.dns_fallback, text, sizeof(text));
+            adapter_hook_log("Adapter %lu reports no DNS server; presenting %s so the game "
+                "does not enumerate an empty list.", p.if_index, text);
+        }
     }
 
-    // A flat L2 segment reports no gateway. The gateway check then has nothing to probe
-    // and reports BAD without sending a packet, which no amount of ICMP virtualisation
-    // can fix. Supply one, as netenv did.
-    if (!chain_has_ipv4(keep->FirstGatewayAddress)) {
-        adapter_hook_log("GetAdaptersAddresses: adapter if_index %lu reports no usable "
-            "gateway; fallback %s", p.if_index,
-            p.gateway_fallback_enabled ? "applied" : "NOT applied");
-    }
-    if (p.gateway_fallback_enabled) {
+    // A flat L2 segment reports no gateway. The gateway check then has nothing to compare
+    // and reports BAD without sending anything, which no amount of ICMP virtualisation can
+    // fix. Supply one, as netenv did - and supply the same one GetAdaptersInfo and
+    // GetBestRoute report, because the game cross-checks them.
+    if (p.gateway_fallback_enabled &&
+        !chain_has_ipv4(keep->FirstGatewayAddress)) {
         GatewayFallbackEntry &fallback = gateway_fallback_entry();
         memset(&fallback, 0, sizeof(fallback));
         fallback.entry.Length = sizeof(fallback.entry);
@@ -508,7 +526,13 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
         fallback.address.sin_family = AF_INET;
         fallback.address.sin_addr = p.gateway_fallback;
         keep->FirstGatewayAddress = &fallback.entry;
-        adapter_hook_log("GetAdaptersAddresses: injected gateway for if_index %lu", p.if_index);
+        static volatile LONG reported = 0;
+        if (InterlockedExchange(&reported, 1) == 0) {
+            char text[INET_ADDRSTRLEN] = "-";
+            InetNtopA(AF_INET, &p.gateway_fallback, text, sizeof(text));
+            adapter_hook_log("Adapter %lu reports no gateway; presenting %s as both the "
+                "gateway and the route next hop.", p.if_index, text);
+        }
     }
 
     // Dump the record once, after shaping. If the game still rejects it, this is the
@@ -625,25 +649,24 @@ inline DWORD WINAPI hook_GetBestRoute(DWORD source, DWORD destination,
         const LONG call = InterlockedIncrement(&g_route_calls);
         if (call <= 8) {
             const uint32_t target = ntohl(destination);
-            adapter_hook_log("GetBestRoute #%ld: source=%lu.%lu.%lu.%lu dest=%lu.%lu.%lu.%lu",
-                call, (ntohl(source) >> 24) & 255, (ntohl(source) >> 16) & 255,
-                (ntohl(source) >> 8) & 255, ntohl(source) & 255,
-                (target >> 24) & 255, (target >> 16) & 255, (target >> 8) & 255, target & 255);
+            adapter_hook_trace("GetBestRoute #%ld: dest=%lu.%lu.%lu.%lu",
+                call, (target >> 24) & 255, (target >> 16) & 255, (target >> 8) & 255,
+                target & 255);
         }
     }
 
     // Matches netenv: report the presented interface as the route for every destination,
-    // not just the ones inside the presented subnet. netenv.c:422-451 does the same and
-    // fills in a fixed row, because amdaemon treats "GetBestRoute succeeded" as evidence
-    // that a default gateway exists. Scoping by destination was a plausible-sounding
-    // refinement, but it makes the answer depend on which address amdaemon happens to
-    // ask about, and the observed failure was on a lookup the scoped version did not
-    // cover.
+    // not just the ones inside the presented subnet. netenv.c:422-451 fills in a fixed
+    // row, because amdaemon treats "GetBestRoute succeeded" as evidence that a default
+    // gateway exists. Scoping by destination was a plausible-sounding refinement, but it
+    // made the answer depend on which address amdaemon happened to ask about, and the
+    // observed failure was on a lookup the scoped version did not cover.
     //
-    // Real packet egress is unaffected: GetBestRoute is a query, and the game's server
-    // I/O goes through WinHTTP, which resolves routes inside the HTTP stack.
-    const DWORD result = next_best_route() ? next_best_route()(source, destination, route)
-                                           : ERROR_NOT_SUPPORTED;
+    // The real lookup is not consulted: every field of the answer is defined here, and
+    // all of them come from the same presented adapter. Real packet egress is unaffected,
+    // because GetBestRoute is a query and the game's server I/O goes through WinHTTP,
+    // which resolves routes inside the HTTP stack.
+    (void)source;
     memset(route, 0, sizeof(*route));
     route->dwForwardDest = 0;
     route->dwForwardMask = 0xFFFFFFFF;
@@ -651,37 +674,12 @@ inline DWORD WINAPI hook_GetBestRoute(DWORD source, DWORD destination,
     route->dwForwardIfIndex = p.if_index;
     route->dwForwardType = MIB_IPROUTE_TYPE_INDIRECT;
     route->dwForwardProto = MIB_IPPROTO_NETMGMT;
-    (void)result;
     return NO_ERROR;
 }
-// amdaemon answers two network-test items with ICMP:
-//
-//   GATEWAY         alwAuthPhaseGateway @ 0x1403c0270 phase 0xb, echo to the presented
-//                   gateway, and it treats getlastError() == 0x3E5 (ERROR_IO_PENDING)
-//                   as success. altrIcmpSendEcho @ 0x1403f0b00 is the only caller of
-//                   IcmpSendEcho2 in the process.
-//
-//   NUMBER OF HOP   alwAuthPhaseTraceroute @ 0x1403c1a00 owns the traceroute, and
-//                   am::networktest::HopsChecker reads the result through
-//                   am::network::HopsCounter: HopsCounter::update @ 0x1402aafe0 calls
-//                   altrGetResultTtl @ 0x1403b9ff0, whose value lands in
-//                   Manager+0x1138 and is what the screen prints. The trace starts at
-//                   TTL 1 (FUN_1403ba120 sets the state to 1, FUN_1403d7a60 gives the
-//                   first three probes TTL 1) and FUN_1403f0b00 forwards that TTL to
-//                   IcmpSendEcho2 as RequestOptions->Ttl.
-//
-// netenv answered every echo of every destination with IP_SUCCESS and never looked at
-// the TTL (netenv.c:490-559). The traceroute therefore "reached" its target on the
-// first probe and the item has always read 1 in the whole segatools era -- the number
-// was never a measurement of the real path.
-//
-// Answering every destination reproduces exactly that, and it is also the only shape
-// that lets the network test finish: the traceroute's target is the ALL.Net
-// authentication server, and with the virtualisation scoped to the presented subnet
-// those probes go out on the real network. When that path does not answer, NUMBER OF
-// HOP never leaves CHECKING and the test -- hence the game start -- hangs on it.
-// icmpScope=subnet keeps the old scoped behaviour for anyone who wants a real
-// measurement and can tolerate the wait.
+
+// amdaemon answers two network-test items with ICMP: GATEWAY, an echo to the presented
+// gateway, and NUMBER OF HOP, the traceroute described above. Both are decided by this
+// one function, and answering every destination is what keeps the second from stalling.
 inline ULONG WINAPI hook_IcmpSendEcho2(HANDLE icmp, HANDLE event, void *apc,
                                        PVOID apc_context, IPAddr destination,
                                        LPVOID request_data, WORD request_size,
@@ -695,23 +693,14 @@ inline ULONG WINAPI hook_IcmpSendEcho2(HANDLE icmp, HANDLE event, void *apc,
     }
 
     const uint32_t host = ntohl((uint32_t)destination);
-    const uint32_t mask = ntohl(p.presented_mask.s_addr);
-    const uint32_t network = ntohl(p.presented_network.s_addr) & mask;
-    const bool inside = p.icmp_all_destinations ||
-        (mask != 0 && mask != 0xFFFFFFFFu && (host & mask) == network);
     {
         const LONG call = InterlockedIncrement(&g_icmp_calls);
         if (call <= 8) {
             const unsigned long ttl = request_options != nullptr ? request_options->Ttl : 0;
-            adapter_hook_log("IcmpSendEcho2 #%ld: destination %lu.%lu.%lu.%lu ttl=%lu -> %s",
+            adapter_hook_trace("IcmpSendEcho2 #%ld: destination %lu.%lu.%lu.%lu ttl=%lu",
                 call, (host >> 24) & 255, (host >> 16) & 255, (host >> 8) & 255, host & 255,
-                ttl, inside ? "virtualized success" : "passed through");
+                ttl);
         }
-    }
-    if (!inside) {
-        return next_icmp() ? next_icmp()(icmp, event, apc, apc_context, destination,
-            request_data, request_size, request_options, reply_buffer, reply_size, timeout)
-            : 0;
     }
 
     if (apc != nullptr || reply_buffer == nullptr || reply_size < sizeof(ICMP_ECHO_REPLY)) {
