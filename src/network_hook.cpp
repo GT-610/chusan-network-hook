@@ -1708,6 +1708,9 @@ InstallReport install_hook_table(HMODULE module, const char *dll_a, const char *
                     FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void *));
                     InterlockedIncrement(&g_hook_count);
                     ++report.patched;
+                    // Name every patched function. "3 slots" could not be told apart from
+                    // "the three I expected" without guessing which three they were.
+                    if (quiet) defer_info("[%s] patched %s", tag, hook.name);
                 } else {
                     // Never silent: a slot left unpatched means every call through
                     // it bypasses the hook and is invisible in the log.
@@ -1832,9 +1835,15 @@ void configure_presentation() {
         presentation.route_override_enabled = g_config.override_best_route;
         // The next hop must be an address that is meaningful on the segment. The
         // synthesised gateway is the only candidate this hook can vouch for.
-        presentation.route_next_hop = g_segatools.found
-            ? segatools::router_address(g_segatools).s_addr
-            : 0;
+        if (g_segatools.found) {
+            presentation.route_next_hop = segatools::router_address(g_segatools).s_addr;
+        } else {
+            // No segatools.ini: the highest host address on the presented subnet is the
+            // only next hop this hook can justify.
+            const uint32_t network =
+                ntohl(g_interface_address.s_addr) & ntohl(g_interface_mask.s_addr);
+            presentation.route_next_hop = htonl(network | 0xFEu);
+        }
         {
             // Prefer the real MAC so anything that keys on it stays consistent.
             ULONG size = 0;
@@ -1878,12 +1887,30 @@ void configure_presentation() {
                                 }
                             }
 
-                            // A flat L2 segment such as ZeroTier reports no gateway either.
-                            // The gateway check then has nothing to probe and fails without
-                            // sending a packet, so supply the address netenv supplied.
+                            // The presented gateway has to be reachable on the presented
+                            // segment. netenv guaranteed that by construction: it invented
+                            // subnet|routerSuffix. A real adapter does not, and a gateway
+                            // outside the adapter's own subnet is not a usable default
+                            // gateway for that adapter anyway.
+                            bool gateway_usable = false;
                             if (chain_has_ipv4(a->FirstGatewayAddress)) {
-                                presentation.gateway_fallback_enabled = false;
-                            } else {
+                                const in_addr real_gateway = reinterpret_cast<const sockaddr_in *>(
+                                    a->FirstGatewayAddress->Address.lpSockaddr)->sin_addr;
+                                const uint32_t mask = ntohl(g_interface_mask.s_addr);
+                                const uint32_t network =
+                                    ntohl(g_interface_address.s_addr) & mask;
+                                gateway_usable = mask != 0 &&
+                                    ((ntohl(real_gateway.s_addr) & mask) == network);
+                                char text[INET_ADDRSTRLEN] = {};
+                                InetNtopA(AF_INET, &real_gateway, text, sizeof(text));
+                                defer_info("Adapter %s reports gateway %s; %s.",
+                                    g_interface_name, text,
+                                    gateway_usable
+                                        ? "it is inside the presented subnet and is kept"
+                                        : "it is outside the presented subnet, so it is "
+                                          "replaced with the segment router address");
+                            }
+                            if (!gateway_usable) {
                                 presentation.gateway_fallback = g_segatools.found
                                     ? segatools::router_address(g_segatools)
                                     : in_addr{};
@@ -1892,9 +1919,9 @@ void configure_presentation() {
                                     char text[INET_ADDRSTRLEN] = {};
                                     InetNtopA(AF_INET, &presentation.gateway_fallback, text,
                                         sizeof(text));
-                                    defer_info("Adapter %s reports no gateway; presenting %s so "
-                                        "the gateway check has an address to probe.",
-                                        g_interface_name, text);
+                                    defer_info("Adapter %s has no usable gateway; presenting %s "
+                                        "so the gateway check has an address on this segment "
+                                        "to work with.", g_interface_name, text);
                                 }
                             }
                             break;

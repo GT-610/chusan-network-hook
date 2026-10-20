@@ -404,3 +404,45 @@ INFO  Adapter ... reports no gateway; presenting 172.16.10.254 so the gateway ch
 ```
 
 With the gateway present, the ICMP hook answers it and the chain closes.
+## 13. What the network test screen actually is, and what it eliminates
+
+The screen (IP ADDRESS / GATEWAY / DNS(LAN) / NUMBER OF HOP / LINE TYPE / ALL.Net
+AUTHENTICATION / Aime SERVER / E-MONEY / TITLE SERVER / MATCHING SERVER) is rendered by
+`chusanApp` - the labels `IP ADDRESS` exist there (`chusanApp.exe` `0x0177d37c`) and the
+item names also exist in `amdaemon`. `chusanApp` imports no ICMP entry point at all
+(`IcmpCreateFile` and `IcmpSendEcho2` are not in its 606 imports), so the verdicts are
+computed by `amdaemon` and handed over.
+
+That plus one field observation eliminates the ICMP explanation:
+
+> After the ICMP hook was added, a network-test run produced `injected DNS server` lines
+> and **no `IcmpSendEcho2` line whatsoever**.
+
+`hook_IcmpSendEcho2` logs every call it receives, up to eight. No line means the gateway
+item is decided without an echo. netenv's always-successful `IcmpSendEcho2` therefore
+cannot be the reason the baseline showed GATEWAY GOOD, which also means the ICMP work done
+earlier in this investigation, while harmless, was not the fix.
+
+The remaining inputs `amdaemon` has for that item are the adapter's gateway field
+(`IP_ADAPTER_ADDRESSES` `+0xd0`, read in `FUN_1402f76f0`) and `GetBestRoute`
+(`FUN_1403bbbc0`). netenv faked both; before this round the hook faked the first only when
+the field was absent, and the second only for destinations inside the presented subnet.
+
+### The shape of the answer now enforced
+
+netenv's synthetic adapter was self-consistent by construction and a real adapter is not.
+The presentation now enforces the same consistency:
+
+| property | rule |
+| --- | --- |
+| gateway | kept only if it lies inside the presented subnet; otherwise replaced with `subnet \| routerSuffix` |
+| `GetBestRoute` | returns the presented interface and that same next hop, for every destination, as netenv did |
+| DHCP flag | `IP_ADAPTER_DHCP_ENABLED` set, because `config_common.json` ships `"dhcp": true` and `FUN_1402f76f0` reads that bit |
+| DNS | kept when present, else `subnet \| routerSuffix` |
+
+The first row is the one that matters: a gateway outside the adapter's own subnet is not a
+usable default gateway for it, and netenv never produced one.
+
+**Not yet verified:** whether this changes the screen. The reasoning above narrows the
+cause to the adapter/route answer, but the confirmation requires a run, and the last
+observed run predates these changes.

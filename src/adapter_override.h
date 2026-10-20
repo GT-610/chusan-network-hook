@@ -341,6 +341,7 @@ inline ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO info, PULONG size) {
     }
 
     if (p.forced_type) keep->Type = kEthernetType;
+    keep->DhcpEnabled = 1;
 
     // chusanApp's GetAdaptersInfo pass reads GatewayList (+0x1d4 in the x86 layout), so
     // the same empty-gateway problem exists on this API. Fill it with the same address
@@ -437,6 +438,15 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
         return result;
     }
 
+    // amdaemon reads IP_ADAPTER_DHCP_ENABLED out of Flags (FUN_1402f76f0:
+    // `*(uint *)(adapter + 0x5c) >> 2 & 1`) and the shipped config_common.json asks for
+    // "dhcp": true. netenv always set the flag; a real adapter frequently does not.
+    if ((keep->Flags & IP_ADAPTER_DHCP_ENABLED) == 0) {
+        keep->Flags |= IP_ADAPTER_DHCP_ENABLED;
+        adapter_hook_log("GetAdaptersAddresses: adapter if_index %lu did not report DHCP; "
+            "presenting it as DHCP-enabled", p.if_index);
+    }
+
     if (p.forced_type) {
         keep->IfType = kEthernetType;
         // The game treats anything but "up" as unusable; a rewritten adapter that
@@ -469,7 +479,7 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
             "gateway; fallback %s", p.if_index,
             p.gateway_fallback_enabled ? "applied" : "NOT applied");
     }
-    if (p.gateway_fallback_enabled && !chain_has_ipv4(keep->FirstGatewayAddress)) {
+    if (p.gateway_fallback_enabled) {
         GatewayFallbackEntry &fallback = gateway_fallback_entry();
         memset(&fallback, 0, sizeof(fallback));
         fallback.entry.Length = sizeof(fallback.entry);
@@ -552,34 +562,39 @@ inline DWORD WINAPI hook_GetBestRoute(DWORD source, DWORD destination,
                                  : ERROR_NOT_SUPPORTED;
     }
 
-    // Scope matters more here than anywhere else in this hook. amdaemon also asks for
-    // routes to the game server; rewriting those onto a LAN-only adapter would break the
-    // server connection, which is the one thing this hook must not do. Only destinations
-    // inside the presented subnet are candidates.
-    const uint32_t mask = ntohl(p.presented_mask.s_addr);
-    const uint32_t network = ntohl(p.presented_network.s_addr) & mask;
-    const uint32_t target = ntohl(destination);
-    const bool inside = mask != 0 && mask != 0xFFFFFFFFu && (target & mask) == network;
-    if (!inside) {
-        return next_best_route()(source, destination, route);
+    {
+        const LONG call = InterlockedIncrement(&g_route_calls);
+        if (call <= 8) {
+            const uint32_t target = ntohl(destination);
+            adapter_hook_log("GetBestRoute #%ld: source=%lu.%lu.%lu.%lu dest=%lu.%lu.%lu.%lu",
+                call, (ntohl(source) >> 24) & 255, (ntohl(source) >> 16) & 255,
+                (ntohl(source) >> 8) & 255, ntohl(source) & 255,
+                (target >> 24) & 255, (target >> 16) & 255, (target >> 8) & 255, target & 255);
+        }
     }
 
-    const DWORD result = next_best_route()(source, destination, route);
-    if (result != ERROR_SUCCESS) return result;
-    if (route->dwForwardIfIndex == p.if_index) return result;
-
-    route->dwForwardIfIndex = p.if_index;
+    // Matches netenv: report the presented interface as the route for every destination,
+    // not just the ones inside the presented subnet. netenv.c:422-451 does the same and
+    // fills in a fixed row, because amdaemon treats "GetBestRoute succeeded" as evidence
+    // that a default gateway exists. Scoping by destination was a plausible-sounding
+    // refinement, but it makes the answer depend on which address amdaemon happens to
+    // ask about, and the observed failure was on a lookup the scoped version did not
+    // cover.
+    //
+    // Real packet egress is unaffected: GetBestRoute is a query, and the game's server
+    // I/O goes through WinHTTP, which resolves routes inside the HTTP stack.
+    const DWORD result = next_best_route() ? next_best_route()(source, destination, route)
+                                           : ERROR_NOT_SUPPORTED;
+    memset(route, 0, sizeof(*route));
+    route->dwForwardDest = 0;
+    route->dwForwardMask = 0xFFFFFFFF;
     route->dwForwardNextHop = p.route_next_hop;
-    const LONG call = InterlockedIncrement(&g_route_calls);
-    if (call <= 4) {
-        adapter_hook_log("GetBestRoute: rewrote egress to if_index %lu next_hop %lu.%lu.%lu.%lu",
-            p.if_index,
-            (ntohl(p.route_next_hop) >> 24) & 255, (ntohl(p.route_next_hop) >> 16) & 255,
-            (ntohl(p.route_next_hop) >> 8) & 255, ntohl(p.route_next_hop) & 255);
-    }
-    return result;
+    route->dwForwardIfIndex = p.if_index;
+    route->dwForwardType = MIB_IPROUTE_TYPE_INDIRECT;
+    route->dwForwardProto = MIB_IPPROTO_NETMGMT;
+    (void)result;
+    return NO_ERROR;
 }
-
 // amdaemon measures the gateway with an ICMP echo:
 //   altrIcmpSendEcho @ 0x1403f0b00 -> IcmpSendEcho2(h, Event, NULL, NULL, dest, ...)
 // and treats getlastError() == 0x3E5 (ERROR_IO_PENDING) as success. netenv answered
