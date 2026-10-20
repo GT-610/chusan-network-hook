@@ -91,6 +91,12 @@ struct AdapterPresentation {
     bool gateway_fallback_enabled = false;
     in_addr gateway_fallback = {};
 
+    // The single gateway address this process presents, through both enumeration APIs.
+    // Kept in one place because the two APIs disagree in practice: the addresses API
+    // returns a node list, while IP_ADAPTER_INFO signals "no gateway" with the literal
+    // string "0.0.0.0" rather than an empty one.
+    in_addr gateway_effective = {};
+
     // GetBestRoute rewrite: keeps route lookups pointing at the presented interface when
     // the real lookup would send the packet somewhere else.
     bool route_override_enabled = false;
@@ -348,7 +354,9 @@ inline ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO info, PULONG size) {
     // the addresses API is given.
     // Overwrite rather than fill-if-empty: the two enumeration APIs must report the same
     // gateway, otherwise the answer depends on which one amdaemon asked.
-    if (p.gateway_fallback_enabled) {
+    if (p.gateway_fallback_enabled &&
+        (keep->GatewayList.IpAddress.String[0] == 0 ||
+         strcmp(keep->GatewayList.IpAddress.String, "0.0.0.0") == 0)) {
         _snprintf_s(keep->GatewayList.IpAddress.String,
             sizeof(keep->GatewayList.IpAddress.String), _TRUNCATE, "%u.%u.%u.%u",
             (ntohl(p.gateway_fallback.s_addr) >> 24) & 255,

@@ -274,7 +274,11 @@ rewriting) and `ws2_32!connect` (port remapping). Both are off by default —
 `send`/`connect` hooks because they are applied later (at `platform_hook_init`, which runs
 after this DLL's `DllMain`) and therefore chain in front: `dns.c` -> this hook -> real.
 No arbitration is needed, but the ordering is what makes it work.
-## 11. The gateway check, and why netenv's ICMP hook mattered
+## 11. The gateway check: first hypothesis (superseded by 13)
+
+**Superseded.** §13 shows the gateway item is decided without any `IcmpSendEcho2` call, so
+the reasoning below is wrong about the cause. It is kept because the measurements are real
+and the `GetBestRoute` finding still holds.
 
 Measured on a ZeroTier-only host, with the takeover active:
 
