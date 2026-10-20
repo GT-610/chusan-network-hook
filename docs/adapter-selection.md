@@ -610,9 +610,40 @@ for anyone who wants a real measurement and can tolerate the stall, and start-up
 
 This is deliberately not an attempt to measure the real hop count. Reproducing a real
 traceroute would mean answering TTL-expired probes on behalf of the routers in between,
-which no hook can do faithfully without knowing the topology. Reporting the same 1 netenv
-reported keeps the item's only consumer - a pass/fail line on the test screen - honest
-about what it is.
+which no hook can do faithfully without knowing the topology. Answering every probe
+reproduces the one value this item has always been given under this launcher, so the
+observable behaviour is identical to the configuration known to work.
+
+### Why this is not pursued further
+
+The investigation closed here on purpose. The reasons:
+
+- **The value is display-only.** The only place the number is consumed is
+  `HopsChecker::update` (`0x140296230`), and it branches on `== 0` only:
+
+  ```c
+  iVar2 = FUN_140247240(...);          // the hop count
+  if (iVar2 == 0) { FUN_14021e500(param_2, 2, 3); return; }   // 3 = BAD
+  FUN_14021e500(param_2, 2, 2);                                // 2 = GOOD
+  FUN_14021e570(param_2, iVar2);                               // "%u" into the item
+  ```
+
+  Zero fails the item; anything else passes it and prints the number. There is no
+  threshold, no comparison against a second value, no arithmetic. A 1 and a 4 are
+  equally acceptable to the game.
+- **The item's real failure mode was the stall, not the value.** A wrong-but-finite
+  answer costs nothing; an answer that never arrives blocks the whole network test and
+  therefore the game. That is what `icmpScope=all` fixes.
+- **A demonstrative counter-example exists.** The same launcher has always reported 1
+  here, and LAN play worked anyway for players who never ran this hook at all. The
+  number is not a gate.
+- **A "more truthful" number is not reachable.** TTL-expired replies would have to be
+  invented for routers we cannot observe, so any value other than 1 would be an
+  equally fabricated constant, simply a less familiar one.
+
+If the target address ever does become interesting - `HopsCounter+0x10`, initialised to
+0 by `0x1402aaf90`, is where a real target would live, and it was never traced to a
+writer - that is a separate reverse-engineering exercise with no bearing on playability.
 
 Evidence: `tests/probe_icmp_scope.cpp` drives `hook_IcmpSendEcho2` directly for both
 scopes, at TTL 1 and TTL 7, and asserts the async contract (`0` returned,

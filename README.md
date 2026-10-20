@@ -162,6 +162,11 @@ presented subnet, which leaves the hop traceroute running against the real netwo
 that path does not answer, the item stays at CHECKING and the network test never finishes,
 so the game does not start.
 
+The reported number is display-only - no game logic branches on it beyond the item's own
+verdict line - so a fabricated 1 is as good as any other value, and it is the one this
+launcher has always produced. See `docs/adapter-selection.md` §15 for the full chain and
+for why a "real" hop count is not obtainable from a hook.
+
 `forceTcpSource=1` binds an unbound client socket to the interface address before
 connecting to TCP 40110 or 50200-50202. Connections to `127.0.0.0/8` are left alone so the
 game's local Join Party path can reach itself. Listener sockets are never restricted.
