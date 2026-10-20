@@ -450,3 +450,21 @@ usable default gateway for it, and netenv never produced one.
 **Not yet verified:** whether this changes the screen. The reasoning above narrows the
 cause to the adapter/route answer, but the confirmation requires a run, and the last
 observed run predates these changes.
+### 13.1 Deciding it in one run
+
+The remaining candidates are the adapter gateway field and `GetBestRoute`. Both now report
+the same value, and both are logged. One run settles it:
+
+| what the log shows | conclusion |
+| --- | --- |
+| `patched IcmpSendEcho2` is **absent** | the ICMP hook never installed, and the earlier elimination in §13 was based on a hook that was not active |
+| `patched GetAdaptersInfo` / `GetAdaptersAddresses` absent | the adapter hooks are not reaching the process that computes the verdict |
+| `injected gateway for if_index N` and the screen turns GOOD | the gateway field was the cause; the on-segment rule fixed it |
+| `injected gateway ...` and the screen stays BAD | the verdict does not come from that field either; the next step is the networktest `ItemChecker` chain (`am::networktest::ItemCheckerBase`, vftable `0x1406d5660`, methods `0x140297010`, `0x140295ac0`, `0x1402955f0`) |
+| `GetBestRoute #N` lines appear and the screen turns GOOD | `GetBestRoute` was the cause |
+| no `ADAPTER_HOOK` lines at all during the test | the verdict is computed without any of the hooked APIs, so it comes from state cached at start-up |
+
+The vftable pointers are recorded here because the RTTI type descriptor for
+`am::networktest::GatewayChecker` (`0x1408ac208`) is reached only through the complete
+object locator at `0x140793140`, which has no direct code reference and is therefore easy
+to lose.
