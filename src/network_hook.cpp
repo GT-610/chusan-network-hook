@@ -47,6 +47,7 @@ struct Config {
     bool allow_loopback = false;
     bool force_directed_broadcast = true;
     bool virtualize_icmp = true;
+    int icmp_scope = 0; // 0 all (netenv parity), 1 presented subnet only
     bool override_best_route = true;
     bool force_limited_broadcast = true;
     bool force_tcp_source = true;
@@ -327,6 +328,15 @@ void load_config() {
     g_config.exclusive = config_bool(L"network", L"exclusive", true);
     g_config.allow_loopback = config_bool(L"network", L"allowLoopback", false);
     g_config.virtualize_icmp = config_bool(L"network", L"virtualizeIcmp", true);
+    {
+        // all (default) reproduces netenv: every echo succeeds, so the traceroute that
+        // produces NUMBER OF HOP finishes on its first probe. subnet keeps the strict
+        // reading, at the cost of the traceroute running against the real internet path.
+        wchar_t scope[16] = {};
+        GetPrivateProfileStringW(L"network", L"icmpScope", L"all", scope, _countof(scope),
+            g_config_path);
+        g_config.icmp_scope = _wcsicmp(scope, L"subnet") == 0 ? 1 : 0;
+    }
     g_config.override_best_route = config_bool(L"network", L"overrideBestRoute", true);
     g_config.force_directed_broadcast =
         config_bool(L"network", L"forceDirectedBroadcast", true);
@@ -1638,8 +1648,9 @@ HookSpec g_iphlp_hooks[] = {
         (void **)&adapter_override::next_addresses()},
     {"GetIfTable", 0, (void *)adapter_override::hook_GetIfTable,
         (void **)&adapter_override::next_table()},
-    // amdaemon measures the gateway with an ICMP echo; netenv answered all of them as
-    // successes. See hook_IcmpSendEcho2 for why that matters on a router-less segment.
+    // amdaemon answers the GATEWAY and NUMBER OF HOP items with ICMP echoes; netenv
+    // answered all of them as successes. See hook_IcmpSendEcho2 for the two callers and
+    // for why the scope decides whether the network test can finish.
     {"IcmpSendEcho2", 0, (void *)adapter_override::hook_IcmpSendEcho2,
         (void **)&adapter_override::next_icmp()},
     // amdaemon resolves egress through GetBestRoute too (FUN_1403bbbc0), and netenv
@@ -1826,12 +1837,28 @@ void configure_presentation() {
         presentation.address = g_interface_address;
         presentation.mask = g_interface_mask;
         presentation.prefix_length = g_interface_prefix_length;
-        // The presented subnet bounds which ICMP echoes are answered; see
-        // hook_IcmpSendEcho2.
+        // The presented subnet bounds which ICMP echoes are answered when the scope is
+        // restricted; see hook_IcmpSendEcho2 and the NUMBER OF HOP note there.
         presentation.presented_mask = g_interface_mask;
         presentation.presented_network.s_addr =
             htonl(ntohl(g_interface_address.s_addr) & ntohl(g_interface_mask.s_addr));
         presentation.virtualize_icmp = g_config.virtualize_icmp;
+        presentation.icmp_all_destinations = g_config.icmp_scope == 0;
+        if (!g_config.virtualize_icmp) {
+            defer_line("ICMP virtualisation is disabled, so the GATEWAY and NUMBER OF HOP "
+                "items run against the real network. Both can stall the network test on a "
+                "segment without a reachable router; set [network] virtualizeIcmp=1 to "
+                "answer them instead.");
+        } else if (g_config.icmp_scope == 0) {
+            defer_info("ICMP echoes to every destination are answered, as segatools' "
+                "netenv did. NUMBER OF HOP will read 1, which is what it has always shown "
+                "under netenv; it is not a measurement of the real path.");
+        } else {
+            defer_info("ICMP echoes are answered only inside the presented subnet. The "
+                "NUMBER OF HOP traceroute targets the ALL.Net authentication server, so "
+                "those probes use the real network and can leave that item at CHECKING. "
+                "Set [network] icmpScope=all to finish the test.");
+        }
         presentation.route_override_enabled = g_config.override_best_route;
         // The next hop must be an address that is meaningful on the segment. The
         // synthesised gateway is the only candidate this hook can vouch for.
@@ -2171,6 +2198,7 @@ DWORD WINAPI initialize(void *) {
         "network_enable=%d interface_selector=%s interface_address=%s interface_index=%lu "
         "mode=%d exclusive=%d allow_loopback=%d force_limited_broadcast=%d "
         "force_directed_broadcast=%d force_tcp_source=%d strict=%d "
+        "virtualize_icmp=%d icmp_scope=%d "
         "lan_install_enable=%d log_enable=%d log_detailed=%d log_write_file=%d",
         g_config.network_enable ? 1 : 0,
         g_config.interface_selector[0] ? g_config.interface_selector : "(auto)",
@@ -2179,6 +2207,7 @@ DWORD WINAPI initialize(void *) {
         g_config.force_limited_broadcast ? 1 : 0,
         g_config.force_directed_broadcast ? 1 : 0,
         g_config.force_tcp_source ? 1 : 0, g_config.strict ? 1 : 0,
+        g_config.virtualize_icmp ? 1 : 0, g_config.icmp_scope,
         g_config.lan_install_enable ? 1 : 0, g_config.log_enable ? 1 : 0,
         g_config.log_detailed ? 1 : 0, g_config.log_write_file ? 1 : 0);
     return 0;

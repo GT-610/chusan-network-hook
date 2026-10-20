@@ -311,17 +311,10 @@ The control row explains the other direction: with no shaping, `chusanApp` sees 
 real adapter list and picks an unacceptable one, so even the address check fails with 8002.
 That is the failure the takeover fixes.
 
-`hook_IcmpSendEcho2` therefore answers echoes **to destinations inside the presented
-subnet** as successes, in the same async shape netenv used, and passes everything else
-through so that a genuine failure outside the LAN is still reported. Measured:
-
-```
-172.16.10.254  count=0 error=997/IO_PENDING status=IP_SUCCESS (virtualized)   <- inside
-8.8.8.8        count=0 error=5/other status=real failure                      <- outside
-```
-
-`virtualizeIcmp=0` disables it, at the cost of the gateway check failing on any segment
-without a reachable router.
+`hook_IcmpSendEcho2` therefore answers echoes as successes, in the same async shape netenv
+used. The default scope is **every destination**, because a second item needs it - see
+§15. `virtualizeIcmp=0` disables it, at the cost of both the gateway check and the hop
+count failing on any segment without a reachable router.
 ## 12. The two egress paths, and why they must stay separate
 
 A host doing remote head-to-head over a virtual L2 network (ZeroTier, Tailscale, a
@@ -553,3 +546,74 @@ this phase checks:
 Otherwise it is replaced with `subnet | routerSuffix`, which satisfies it by construction,
 and the same value is used for the route next hop and for both enumeration APIs. The
 replacement is reported at start-up, naming the address that was rejected and why.
+
+## 15. NUMBER OF HOP: why it read 1 under netenv, and why it hung at CHECKING
+
+This item is a **traceroute result**, not a ping. It is the TTL the trace needed to reach
+the ALL.Net authentication server.
+
+### The chain
+
+```
+am::networktest::HopsChecker                 RTTI 0x1408ac288, vftable 0x1406d56c8
+  update              0x140296230
+  -> FUN_1402471c0(network::Manager)  "has LocationRouterChecker finished?"
+       reads Manager+0x1138
+         == LocationRouterChecker+0x148
+            <- written by FUN_140294c80 from HopsCounter+0x1e4
+                 <- am::network::HopsCounter::update 0x1402aafe0
+                      -> altrGetResultTtl 0x1403b9ff0
+                           -> the ALL.Net traceroute state in DAT_1409d1890
+```
+
+`LocationRouterChecker` sits at `Manager+0xff0`, so `0xff0 - 0x320 + 0xe18 = 0x1138`
+resolves the offset the item reads. The trace itself is owned by
+`alwAuthPhaseTraceroute` (`0x1403c1a00`), which calls `altrStartTraceroute`
+(`0x1403ba570`); `altrGetStatus` (`0x1403ba260`) drives it, and
+`altrServerMain` (`0x1403d7d30`) sends the probes.
+
+### Why the answer was always exactly 1
+
+The trace starts at TTL 1: `FUN_1403ba120` sets the state word to 1, and `FUN_1403d7a60`
+gives the first `n` probes TTL 1 (three, in the default 10-timeout / 3-round setup).
+`FUN_1403f0b00` forwards that value as `RequestOptions->Ttl`:
+
+```c
+local_28.Ttl = *param_1;              // the probe's TTL, i.e. 1 on the first round
+IcmpSendEcho2(h, event, NULL, NULL, dest, NULL, 0, &local_28, ...);
+if (sent == 0 && GetLastError() != 0x3E5) { /* real failure */ }
+```
+
+netenv's `hook_IcmpSendEcho2` (`netenv.c:490-559`) never reads `RequestOptions` and never
+transmits anything. It fills `pong->Status = IP_SUCCESS` and signals the event for **every**
+destination. So the very first TTL=1 probe is indistinguishable from a probe that reached
+the server, `FUN_1403d7850` marks the probe done, `FUN_1403d75c0` sees a completed probe
+with status 0 and ends the trace, and `FUN_1403b9ff0` reports `ttls = 1`.
+
+The 1 was therefore never a measurement. It is a constant produced by answering the first
+probe of a trace that never ran.
+
+### Why the takeover left it at CHECKING
+
+Our hook scoped virtualisation to the presented subnet, on the reasoning that a real
+failure outside the LAN should still be visible. The trace's target is the ALL.Net
+authentication server, a public address, so those probes were passed through to the real
+network. When that path does not answer - ICMP filtered, target unreachable, or the
+presented interface pinned as the egress - the item never leaves CHECKING, and the network
+test never finishes, which keeps the game from starting.
+
+### What it now does
+
+`icmpScope=all` (default) answers every destination, which reproduces netenv exactly:
+NUMBER OF HOP reads 1 and the test completes. `icmpScope=subnet` keeps the strict behaviour
+for anyone who wants a real measurement and can tolerate the stall, and start-up says so.
+
+This is deliberately not an attempt to measure the real hop count. Reproducing a real
+traceroute would mean answering TTL-expired probes on behalf of the routers in between,
+which no hook can do faithfully without knowing the topology. Reporting the same 1 netenv
+reported keeps the item's only consumer - a pass/fail line on the test screen - honest
+about what it is.
+
+Evidence: `tests/probe_icmp_scope.cpp` drives `hook_IcmpSendEcho2` directly for both
+scopes, at TTL 1 and TTL 7, and asserts the async contract (`0` returned,
+`ERROR_IO_PENDING` set, event signalled, `IP_SUCCESS` in the reply).

@@ -150,11 +150,17 @@ subnet broadcast the game actually addresses, e.g. `192.168.139.255`. Both apply
 destination and payload untouched. The scope is UDP 50200 for Party, 50201 for Setting,
 50202 for Advertise, and UDP 40112 when LAN Install virtualization is disabled.
 
-`virtualizeIcmp=1` answers ICMP echoes addressed inside the presented subnet as
-successes, in the same asynchronous form segatools' netenv used. `amdaemon` measures the
-gateway with `IcmpSendEcho2`, so on a segment with no router - ZeroTier and other flat L2
-networks - the gateway check fails without it. Echoes outside the subnet pass through, so
-a genuine failure is still reported.
+`virtualizeIcmp=1` answers ICMP echoes as successes, in the same asynchronous form
+segatools' netenv used. Two network-test items depend on it: GATEWAY, which echoes the
+presented gateway, and NUMBER OF HOP, whose traceroute targets the ALL.Net authentication
+server. On a segment with no router - ZeroTier and other flat L2 networks - the gateway
+check fails without it.
+
+`icmpScope=all` (default) answers every destination, as netenv did: NUMBER OF HOP reads 1,
+which is what it has always read under netenv. `icmpScope=subnet` answers only inside the
+presented subnet, which leaves the hop traceroute running against the real network; if
+that path does not answer, the item stays at CHECKING and the network test never finishes,
+so the game does not start.
 
 `forceTcpSource=1` binds an unbound client socket to the interface address before
 connecting to TCP 40110 or 50200-50202. Connections to `127.0.0.0/8` are left alone so the

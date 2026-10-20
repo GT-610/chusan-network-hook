@@ -102,12 +102,22 @@ struct AdapterPresentation {
     bool route_override_enabled = false;
     DWORD route_next_hop = 0;
 
-    // amdaemon's gateway check is an ICMP echo (altrIcmpSendEcho @ 0x1403f0b00 ->
-    // IcmpSendEcho2), and netenv made every echo succeed. Without that, a host whose
-    // presented interface has no reachable router fails the check even though the LAN
-    // is fine -- which is exactly what ZeroTier does, since it is a flat L2 network
-    // with no router. Scope: destinations inside the presented subnet.
+    // amdaemon answers two separate network-test items with IcmpSendEcho2:
+    //   - GATEWAY,      alwAuthPhaseGateway   @ 0x1403c0270 phase 0xb, target = the
+    //                   presented gateway (inside our subnet);
+    //   - NUMBER OF HOP, alwAuthPhaseTraceroute @ 0x1403c1a00, target = the ALL.Net
+    //                   authentication server (a public address).
+    // The hop count is the TTL the traceroute needed to reach that server, so it cannot
+    // be faked by answering one echo -- but it can be held at 1 by answering every echo,
+    // which is what netenv did (see hook_IcmpSendEcho2).
+    //
+    // icmp_all_destinations selects netenv's semantics: answer every destination.
+    // false restricts this to the presented subnet, which leaves the traceroute to the
+    // authentication server running against the real network; when that path does not
+    // answer, NUMBER OF HOP stays at CHECKING and the network test never finishes, which
+    // blocks the game from starting.
     bool virtualize_icmp = true;
+    bool icmp_all_destinations = true;
     in_addr presented_network = {};
     in_addr presented_mask = {};
 };
@@ -644,15 +654,34 @@ inline DWORD WINAPI hook_GetBestRoute(DWORD source, DWORD destination,
     (void)result;
     return NO_ERROR;
 }
-// amdaemon measures the gateway with an ICMP echo:
-//   altrIcmpSendEcho @ 0x1403f0b00 -> IcmpSendEcho2(h, Event, NULL, NULL, dest, ...)
-// and treats getlastError() == 0x3E5 (ERROR_IO_PENDING) as success. netenv answered
-// every echo as a success without transmitting anything, so on a host whose presented
-// interface has no router -- ZeroTier is a flat L2 network with none -- the check passed
-// under netenv and fails without it.
+// amdaemon answers two network-test items with ICMP:
 //
-// Only destinations inside the presented subnet are answered, so a genuine failure to
-// reach something outside the LAN is still reported as a failure.
+//   GATEWAY         alwAuthPhaseGateway @ 0x1403c0270 phase 0xb, echo to the presented
+//                   gateway, and it treats getlastError() == 0x3E5 (ERROR_IO_PENDING)
+//                   as success. altrIcmpSendEcho @ 0x1403f0b00 is the only caller of
+//                   IcmpSendEcho2 in the process.
+//
+//   NUMBER OF HOP   alwAuthPhaseTraceroute @ 0x1403c1a00 owns the traceroute, and
+//                   am::networktest::HopsChecker reads the result through
+//                   am::network::HopsCounter: HopsCounter::update @ 0x1402aafe0 calls
+//                   altrGetResultTtl @ 0x1403b9ff0, whose value lands in
+//                   Manager+0x1138 and is what the screen prints. The trace starts at
+//                   TTL 1 (FUN_1403ba120 sets the state to 1, FUN_1403d7a60 gives the
+//                   first three probes TTL 1) and FUN_1403f0b00 forwards that TTL to
+//                   IcmpSendEcho2 as RequestOptions->Ttl.
+//
+// netenv answered every echo of every destination with IP_SUCCESS and never looked at
+// the TTL (netenv.c:490-559). The traceroute therefore "reached" its target on the
+// first probe and the item has always read 1 in the whole segatools era -- the number
+// was never a measurement of the real path.
+//
+// Answering every destination reproduces exactly that, and it is also the only shape
+// that lets the network test finish: the traceroute's target is the ALL.Net
+// authentication server, and with the virtualisation scoped to the presented subnet
+// those probes go out on the real network. When that path does not answer, NUMBER OF
+// HOP never leaves CHECKING and the test -- hence the game start -- hangs on it.
+// icmpScope=subnet keeps the old scoped behaviour for anyone who wants a real
+// measurement and can tolerate the wait.
 inline ULONG WINAPI hook_IcmpSendEcho2(HANDLE icmp, HANDLE event, void *apc,
                                        PVOID apc_context, IPAddr destination,
                                        LPVOID request_data, WORD request_size,
@@ -668,13 +697,15 @@ inline ULONG WINAPI hook_IcmpSendEcho2(HANDLE icmp, HANDLE event, void *apc,
     const uint32_t host = ntohl((uint32_t)destination);
     const uint32_t mask = ntohl(p.presented_mask.s_addr);
     const uint32_t network = ntohl(p.presented_network.s_addr) & mask;
-    const bool inside = mask != 0 && mask != 0xFFFFFFFFu && (host & mask) == network;
+    const bool inside = p.icmp_all_destinations ||
+        (mask != 0 && mask != 0xFFFFFFFFu && (host & mask) == network);
     {
         const LONG call = InterlockedIncrement(&g_icmp_calls);
         if (call <= 8) {
-            adapter_hook_log("IcmpSendEcho2 #%ld: destination %lu.%lu.%lu.%lu -> %s",
+            const unsigned long ttl = request_options != nullptr ? request_options->Ttl : 0;
+            adapter_hook_log("IcmpSendEcho2 #%ld: destination %lu.%lu.%lu.%lu ttl=%lu -> %s",
                 call, (host >> 24) & 255, (host >> 16) & 255, (host >> 8) & 255, host & 255,
-                inside ? "virtualized success" : "passed through");
+                ttl, inside ? "virtualized success" : "passed through");
         }
     }
     if (!inside) {
