@@ -374,3 +374,33 @@ It reports; it does not reroute. If the LAN adapter is the only one with a defau
 and it cannot reach the server, the hook says so and stops there - fixing that is a
 routing or server-placement decision, not something an adapter hook should silently paper
 over.
+### 11.1 A gateway has to exist before it can be probed
+
+The first field report after the ICMP work still showed GATEWAY BAD, with
+`[iphlpapi] installed 3 hook slot(s)`. The 3 is correct for `amdaemon`: it imports
+`GetAdaptersInfo`, `GetAdaptersAddresses` and `IcmpSendEcho2`, but **not** `GetIfTable`,
+so the three slots were the two enumeration APIs plus the ICMP hook. The ICMP hook was
+live.
+
+What was missing is the address to probe. ZeroTier is a flat L2 segment: it reports no
+gateway at all, so `FirstGatewayAddress` is null, and the check fails before
+`IcmpSendEcho2` is ever called. Virtualising the echo cannot help a probe that is never
+made.
+
+netenv never had this problem because it supplied `subnet | routerSuffix` as the gateway
+unconditionally (`netenv.c:269`, `netenv.c:322-323`). The hook now does the same, but only
+when the adapter reports none, on both APIs:
+
+- `FirstGatewayAddress` for `GetAdaptersAddresses`;
+- `GatewayList` for `GetAdaptersInfo`, whose x86 pass reads it at `+0x1d4`.
+
+Measured on an adapter that, like ZeroTier, reports no gateway:
+
+```
+INFO  Adapter ... reports no gateway; presenting 172.16.10.254 so the gateway check
+      has an address to probe.
+  gw: 172.16.10.254  dns: 100.127.129.129 211.136.17.107
+  172.16.10.254  count=0 error=997/IO_PENDING status=IP_SUCCESS (virtualized)
+```
+
+With the gateway present, the ICMP hook answers it and the chain closes.

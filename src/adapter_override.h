@@ -55,6 +55,13 @@ struct AdapterPresentation {
     bool dns_fallback_enabled = true;
     in_addr dns_fallback = {};
 
+    // ZeroTier and similar flat L2 segments report no gateway at all. netenv always
+    // supplied subnet|routerSuffix, and the gateway check has nothing to probe when the
+    // list is empty, so it reports BAD before any ICMP is sent. Synthesise one only when
+    // the adapter genuinely has none.
+    bool gateway_fallback_enabled = false;
+    in_addr gateway_fallback = {};
+
     // amdaemon's gateway check is an ICMP echo (altrIcmpSendEcho @ 0x1403f0b00 ->
     // IcmpSendEcho2), and netenv made every echo succeed. Without that, a host whose
     // presented interface has no reachable router fails the check even though the LAN
@@ -107,6 +114,18 @@ struct DnsFallbackEntry {
 
 inline DnsFallbackEntry &dns_fallback_entry() {
     static DnsFallbackEntry storage;
+    return storage;
+}
+
+// Same idea for the gateway: one static entry, used only when the real adapter reports
+// none. The game copies the address out during enumeration.
+struct GatewayFallbackEntry {
+    IP_ADAPTER_GATEWAY_ADDRESS entry;
+    sockaddr_in address;
+};
+
+inline GatewayFallbackEntry &gateway_fallback_entry() {
+    static GatewayFallbackEntry storage;
     return storage;
 }
 
@@ -249,6 +268,21 @@ inline ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO info, PULONG size) {
 
     if (p.forced_type) keep->Type = kEthernetType;
 
+    // chusanApp's GetAdaptersInfo pass reads GatewayList (+0x1d4 in the x86 layout), so
+    // the same empty-gateway problem exists on this API. Fill it with the same address
+    // the addresses API is given.
+    if (p.gateway_fallback_enabled && keep->GatewayList.IpAddress.String[0] == 0) {
+        _snprintf_s(keep->GatewayList.IpAddress.String,
+            sizeof(keep->GatewayList.IpAddress.String), _TRUNCATE, "%u.%u.%u.%u",
+            (ntohl(p.gateway_fallback.s_addr) >> 24) & 255,
+            (ntohl(p.gateway_fallback.s_addr) >> 16) & 255,
+            (ntohl(p.gateway_fallback.s_addr) >> 8) & 255,
+            ntohl(p.gateway_fallback.s_addr) & 255);
+        strcpy_s(keep->GatewayList.IpMask.String,
+            sizeof(keep->GatewayList.IpMask.String), "255.255.255.0");
+        keep->GatewayList.Next = nullptr;
+    }
+
     if (p.exclusive && keep != info) {
         // The caller owns the head pointer, so the only way to drop the adapters
         // ahead of ours is to move ours to the front of the caller's buffer.
@@ -343,6 +377,20 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
         fallback.address.sin_family = AF_INET;
         fallback.address.sin_addr = p.dns_fallback;
         keep->FirstDnsServerAddress = &fallback.entry;
+    }
+
+    // A flat L2 segment reports no gateway. The gateway check then has nothing to probe
+    // and reports BAD without sending a packet, which no amount of ICMP virtualisation
+    // can fix. Supply one, as netenv did.
+    if (p.gateway_fallback_enabled && keep->FirstGatewayAddress == nullptr) {
+        GatewayFallbackEntry &fallback = gateway_fallback_entry();
+        memset(&fallback, 0, sizeof(fallback));
+        fallback.entry.Length = sizeof(fallback.entry);
+        fallback.entry.Address.lpSockaddr = (struct sockaddr *)&fallback.address;
+        fallback.entry.Address.iSockaddrLength = sizeof(fallback.address);
+        fallback.address.sin_family = AF_INET;
+        fallback.address.sin_addr = p.gateway_fallback;
+        keep->FirstGatewayAddress = &fallback.entry;
     }
 
     if (p.exclusive) {

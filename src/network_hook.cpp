@@ -1863,6 +1863,27 @@ void configure_presentation() {
                                         "not enumerate an empty DNS list.", g_interface_name, text);
                                 }
                             }
+
+                            // A flat L2 segment such as ZeroTier reports no gateway either.
+                            // The gateway check then has nothing to probe and fails without
+                            // sending a packet, so supply the address netenv supplied.
+                            if (a->FirstGatewayAddress != nullptr &&
+                                a->FirstGatewayAddress->Address.lpSockaddr != nullptr) {
+                                presentation.gateway_fallback_enabled = false;
+                            } else {
+                                presentation.gateway_fallback = g_segatools.found
+                                    ? segatools::router_address(g_segatools)
+                                    : in_addr{};
+                                if (presentation.gateway_fallback.s_addr != 0) {
+                                    presentation.gateway_fallback_enabled = true;
+                                    char text[INET_ADDRSTRLEN] = {};
+                                    InetNtopA(AF_INET, &presentation.gateway_fallback, text,
+                                        sizeof(text));
+                                    defer_info("Adapter %s reports no gateway; presenting %s so "
+                                        "the gateway check has an address to probe.",
+                                        g_interface_name, text);
+                                }
+                            }
                             break;
                         }
                     }
