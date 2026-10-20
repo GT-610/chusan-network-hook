@@ -202,6 +202,13 @@ inline icmp_send_echo2_fn &next_icmp() {
     return fn;
 }
 
+// Formats an address the way IP_ADAPTER_INFO stores it, dotted quad in a fixed buffer.
+inline void adapter_gateway_string(const in_addr address, char *out, size_t out_size) {
+    const uint32_t host = ntohl(address.s_addr);
+    _snprintf_s(out, out_size, _TRUNCATE, "%u.%u.%u.%u",
+        (host >> 24) & 255, (host >> 16) & 255, (host >> 8) & 255, host & 255);
+}
+
 // Storage for a DNS server entry that has no home in the caller's buffer when the real
 // adapter reports none. A single static entry is enough: the game copies the address out
 // during enumeration, exactly as it does for netenv's static struct.
@@ -349,7 +356,7 @@ inline ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO info, PULONG size) {
             sizeof(entry->GatewayList.IpMask.String), "255.255.255.0");
         entry->LeaseObtained = (UINT32)time(nullptr) - 3600;
         entry->LeaseExpires = (UINT32)time(nullptr) + 86400;
-        if (size) *size = sizeof(IP_ADAPTER_INFO);
+        *size = sizeof(IP_ADAPTER_INFO);
         return ERROR_SUCCESS;
     }
 
@@ -374,19 +381,18 @@ inline ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO info, PULONG size) {
     keep->DhcpEnabled = 1;
 
     // chusanApp's GetAdaptersInfo pass reads GatewayList (+0x1d4 in the x86 layout), so
-    // the same empty-gateway problem exists on this API. Fill it with the same address
-    // the addresses API is given.
-    // Overwrite rather than fill-if-empty: the two enumeration APIs must report the same
-    // gateway, otherwise the answer depends on which one amdaemon asked.
-    if (p.gateway_fallback_enabled &&
-        (keep->GatewayList.IpAddress.String[0] == 0 ||
-         strcmp(keep->GatewayList.IpAddress.String, "0.0.0.0") == 0)) {
-        _snprintf_s(keep->GatewayList.IpAddress.String,
-            sizeof(keep->GatewayList.IpAddress.String), _TRUNCATE, "%u.%u.%u.%u",
-            (ntohl(p.gateway_fallback.s_addr) >> 24) & 255,
-            (ntohl(p.gateway_fallback.s_addr) >> 16) & 255,
-            (ntohl(p.gateway_fallback.s_addr) >> 8) & 255,
-            ntohl(p.gateway_fallback.s_addr) & 255);
+    // this is the value the game actually uses for the gateway item. It must be the same
+    // one GetAdaptersAddresses and GetBestRoute report, or the answer depends on which API
+    // happened to be asked.
+    //
+    // Overwrite unconditionally rather than only when the field is empty. `gateway_fallback`
+    // already holds the value to present - the adapter's own gateway when that one is on the
+    // presented segment, the segment router otherwise - so a field that is merely non-empty
+    // can still be the wrong address. Leaving an out-of-subnet gateway here while replacing
+    // it on the other API is precisely the inconsistency this hook exists to remove.
+    if (p.gateway_fallback_enabled) {
+        adapter_gateway_string(p.gateway_fallback, keep->GatewayList.IpAddress.String,
+            sizeof(keep->GatewayList.IpAddress.String));
         strcpy_s(keep->GatewayList.IpMask.String,
             sizeof(keep->GatewayList.IpMask.String), "255.255.255.0");
         keep->GatewayList.Next = nullptr;
@@ -516,8 +522,12 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
     // and reports BAD without sending anything, which no amount of ICMP virtualisation can
     // fix. Supply one, as netenv did - and supply the same one GetAdaptersInfo and
     // GetBestRoute report, because the game cross-checks them.
-    if (p.gateway_fallback_enabled &&
-        !chain_has_ipv4(keep->FirstGatewayAddress)) {
+    //
+    // Unconditional for the same reason as the GatewayList write above: `gateway_fallback`
+    // is the address to present, not merely a fallback for an empty field, so a real gateway
+    // that sits outside the presented subnet has to be replaced here too.
+    if (p.gateway_fallback_enabled) {
+        const bool replaced = chain_has_ipv4(keep->FirstGatewayAddress);
         GatewayFallbackEntry &fallback = gateway_fallback_entry();
         memset(&fallback, 0, sizeof(fallback));
         fallback.entry.Length = sizeof(fallback.entry);
@@ -527,11 +537,12 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
         fallback.address.sin_addr = p.gateway_fallback;
         keep->FirstGatewayAddress = &fallback.entry;
         static volatile LONG reported = 0;
-        if (InterlockedExchange(&reported, 1) == 0) {
+        if (replaced && InterlockedExchange(&reported, 1) == 0) {
             char text[INET_ADDRSTRLEN] = "-";
             InetNtopA(AF_INET, &p.gateway_fallback, text, sizeof(text));
-            adapter_hook_log("Adapter %lu reports no gateway; presenting %s as both the "
-                "gateway and the route next hop.", p.if_index, text);
+            adapter_hook_log("Adapter %lu's own gateway is not on the presented segment; "
+                "presenting %s as the gateway and the route next hop instead.", p.if_index,
+                text);
         }
     }
 

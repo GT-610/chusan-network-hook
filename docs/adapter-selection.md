@@ -151,7 +151,16 @@ change only the fields the game refuses.
 
 The segment router is `[keychip] subnet | [netenv] routerSuffix` when `segatools.ini` is
 present — the same address netenv invented — and otherwise the last usable host of the
-presented subnet. Both are inside the subnet, which is the only property that matters.
+presented subnet. The configured value is validated against the presented subnet rather than
+trusted: `[keychip] subnet` describes what the game was *told* to expect, and when the chosen
+adapter is on another subnet the invented address falls outside its own network and would
+fail the very comparison it exists to satisfy.
+
+The substitution is unconditional on both enumeration APIs whenever a gateway is to be
+presented, not only when the field is empty. A field that is merely non-empty can still be
+the wrong address, and `chusanApp` reads the gateway from `GetAdaptersInfo` (`+0x1D4`) during
+enumeration — so correcting one API and leaving the other would hand the game the bad value
+while the log showed a good one.
 
 `exclusive=1` moves the chosen adapter to the front of the caller's buffer rather than
 allocating a new list: `IP_ADAPTER_INFO` keeps its strings inline, and

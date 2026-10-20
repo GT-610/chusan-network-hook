@@ -578,6 +578,11 @@ bool resolve_network_interface() {
     bool have_requested = false;
     ULONG requested_index = 0;
     bool have_index = false;
+    // A friendly name is matched case-insensitively against adapter->FriendlyName. It has
+    // to be kept separately because it is wide, and because "no such name" must reach the
+    // unresolved-selector error rather than quietly falling through to automatic choice.
+    wchar_t requested_name[128] = {};
+    bool have_name = false;
 
     if (selector[0] != 0) {
         if (InetPtonA(AF_INET, selector, &requested) == 1) {
@@ -588,6 +593,10 @@ bool resolve_network_interface() {
             if (end != nullptr && *end == 0 && parsed > 0 && parsed < 0x10000000) {
                 requested_index = (ULONG)parsed;
                 have_index = true;
+            } else {
+                MultiByteToWideChar(CP_UTF8, 0, selector, -1, requested_name,
+                    (int)(sizeof(requested_name) / sizeof(requested_name[0])));
+                have_name = requested_name[0] != 0;
             }
         }
         g_interface_explicit = true;
@@ -644,6 +653,9 @@ bool resolve_network_interface() {
                 if (candidate->sin_addr.s_addr != requested.s_addr) continue;
             } else if (have_index) {
                 if (adapter->IfIndex != requested_index) continue;
+            } else if (have_name) {
+                if (adapter->FriendlyName == nullptr ||
+                    _wcsicmp(adapter->FriendlyName, requested_name) != 0) continue;
             } else if (have_expected) {
                 if (candidate->sin_addr.s_addr != expected.s_addr) continue;
             } else {
@@ -663,7 +675,11 @@ bool resolve_network_interface() {
     // it is rewritten to Ethernet, loopback only when asked for. Excluding the rest
     // keeps a Tailscale or TAP adapter (IfType 53) from making the choice look
     // ambiguous when it would have been rejected regardless.
-    if (chosen == nullptr && !have_requested && !have_index) {
+    // `g_interface_explicit` rather than the individual flags: an explicitly named
+    // interface that did not match must not silently fall through to automatic choice,
+    // which is what happened when a friendly name failed to parse as either an address or
+    // an index and left every flag false.
+    if (chosen == nullptr && !g_interface_explicit) {
         const uint32_t network = ntohl(segatools::subnet_network(g_segatools).s_addr);
         IP_ADAPTER_ADDRESSES *candidates[16] = {};
         IP_ADAPTER_UNICAST_ADDRESS *candidate_addresses[16] = {};
@@ -747,6 +763,10 @@ bool resolve_network_interface() {
             _snprintf_s(request, sizeof(request), _TRUNCATE, "address %s", selector);
         } else if (have_index) {
             _snprintf_s(request, sizeof(request), _TRUNCATE, "index %lu", requested_index);
+        } else if (have_name) {
+            char name[160] = {};
+            wide_to_utf8(requested_name, name, sizeof(name));
+            _snprintf_s(request, sizeof(request), _TRUNCATE, "the adapter named \"%s\"", name);
         } else if (have_expected) {
             char text[INET_ADDRSTRLEN] = {};
             InetNtopA(AF_INET, &expected, text, sizeof(text));
@@ -1800,16 +1820,24 @@ extern "C" __declspec(noinline) bool lan_duplicate_server_false() {
 // With segatools.ini present that is the address netenv invented for the same purpose -
 // [keychip] subnet with [netenv] routerSuffix, default .254. Without it there is no
 // configured value, and a flat L2 segment often reports no gateway of its own, so the
-// last usable host of the presented subnet is used instead. Either way the answer is
-// inside the subnet, which is the property the game's gateway check tests for.
+// last usable host of the presented subnet is used instead.
+//
+// Either way the answer is inside the presented subnet, because that is the property the
+// game's gateway check tests for. The configured value is validated against it rather than
+// trusted: `[keychip] subnet` describes the subnet the game was told to expect, and when
+// the chosen adapter is on a different one, the invented address is outside its own network
+// and would fail the very comparison it is supposed to satisfy.
 in_addr segment_router_address() {
-    if (g_segatools.found) {
-        const in_addr configured = segatools::router_address(g_segatools);
-        if (configured.s_addr != 0) return configured;
-    }
     const uint32_t mask = ntohl(g_interface_mask.s_addr);
     if (mask == 0 || mask == 0xFFFFFFFFu) return in_addr{};
     const uint32_t network = ntohl(g_interface_address.s_addr) & mask;
+
+    if (g_segatools.found) {
+        const in_addr configured = segatools::router_address(g_segatools);
+        if (configured.s_addr != 0 && (ntohl(configured.s_addr) & mask) == network) {
+            return configured;
+        }
+    }
     in_addr result = {};
     result.s_addr = htonl((network | ~mask) - 1);
     return result;
@@ -1850,12 +1878,19 @@ void configure_presentation() {
         presentation.route_override_enabled = g_config.override_best_route;
         {
             // Prefer the real MAC so anything that keys on it stays consistent.
+            //
+            // GAA_FLAG_INCLUDE_GATEWAYS is not optional here: without it
+            // FirstGatewayAddress is left null for every adapter, so the check below would
+            // conclude that no adapter has a gateway and substitute the segment router on
+            // every host - silently discarding a real gateway that happens to be correct.
             ULONG size = 0;
-            if (GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &size) == ERROR_BUFFER_OVERFLOW) {
+            if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS, nullptr, nullptr,
+                    &size) == ERROR_BUFFER_OVERFLOW) {
                 IP_ADAPTER_ADDRESSES *buffer = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(
                     HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size));
                 if (buffer != nullptr) {
-                    if (GetAdaptersAddresses(AF_INET, 0, nullptr, buffer, &size) == NO_ERROR) {
+                    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS, nullptr,
+                            buffer, &size) == NO_ERROR) {
                         for (IP_ADAPTER_ADDRESSES *a = buffer; a != nullptr; a = a->Next) {
                             if (a->IfIndex != g_interface_index) continue;
                             if (a->PhysicalAddressLength == 6) {

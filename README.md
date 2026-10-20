@@ -97,6 +97,11 @@ interface index. Left empty, the hook decides:
 2. the only acceptable adapter inside `[keychip] subnet`;
 3. the only acceptable adapter with a routable IPv4.
 
+A name that does not match is a hard error, never a silent fall-through to the automatic
+order. A non-ASCII friendly name requires `network_hook.ini` to be saved as UTF-16, because
+the Windows profile API reads an ANSI file as the system code page; the numeric index always
+works and needs no encoding.
+
 "Acceptable" means a link type the game can use: Ethernet, or wireless (rewritten to
 Ethernet). TAP, Tailscale and similar adapters report a link type the game rejects anyway,
 so they are not counted, which keeps them from making the choice look ambiguous.
@@ -122,9 +127,14 @@ The hook rewrites **only the fields the game refuses** and keeps the real identi
 The gateway and the DNS server list are the two substituted values. Both must be usable on
 the presented segment, so the hook keeps a real gateway only when it lies inside
 `address & mask` and otherwise supplies the segment router — `[keychip] subnet` with
-`[netenv] routerSuffix`, which is the address netenv invented. The same value feeds the
-adapter field, the `GetAdaptersInfo` string and the route next hop, because the game
-cross-checks them. An empty DNS list, likewise, is a state netenv never produced.
+`[netenv] routerSuffix`, which is the address netenv invented, and only when that address
+really falls inside the presented subnet. The same value feeds the adapter field, the
+`GetAdaptersInfo` string and the route next hop, because the game cross-checks them.
+
+That last point is not decoration: `chusanApp` reads the gateway from `GetAdaptersInfo`
+during enumeration, so an out-of-subnet gateway left in that API while the other one was
+corrected is exactly the inconsistency that makes the item fail. An empty DNS list,
+likewise, is a state netenv never produced.
 
 `[netenv] enable=1` in `segatools.ini` takes precedence: segatools patches the same three
 functions at the executable entry point and would overwrite these hooks, so the hook does not

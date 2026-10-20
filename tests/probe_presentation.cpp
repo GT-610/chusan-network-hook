@@ -61,10 +61,14 @@ int wmain(int argc, wchar_t **argv) {
         for (IP_ADAPTER_INFO *a = info; a != NULL; a = a->Next) {
             const bool ok = a->Type == 6;
             if (ok) ++accepted;
-            printf("  idx=%-3lu type=%-2lu %-13s %-16s macLen=%lu  %s\n",
+            // The gateway column matters: chusanApp's pass 1 parses GatewayList (+0x1d4)
+            // and this is the value the gateway item is actually decided on. It has to
+            // agree with the GetAdaptersAddresses output below.
+            printf("  idx=%-3lu type=%-2lu %-13s %-16s gw=%-16s macLen=%lu  %s\n",
                 a->Index, a->Type, type_name(a->Type),
-                a->IpAddressList.IpAddress.String, a->AddressLength,
-                ok ? "ACCEPT" : "reject");
+                a->IpAddressList.IpAddress.String,
+                a->GatewayList.IpAddress.String[0] ? a->GatewayList.IpAddress.String : "-",
+                a->AddressLength, ok ? "ACCEPT" : "reject");
         }
         printf("  -> chusanApp would accept %d adapter(s)\n", accepted);
         free(info);
