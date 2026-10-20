@@ -498,3 +498,58 @@ field rather than requiring another round of guessing:
 ADAPTER_HOOK  presented: if_index=10 if_type=6 oper=1 flags=0x3E5 mtu=1500
               ip=172.16.10.235 gw=172.16.10.254 dns=100.127.129.129 exclusive=1
 ```
+## 14. The cause, confirmed
+
+`FUN_1403c0270` is `alwAuthPhaseGateway`, the gateway phase of the ALL.Net authentication
+state machine (its log tag is `alwAuthPhaseGateway`). In its first phase it performs a
+comparison and fails immediately:
+
+```c
+puVar8 = FUN_1403b0f20();          /* the network state block */
+if ((*(int *)(puVar8 + 7) == 0) &&
+    ((*(uint *)((longlong)puVar8 + 0xcc) & *(uint *)(puVar8 + 0x19)) !=   /* gateway & mask */
+     (*(uint *)((longlong)puVar8 + 0xc4) & *(uint *)(puVar8 + 0x19)))) {  /* address & mask */
+    FUN_1403c74a0(0xfffffffe, 0x1f42);                                    /* 0x1F42 = 8002 */
+    ...
+```
+
+`puVar8` is `undefined8 *`, so the three offsets are bytes: `+0xc4` the interface
+address, `+0xc8` the mask, `+0xcc` the gateway. The test is:
+
+> **`(gateway & mask) != (address & mask)` -> fail with 8002.**
+
+That is a pure integer comparison. It sends nothing, which is why the gateway item turns
+BAD immediately and why the field log contained no `IcmpSendEcho2` line at all, and it is
+the same `0x1F42` seen in the control run ("IP ADDRESS BAD then error 8002").
+
+### Why netenv never failed it
+
+netenv reported `subnet | routerSuffix` as the gateway and `subnet | addrSuffix` as the
+address. Both are inside the `/24` it also reported, so `gateway & mask == address & mask`
+held trivially. It did not have to send a packet either - it simply never had a gateway
+outside its own subnet, because it invented both numbers from the same subnet.
+
+A real adapter carries no such guarantee. A flat L2 segment such as ZeroTier can report a
+gateway on a different prefix, and the check then fails on the arithmetic alone.
+
+### Why every earlier attempt missed it
+
+- The ICMP hook was written for a probe that this code path never reaches; the observed
+  absence of `IcmpSendEcho2` calls is consistent with the comparison above.
+- Filling in a gateway only when the field was *absent* left the case that actually
+  occurs - a gateway present but outside the prefix - completely untouched.
+- `GetBestRoute` feeds `alwAuthPhaseDefaultGateway` (a different phase, `FUN_1403c00d0`),
+  not this one, so changing it could not have fixed the gateway verdict.
+
+### The rule the hook now applies
+
+The gateway presented to the game is kept only when it satisfies exactly the condition
+this phase checks:
+
+```
+(ntohl(gateway) & mask) == (ntohl(interface_address) & mask)
+```
+
+Otherwise it is replaced with `subnet | routerSuffix`, which satisfies it by construction,
+and the same value is used for the route next hop and for both enumeration APIs. The
+replacement is reported at start-up, naming the address that was rejected and why.
