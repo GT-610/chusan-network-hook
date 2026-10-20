@@ -1893,8 +1893,9 @@ void configure_presentation() {
                             // outside the adapter's own subnet is not a usable default
                             // gateway for that adapter anyway.
                             bool gateway_usable = false;
+                            in_addr real_gateway = {};
                             if (chain_has_ipv4(a->FirstGatewayAddress)) {
-                                const in_addr real_gateway = reinterpret_cast<const sockaddr_in *>(
+                                real_gateway = reinterpret_cast<const sockaddr_in *>(
                                     a->FirstGatewayAddress->Address.lpSockaddr)->sin_addr;
                                 const uint32_t mask = ntohl(g_interface_mask.s_addr);
                                 const uint32_t network =
@@ -1910,18 +1911,28 @@ void configure_presentation() {
                                         : "it is outside the presented subnet, so it is "
                                           "replaced with the segment router address");
                             }
-                            if (!gateway_usable) {
-                                presentation.gateway_fallback = g_segatools.found
+
+                            // One address serves both the adapter field and the route next
+                            // hop. Deriving them separately let the two disagree, and a
+                            // disagreement between "what the adapter says the gateway is"
+                            // and "where the route says traffic goes" is exactly the kind
+                            // of inconsistency netenv never produced.
+                            if (gateway_usable) {
+                                presentation.gateway_effective = real_gateway;
+                                presentation.gateway_fallback_enabled = false;
+                            } else {
+                                const in_addr segment_router = g_segatools.found
                                     ? segatools::router_address(g_segatools)
                                     : in_addr{};
-                                if (presentation.gateway_fallback.s_addr != 0) {
+                                presentation.gateway_effective = segment_router;
+                                if (segment_router.s_addr != 0) {
+                                    presentation.gateway_fallback = segment_router;
                                     presentation.gateway_fallback_enabled = true;
                                     char text[INET_ADDRSTRLEN] = {};
-                                    InetNtopA(AF_INET, &presentation.gateway_fallback, text,
-                                        sizeof(text));
-                                    defer_info("Adapter %s has no usable gateway; presenting %s "
-                                        "so the gateway check has an address on this segment "
-                                        "to work with.", g_interface_name, text);
+                                    InetNtopA(AF_INET, &segment_router, text, sizeof(text));
+                                    defer_info("Adapter %s has no on-segment gateway; presenting "
+                                        "%s for both the adapter field and the route next hop.",
+                                        g_interface_name, text);
                                 }
                             }
                             break;

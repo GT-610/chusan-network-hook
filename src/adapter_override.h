@@ -501,6 +501,45 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
         adapter_hook_log("GetAdaptersAddresses: injected gateway for if_index %lu", p.if_index);
     }
 
+    // Dump the record once, after shaping. If the game still rejects it, this is the
+    // only place that shows every field it was actually given.
+    {
+        static volatile LONG dumped = 0;
+        if (InterlockedExchange(&dumped, 1) == 0 && log_sink() != nullptr) {
+            char unicast[INET_ADDRSTRLEN] = "-";
+            char gateway[INET_ADDRSTRLEN] = "-";
+            char dns[INET_ADDRSTRLEN] = "-";
+            for (PIP_ADAPTER_UNICAST_ADDRESS u = keep->FirstUnicastAddress; u != nullptr;
+                 u = u->Next) {
+                if (u->Address.lpSockaddr != nullptr && u->Address.lpSockaddr->sa_family == AF_INET) {
+                    InetNtopA(AF_INET,
+                        &reinterpret_cast<const sockaddr_in *>(u->Address.lpSockaddr)->sin_addr,
+                        unicast, sizeof(unicast));
+                    break;
+                }
+            }
+            if (keep->FirstGatewayAddress != nullptr &&
+                keep->FirstGatewayAddress->Address.lpSockaddr != nullptr &&
+                keep->FirstGatewayAddress->Address.lpSockaddr->sa_family == AF_INET) {
+                InetNtopA(AF_INET, &reinterpret_cast<const sockaddr_in *>(
+                    keep->FirstGatewayAddress->Address.lpSockaddr)->sin_addr,
+                    gateway, sizeof(gateway));
+            }
+            if (keep->FirstDnsServerAddress != nullptr &&
+                keep->FirstDnsServerAddress->Address.lpSockaddr != nullptr &&
+                keep->FirstDnsServerAddress->Address.lpSockaddr->sa_family == AF_INET) {
+                InetNtopA(AF_INET, &reinterpret_cast<const sockaddr_in *>(
+                    keep->FirstDnsServerAddress->Address.lpSockaddr)->sin_addr,
+                    dns, sizeof(dns));
+            }
+            adapter_hook_log("presented: if_index=%lu if_type=%lu oper=%u flags=0x%lX mtu=%lu "
+                "ip=%s gw=%s dns=%s exclusive=%d",
+                keep->IfIndex, keep->IfType, (unsigned)keep->OperStatus,
+                (unsigned long)keep->Flags, (unsigned long)keep->Mtu,
+                unicast, gateway, dns, p.exclusive ? 1 : 0);
+        }
+    }
+
     if (p.exclusive) {
         // Only the fixed-size header moves. Its internal pointers address data
         // elsewhere in the same caller-owned buffer, so they stay valid as-is; only
