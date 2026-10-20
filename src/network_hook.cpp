@@ -1812,6 +1812,29 @@ void configure_presentation() {
                                     g_interface_name, (unsigned long)a->IfType,
                                     a->IfType == kWirelessType ? "wireless" : "other");
                             }
+                            // chusanApp walks FirstDnsServerAddress while enumerating, so
+                            // an adapter with no DNS server must not hand it a blank list.
+                            // Keep the real server when there is one; otherwise fall back
+                            // to the router, which is what netenv always reported.
+                            if (a->FirstDnsServerAddress != nullptr &&
+                                a->FirstDnsServerAddress->Address.lpSockaddr != nullptr &&
+                                a->FirstDnsServerAddress->Address.lpSockaddr->sa_family == AF_INET) {
+                                presentation.dns_fallback_enabled = false;
+                            } else {
+                                presentation.dns_fallback_enabled = true;
+                                presentation.dns_fallback = g_segatools.found
+                                    ? segatools::router_address(g_segatools)
+                                    : in_addr{};
+                                if (presentation.dns_fallback.s_addr == 0) {
+                                    presentation.dns_fallback_enabled = false;
+                                } else {
+                                    char text[INET_ADDRSTRLEN] = {};
+                                    InetNtopA(AF_INET, &presentation.dns_fallback, text, sizeof(text));
+                                    defer_line("Adapter %s reports no DNS server; presenting %s "
+                                        "(the [netenv] routerSuffix address) so the game does "
+                                        "not enumerate an empty DNS list.", g_interface_name, text);
+                                }
+                            }
                             break;
                         }
                     }

@@ -39,6 +39,9 @@ int main(void) {
     printf("IfType          +0x%03zx\n", offsetof(IP_ADAPTER_ADDRESSES, IfType));
     printf("OperStatus      +0x%03zx\n", offsetof(IP_ADAPTER_ADDRESSES, OperStatus));
     printf("FirstUnicastAddress +0x%03zx\n", offsetof(IP_ADAPTER_ADDRESSES, FirstUnicastAddress));
+    printf("FirstAnycastAddress +0x%03zx\n", offsetof(IP_ADAPTER_ADDRESSES, FirstAnycastAddress));
+    printf("FirstMulticastAddress +0x%03zx\n", offsetof(IP_ADAPTER_ADDRESSES, FirstMulticastAddress));
+    printf("FirstDnsServerAddress +0x%03zx\n", offsetof(IP_ADAPTER_ADDRESSES, FirstDnsServerAddress));
     printf("FriendlyName    +0x%03zx\n", offsetof(IP_ADAPTER_ADDRESSES, FriendlyName));
     printf("Ipv4Metric      +0x%03zx\n", offsetof(IP_ADAPTER_ADDRESSES, Ipv4Metric));
 

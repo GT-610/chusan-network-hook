@@ -46,6 +46,13 @@ struct AdapterPresentation {
     in_addr synthetic_address = {};
     in_addr synthetic_mask = {};
     in_addr synthetic_gateway = {};
+
+    // chusanApp reads IP_ADAPTER_ADDRESSES.FirstDnsServerAddress (+0x1c) while it
+    // enumerates (allnet_enumerate_adapters), so the list has to be non-empty even
+    // when the real adapter has no DNS server configured. netenv always reported the
+    // router here; this keeps that behaviour only as the fallback.
+    bool dns_fallback_enabled = true;
+    in_addr dns_fallback = {};
 };
 
 namespace adapter_override {
@@ -71,6 +78,19 @@ inline get_adapters_addresses_fn &next_addresses() {
 inline get_if_table_fn &next_table() {
     static get_if_table_fn fn = nullptr;
     return fn;
+}
+
+// Storage for a DNS server entry that has no home in the caller's buffer when the real
+// adapter reports none. A single static entry is enough: the game copies the address out
+// during enumeration, exactly as it does for netenv's static struct.
+struct DnsFallbackEntry {
+    IP_ADAPTER_DNS_SERVER_ADDRESS entry;
+    sockaddr_in address;
+};
+
+inline DnsFallbackEntry &dns_fallback_entry() {
+    static DnsFallbackEntry storage;
+    return storage;
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +311,21 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
         // The game treats anything but "up" as unusable; a rewritten adapter that
         // reports down would be worse than not rewriting at all.
         if (keep->OperStatus != IfOperStatusUp) keep->OperStatus = IfOperStatusUp;
+    }
+
+    // chusanApp walks FirstDnsServerAddress during enumeration. A chosen adapter that
+    // legitimately has no DNS server (static IP, no DHCP) would hand the game an empty
+    // list, which is a state netenv never produced. Fall back to the gateway, which is
+    // what netenv reported unconditionally.
+    if (p.dns_fallback_enabled && keep->FirstDnsServerAddress == nullptr) {
+        DnsFallbackEntry &fallback = dns_fallback_entry();
+        memset(&fallback, 0, sizeof(fallback));
+        fallback.entry.Length = sizeof(fallback.entry);
+        fallback.entry.Address.lpSockaddr = (struct sockaddr *)&fallback.address;
+        fallback.entry.Address.iSockaddrLength = sizeof(fallback.address);
+        fallback.address.sin_family = AF_INET;
+        fallback.address.sin_addr = p.dns_fallback;
+        keep->FirstDnsServerAddress = &fallback.entry;
     }
 
     if (p.exclusive) {

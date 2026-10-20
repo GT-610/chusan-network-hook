@@ -200,3 +200,77 @@ build\probe_adapter_table.exe
 ```
 
 Ghidra side: `allnet_enumerate_adapters` @ `0x01026820`, single caller `0x0044dcc5`.
+
+## 10. DNS: what netenv controls, and what it does not
+
+This was checked because it decides whether dropping netenv changes how the game resolves
+names. It does change one thing, and not the one that first suggests itself.
+
+### netenv does not touch name resolution
+
+`netenv.c` hooks exactly five import groups — `GetAdaptersAddresses`, `GetAdaptersInfo`,
+`GetBestRoute`, `GetIfTable`, `IcmpSendEcho2` and `ws2_32!sendto`. It never patches
+`dnsapi.dll`, `getaddrinfo`, `GetAddrInfoW`, `DnsQuery_*` or `WinHttpConnect`.
+
+Name redirection lives in a separate segatools component,
+`common/hooklib/dns.c`, driven by `common/platform/dns.c`. It is enabled by the `[dns]`
+section, whose `enable` defaults to **1** (`config.c:92`) and is independent of
+`[netenv] enable` (default **0**). `platform_hook_init` initialises the two siblings in
+sequence (`platform.c:44` then `platform.c:62`); neither owns the other.
+
+So with `[netenv] enable=0` the domain table still applies: `naominet.jp`,
+`*.sys-all.net`, `tenporouter.loc` and the rest keep resolving to the `[dns]` targets.
+
+### But netenv does fabricate the adapter's DNS server list
+
+`chusanApp` reads `IP_ADAPTER_ADDRESSES.FirstDnsServerAddress` while enumerating.
+`allnet_enumerate_adapters` @ `0x01026820` walks it:
+
+```c
+uVar1 = puVar9[7];                       /* +0x1c = FirstDnsServerAddress */
+for (; uVar1 != 0; uVar1 = *(uint *)(uVar1 + 8)) {   /* Next at +0x08 */
+    getnameinfo(*(uint *)(uVar1 + 0x0c),             /* Address.lpSockaddr */
+                *(uint *)(uVar1 + 0x10),             /* Address.iSockaddrLength */
+                local_40c, 0x401, 0, 0, 2);
+    ...
+}
+```
+
+The offsets line up with the SDK layout, measured by `tests/probe_struct_offsets.cpp`:
+`FirstUnicastAddress` 0x10, `FirstAnycastAddress` 0x14, `FirstMulticastAddress` 0x18,
+**`FirstDnsServerAddress` 0x1c**. `puVar9[2]` is `Next` at 0x08 and `puVar9[1]` is
+`IfIndex` at 0x04, which confirms `puVar9` really is the adapter pointer.
+
+netenv supplies that list — `netenv.c:256` sets `FirstDnsServerAddress = &env->dns`, and
+`netenv.c:326` sets it to `netenv_ip_router`, i.e. `subnet | routerSuffix` (default
+`.254`).
+
+Note the asymmetry: netenv's `hook_GetAdaptersInfo` never assigns `DnsServerList`, so that
+API reports an empty list. The game does not read it there — the `GetAdaptersInfo` pass
+only parses IP, mask and gateway (`0x1B0`, `0x1C0`, `0x1D4`) — so the inconsistency is
+invisible in practice.
+
+### Consequence for this hook
+
+Presenting the real adapter therefore changes the DNS list the game sees, from netenv's
+constant `a.b.c.254` to whatever the adapter actually has. That is more correct, but it
+is a behaviour change on a host whose adapter has **no** DNS server (static address, no
+DHCP): the game would enumerate an empty list, a state netenv never produced.
+
+`hook_GetAdaptersAddresses` therefore keeps the real list when one exists and falls back
+to `[netenv] routerSuffix` when the adapter has none, which reproduces the only value
+netenv ever reported. The fallback is reported on start-up rather than applied silently.
+
+**Not verified:** an adapter that genuinely reports no DNS server. This host's chosen
+adapter has two, so the fallback branch never ran; only the "keep the real list" branch is
+measured.
+
+### A collision worth knowing about
+
+`common/hooklib/dns.c` can also patch `ws2_32!send` (`http_hook_init`, for `Host:`
+rewriting) and `ws2_32!connect` (port remapping). Both are off by default —
+`[dns] replaceHost`, `startupPort`, `billingPort` and `aimedbPort` all default to 0
+(`config.c:142-145`). If they are enabled, those patches coexist with this hook's own
+`send`/`connect` hooks because they are applied later (at `platform_hook_init`, which runs
+after this DLL's `DllMain`) and therefore chain in front: `dns.c` -> this hook -> real.
+No arbitration is needed, but the ordering is what makes it work.

@@ -132,6 +132,11 @@ The hook rewrites **only the fields the game refuses**, and keeps the real ident
 - `exclusive=1` presents only the chosen adapter, so a lower-index adapter cannot win by
   accident.
 
+The adapter's DNS server list is preserved when it has one, and falls back to the
+`[netenv] routerSuffix` address when it does not, because `chusanApp` reads
+`FirstDnsServerAddress` during enumeration. Name resolution itself is untouched: that is
+segatools' separate `[dns]` component and stays active regardless of `[netenv] enable`.
+
 `[netenv] enable=1` in `segatools.ini` takes precedence: segatools patches the same three
 functions at the executable entry point and would overwrite these hooks, so the hook does
 not fight it. It reports the conflict instead, naming the file to edit. Set

@@ -81,6 +81,15 @@ int wmain(int argc, wchar_t **argv) {
                 printf("  if_index=%-3lu if_type=%-2lu %-13s oper=%u unicast:",
                     a->IfIndex, (unsigned long)a->IfType, type_name(a->IfType),
                     (unsigned)a->OperStatus);
+                printf(" dns:");
+                for (IP_ADAPTER_DNS_SERVER_ADDRESS *d = a->FirstDnsServerAddress; d; d = d->Next) {
+                    char dtext[INET6_ADDRSTRLEN] = {};
+                    if (d->Address.lpSockaddr && getnameinfo(d->Address.lpSockaddr,
+                            d->Address.iSockaddrLength, dtext, sizeof(dtext), NULL, 0,
+                            NI_NUMERICHOST) == 0)
+                        printf(" %s", dtext);
+                }
+                printf(" unicast:");
                 for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next) {
                     char text[INET6_ADDRSTRLEN] = {};
                     if (getnameinfo(u->Address.lpSockaddr, u->Address.iSockaddrLength,

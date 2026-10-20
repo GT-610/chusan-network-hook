@@ -152,7 +152,16 @@ broadcast is legitimate and no rewrite is needed. The old `limited_broadcast_tar
 matched `255.255.255.255` only, which is why the pinning never engaged on real sessions
 that addressed `192.168.139.255`.
 
-## 9. Out of scope
+## 9. DNS
+
+netenv does not intercept name resolution; that is `[dns]` in segatools
+(`common/hooklib/dns.c`), enabled independently and still active with `[netenv] enable=0`.
+What netenv *does* control is the adapter's DNS **server list**, which `chusanApp` reads
+through `FirstDnsServerAddress` while enumerating. This hook keeps the real list when the
+adapter has one and falls back to the `[netenv] routerSuffix` address when it does not,
+which is the only value netenv ever reported. See `adapter-selection.md` #10.
+
+## 10. Out of scope
 
 - LAN Install virtualisation (`[lanInstall]`) is unchanged.
 - No packet payload rewriting. The address the game serialises into its packets must be
