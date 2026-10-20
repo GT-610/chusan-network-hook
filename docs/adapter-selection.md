@@ -468,3 +468,33 @@ The vftable pointers are recorded here because the RTTI type descriptor for
 `am::networktest::GatewayChecker` (`0x1408ac208`) is reached only through the complete
 object locator at `0x140793140`, which has no direct code reference and is therefore easy
 to lose.
+### 13.2 The invariant the presentation now guarantees
+
+The whole difference between this hook and netenv, stated as one sentence: **netenv's
+adapter was internally consistent because everything in it came from one invented
+subnet, and a real adapter is not consistent in that sense.** Every field a consumer can
+cross-check - address against mask, gateway against subnet, route next hop against the
+gateway field, the two enumeration APIs against each other - agreed for netenv for free.
+
+The presentation therefore enforces these now, rather than passing reality through:
+
+| pair | rule |
+| --- | --- |
+| address / mask / prefix | taken from the same unicast entry |
+| gateway vs subnet | gateway kept only if inside `address & mask`, else `subnet \| routerSuffix` |
+| `GetBestRoute` next hop vs gateway field | one `gateway_effective` feeds both |
+| `GetAdaptersInfo.GatewayList` vs `GetAdaptersAddresses.FirstGatewayAddress` | both written from that same value; `"0.0.0.0"` counts as absent |
+| `IfIndex` | real, so `GetIfEntry` and `IP_UNICAST_IF` stay valid |
+
+The one field that deliberately stays real is `IfIndex`, because faking it is what broke
+`IP_UNICAST_IF` and `bind()` in the first place. netenv used `1`, which also happens to be
+the loopback index; that it still worked is evidence the verdict does not cross-check the
+index, so keeping the real one costs nothing.
+
+The presented record is dumped once per process, so a run that still fails reports every
+field rather than requiring another round of guessing:
+
+```
+ADAPTER_HOOK  presented: if_index=10 if_type=6 oper=1 flags=0x3E5 mtu=1500
+              ip=172.16.10.235 gw=172.16.10.254 dns=100.127.129.129 exclusive=1
+```
