@@ -42,10 +42,18 @@ Per `IP_ADAPTER_INFO` node the fields are copied out. Offsets are confirmed by t
 | `+0x194` | `Address[8]` | 8-byte copy — MAC |
 | `+0x19C` | `Index` | stored, also the map key |
 | **`+0x1A0`** | **`Type`** | **`CMP [ECX+0x1a0], 6` — adapters that fail this are dropped** |
-| `+0x1A4` | `DhcpEnabled` | `0` or the DHCP server string |
+| `+0x1A4` | `DhcpEnabled` | numeric flag, `0` or `1`; gates the `DhcpServer` read below |
 | `+0x1B0` | `IpAddressList.IpAddress.String` | parsed to a packed IPv4 |
 | `+0x1C0` | `IpAddressList.IpMask.String` | parsed to a packed IPv4 |
-| `+0x1D4` | `GatewayList.IpAddress.String` | parsed into a vector |
+| `+0x1D4` | `GatewayList` (i.e. its `Next`) | start of the list, handed to the parser |
+| `+0x1D8` | `GatewayList.IpAddress.String` | parsed into a vector |
+| `+0x200` | `DhcpServer.IpAddress.String` | copied only when `DhcpEnabled != 0` |
+
+`DhcpEnabled` is a `BOOL`, not a string, and `+0x200` is a different field:
+`01026979  CMP dword ptr [ECX + 0x1a4], 0` / `JNZ` either clears the DHCP-server slot or
+duplicates the string at `+0x200`. `GatewayList` itself begins at `+0x1D4` — that is where
+`Next` lives — and the enumeration code passes `+0x1D4` to the parser, which reads `+4`
+from it (`thunk_FUN_01033d90(puVar3 + 1)`), so the string it actually parses is `+0x1D8`.
 
 `0x010268F0` is `CMP dword ptr [ECX + 0x1a0], 0x6` / `JNZ skip`. `Type == 6` is
 `MIB_IF_TYPE_ETHERNET`. There is **no other acceptance test** in this pass: no speed, no
@@ -158,7 +166,8 @@ fail the very comparison it exists to satisfy.
 
 The substitution is unconditional on both enumeration APIs whenever a gateway is to be
 presented, not only when the field is empty. A field that is merely non-empty can still be
-the wrong address, and `chusanApp` reads the gateway from `GetAdaptersInfo` (`+0x1D4`) during
+the wrong address, and `chusanApp` reads the gateway from `GetAdaptersInfo`
+(`GatewayList.IpAddress.String`, `+0x1D8`) during
 enumeration — so correcting one API and leaving the other would hand the game the bad value
 while the log showed a good one.
 

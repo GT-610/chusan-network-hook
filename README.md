@@ -52,6 +52,15 @@ start "AM Daemon" /min inject_x64 -d -k chusanhook_x64.dll -k chusan_network_hoo
 inject_x86 -d -k chusanhook_x86.dll -k chusan_network_hook_x86.dll chusanApp.exe
 ```
 
+Both `-k` names are resolved against the working directory, which is the game's `bin`
+directory (that is what `pushd %~dp0` in `launch.bat` establishes), so the two hook DLLs have
+to be there. Copy them in from the build output before launching:
+
+```bat
+copy build\chusan_network_hook_x64.dll bin\
+copy build\chusan_network_hook_x86.dll bin\
+```
+
 Place `network_hook.ini` in the same directory as each injected DLL. Both processes may
 share one configuration when both DLLs are stored together.
 
@@ -128,7 +137,10 @@ The gateway and the DNS server list are the two substituted values. Both must be
 the presented segment, so the hook keeps a real gateway only when it lies inside
 `address & mask` and otherwise supplies the segment router — `[keychip] subnet` with
 `[netenv] routerSuffix`, which is the address netenv invented, and only when that address
-really falls inside the presented subnet. The same value feeds the adapter field, the
+really falls inside the presented subnet. When the configured router is outside the selected
+adapter's subnet — or `segatools.ini` is absent — the fallback is the **last usable host of
+the presented subnet** (`(network | ~mask) - 1`, e.g. `172.16.63.254` on a `/18`). That one
+value is used consistently for the presented gateway, the adapter field, the
 `GetAdaptersInfo` string and the route next hop, because the game cross-checks them.
 
 That last point is not decoration: `chusanApp` reads the gateway from `GetAdaptersInfo`
@@ -157,10 +169,13 @@ Join Party path can reach itself. Listener sockets are never restricted.
 destination, as netenv did. It is a query only: real egress still follows the routing table,
 so the game server keeps its own path.
 
-`strict=1` turns a **misconfigured** interface into a hard block: if `interface` names
-something that cannot be resolved, the affected operation fails instead of silently using a
-different adapter. A hook that simply has not worked out an interface is reported once and
-left unpinned — an absent configuration is not a misconfiguration.
+`strict=1` decides what happens when an operation needs an interface and does not have one.
+It only ever applies to a **misconfigured** interface — one the user named that cannot be
+resolved: there the affected operation fails instead of silently using a different adapter,
+and `strict=0` lets it fall back to Windows routing. An *absent* configuration is not a
+misconfiguration: if `[network] interface` is empty and no automatic candidate qualifies, the
+hook reports that once and leaves traffic unpinned, and `strict` does not change that, in
+either setting. So `strict=0` relaxes the explicit-name case only.
 
 ### ICMP and the network-test items
 

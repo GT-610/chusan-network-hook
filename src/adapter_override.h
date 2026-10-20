@@ -29,6 +29,10 @@
 constexpr ULONG kEthernetType = 6;      // MIB_IF_TYPE_ETHERNET / IF_TYPE_ETHERNET_CSMACD
 constexpr ULONG kWirelessType = 71;     // IF_TYPE_IEEE80211
 constexpr ULONG kLoopbackType = 24;     // IF_TYPE_SOFTWARE_LOOPBACK
+// The MAC length netenv presented, and the value amdaemon's GetAdaptersInfo filter tests
+// (`+0x194 == 6`). IP_ADAPTER_INFO.Address and IP_ADAPTER_ADDRESSES.PhysicalAddress both
+// hold it; the latter has room for 8, which is not permission to report 8.
+constexpr ULONG kMacLength = 6;
 
 // A chain of IP_ADAPTER_*_ADDRESS entries counts as usable only if some node really
 // carries an AF_INET address that is not 0.0.0.0. Testing the head pointer alone is not
@@ -265,8 +269,15 @@ inline void build_fabricated(const AdapterPresentation &p, Fabricated *env) {
     env->head.DnsSuffix = env->dns_suffix;
     env->head.Description = env->description;
     env->head.FriendlyName = env->friendly_name;
-    memcpy(env->head.PhysicalAddress, p.mac, sizeof(p.mac));
-    env->head.PhysicalAddressLength = (ULONG)sizeof(p.mac);
+    // sizeof(p.mac) is 8 - the array is oversized so GetAdaptersAddresses has somewhere
+    // to write - and copying that many bytes would report a MAC length of 8 while
+    // hook_GetAdaptersInfo reports AddressLength 6 for the same adapter. amdaemon tests
+    // that length (`+0x194 == 6`) before accepting anything, so the two APIs have to
+    // agree on 6, which is also what netenv presented (netenv.c:260-263).
+    const ULONG mac_length =
+        p.mac_length != 0 && p.mac_length < kMacLength ? p.mac_length : kMacLength;
+    memcpy(env->head.PhysicalAddress, p.mac, mac_length);
+    env->head.PhysicalAddressLength = mac_length;
     env->head.Flags = IP_ADAPTER_DHCP_ENABLED | IP_ADAPTER_IPV4_ENABLED;
     env->head.Mtu = 4200;
     env->head.IfType = kEthernetType;
@@ -333,8 +344,8 @@ inline ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO info, PULONG size) {
         memset(entry, 0, sizeof(*entry));
         strcpy_s(entry->AdapterName, _countof(entry->AdapterName), "Fake Ethernet");
         strcpy_s(entry->Description, _countof(entry->Description), "Adapter Description");
-        entry->AddressLength = 6;
-        memcpy(entry->Address, p.mac, 6);
+        entry->AddressLength = kMacLength;
+        memcpy(entry->Address, p.mac, kMacLength);
         entry->Index = 1;
         entry->Type = kEthernetType;
         entry->DhcpEnabled = 1;

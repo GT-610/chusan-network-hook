@@ -83,9 +83,9 @@ int wmain(int argc, wchar_t **argv) {
         printf("=== GetAdaptersAddresses (result=%lu) ===\n", result);
         if (result == NO_ERROR) {
             for (IP_ADAPTER_ADDRESSES *a = addresses; a != NULL; a = a->Next) {
-                printf("  if_index=%-3lu if_type=%-2lu %-13s oper=%u unicast:",
+                printf("  if_index=%-3lu if_type=%-2lu %-13s oper=%u macLen=%lu unicast:",
                     a->IfIndex, (unsigned long)a->IfType, type_name(a->IfType),
-                    (unsigned)a->OperStatus);
+                    (unsigned)a->OperStatus, (unsigned long)a->PhysicalAddressLength);
                 printf(" gw:");
                 for (IP_ADAPTER_GATEWAY_ADDRESS *g = a->FirstGatewayAddress; g; g = g->Next) {
                     char gtext[INET6_ADDRSTRLEN] = {};
@@ -140,7 +140,8 @@ int wmain(int argc, wchar_t **argv) {
         const char *targets[] = { "172.16.10.254", "8.8.8.8" };
         printf("=== IcmpSendEcho2 (async form, as amdaemon calls it) ===\n");
         for (int i = 0; i < 2; ++i) {
-            IPAddr destination = inet_addr(targets[i]);
+            IPAddr destination = INADDR_NONE;
+            InetPtonA(AF_INET, targets[i], &destination);
             ResetEvent(event);
             SetLastError(0);
             const DWORD count = IcmpSendEcho2(icmp, event, NULL, NULL, destination,

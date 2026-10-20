@@ -1962,9 +1962,15 @@ void configure_presentation() {
         presentation.synthetic_address = segatools::expected_address(g_segatools);
         presentation.synthetic_gateway = segatools::router_address(g_segatools);
         presentation.synthetic_mask.s_addr = htonl(0xFFFFFF00u);
-        defer_line("mode=compat: presenting a synthetic adapter for %s, as netenv would. "
+        // g_interface_ready_text() reports the selected real interface, and this branch is
+        // reached precisely when none qualified - it would print "(not selected)" where the
+        // message claims to name the address the game will see. Format the synthetic one.
+        char synthetic_text[INET_ADDRSTRLEN] = {};
+        InetNtopA(AF_INET, &presentation.synthetic_address, synthetic_text,
+            sizeof(synthetic_text));
+        defer_info("mode=compat: presenting a synthetic adapter for %s, as netenv would. "
             "Traffic is not pinned, because no real interface carries that address.",
-            g_interface_ready_text());
+            synthetic_text);
         return;
     }
 
