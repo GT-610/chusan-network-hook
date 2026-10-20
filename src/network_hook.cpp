@@ -9,7 +9,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "segatools_ini.h"
+#include "adapter_override.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -37,6 +41,11 @@ constexpr unsigned char kProtocolKey[16] = {
 struct Config {
     bool network_enable = false;
     char interface_address[INET_ADDRSTRLEN] = {};
+    char interface_selector[128] = {};
+    int mode = 0; // 0 auto, 1 native, 2 compat
+    bool exclusive = true;
+    bool allow_loopback = false;
+    bool force_directed_broadcast = true;
     bool force_limited_broadcast = true;
     bool force_tcp_source = true;
     bool strict = true;
@@ -44,7 +53,10 @@ struct Config {
     bool log_enable = true;
     bool log_detailed = false;
     bool log_write_file = false;
+    wchar_t segatools_path[MAX_PATH] = {};
 };
+
+enum class Mode { Auto, Native, Compat };
 
 HMODULE g_dll;
 SRWLOCK g_log_lock = SRWLOCK_INIT;
@@ -60,8 +72,16 @@ wchar_t g_log_path[MAX_PATH];
 in_addr g_interface_address = {};
 ULONG g_interface_index;
 ULONG g_interface_prefix_length;
+in_addr g_interface_mask = {};
 char g_interface_name[512];
 bool g_network_ready;
+segatools::Config g_segatools;
+// Set when the interface was named explicitly and could not be resolved. That is a
+// misconfiguration and must be treated differently from "nothing was configured".
+bool g_interface_explicit;
+// Messages raised before the logging thread exists; flushed once logging is up.
+char g_pending[8][512];
+volatile LONG g_pending_count;
 BCRYPT_ALG_HANDLE g_aes_provider;
 BCRYPT_KEY_HANDLE g_aes_key;
 PUCHAR g_aes_key_object;
@@ -275,6 +295,31 @@ void load_config() {
         g_config_path);
     WideCharToMultiByte(CP_UTF8, 0, interface_address, -1,
         g_config.interface_address, sizeof(g_config.interface_address), nullptr, nullptr);
+
+    // `interface` supersedes `interfaceAddress`: it accepts an address, a friendly
+    // name or an index, and an address is what interfaceAddress already was.
+    wchar_t selector[128] = {};
+    GetPrivateProfileStringW(L"network", L"interface", L"", selector, _countof(selector),
+        g_config_path);
+    if (selector[0] == 0) {
+        wcsncpy_s(selector, interface_address, _TRUNCATE);
+    }
+    WideCharToMultiByte(CP_UTF8, 0, selector, -1,
+        g_config.interface_selector, sizeof(g_config.interface_selector), nullptr, nullptr);
+
+    wchar_t mode[16] = {};
+    GetPrivateProfileStringW(L"network", L"mode", L"auto", mode, _countof(mode), g_config_path);
+    if (_wcsicmp(mode, L"native") == 0) g_config.mode = 1;
+    else if (_wcsicmp(mode, L"compat") == 0) g_config.mode = 2;
+    else g_config.mode = 0;
+
+    GetPrivateProfileStringW(L"segatools", L"path", L"", g_config.segatools_path,
+        MAX_PATH, g_config_path);
+
+    g_config.exclusive = config_bool(L"network", L"exclusive", true);
+    g_config.allow_loopback = config_bool(L"network", L"allowLoopback", false);
+    g_config.force_directed_broadcast =
+        config_bool(L"network", L"forceDirectedBroadcast", true);
     g_config.force_limited_broadcast =
         config_bool(L"network", L"forceLimitedBroadcast", true);
     g_config.force_tcp_source = config_bool(L"network", L"forceTcpSource", true);
@@ -283,6 +328,37 @@ void load_config() {
     g_config.log_enable = config_bool(L"log", L"enable", true);
     g_config.log_detailed = config_bool(L"log", L"detailed", false);
     g_config.log_write_file = config_bool(L"log", L"writeFile", false);
+}
+
+// Defined below; flush_pending() needs it while the logger itself is still ahead in
+// the translation unit.
+const char *g_interface_ready_text() {
+    static char text[INET_ADDRSTRLEN + 1] = "(not selected)";
+    if (!g_network_ready) return text;
+    InetNtopA(AF_INET, &g_interface_address, text, sizeof(text));
+    return text;
+}
+
+void human_line(const char *category, const char *format, ...);
+
+// Buffers a diagnostic raised before the logging thread exists. Calling the normal
+// logger from DllMain would take a lock and touch the filesystem under the loader
+// lock, which is exactly what the loader-lock rules forbid.
+void defer_line(const char *format, ...) {
+    const LONG slot = InterlockedIncrement(&g_pending_count) - 1;
+    if (slot < 0 || slot >= (LONG)(sizeof(g_pending) / sizeof(g_pending[0]))) return;
+    va_list args;
+    va_start(args, format);
+    _vsnprintf_s(g_pending[slot], sizeof(g_pending[slot]), _TRUNCATE, format, args);
+    va_end(args);
+}
+
+void flush_pending() {
+    const LONG count = g_pending_count;
+    for (LONG i = 0; i < count && i < (LONG)(sizeof(g_pending) / sizeof(g_pending[0])); ++i) {
+        human_line("ERROR", "%s", g_pending[i]);
+    }
+    InterlockedExchange(&g_pending_count, 0);
 }
 
 void open_log_file() {
@@ -467,18 +543,36 @@ bool resolve_network_interface() {
     g_interface_index = 0;
     g_interface_prefix_length = 0;
     g_interface_name[0] = '\0';
+    g_interface_explicit = false;
     if (!g_config.network_enable) return true;
-    if (InetPtonA(AF_INET, g_config.interface_address, &g_interface_address) != 1) {
-        human_line("ERROR", "The configured interfaceAddress '%s' is not a valid IPv4 address.",
-            g_config.interface_address[0] ? g_config.interface_address : "(empty)");
-        return false;
+
+    const char *selector = g_config.interface_selector;
+    while (*selector == ' ') ++selector;
+
+    in_addr requested = {};
+    bool have_requested = false;
+    ULONG requested_index = 0;
+    bool have_index = false;
+
+    if (selector[0] != 0) {
+        if (InetPtonA(AF_INET, selector, &requested) == 1) {
+            have_requested = true;
+        } else {
+            char *end = nullptr;
+            const unsigned long parsed = strtoul(selector, &end, 0);
+            if (end != nullptr && *end == 0 && parsed > 0 && parsed < 0x10000000) {
+                requested_index = (ULONG)parsed;
+                have_index = true;
+            }
+        }
+        g_interface_explicit = true;
     }
 
     ULONG size = 16 * 1024;
     IP_ADAPTER_ADDRESSES *addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(
         HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size));
     if (addresses == nullptr) {
-        human_line("ERROR", "Could not enumerate network adapters: out of memory.");
+        defer_line("Could not enumerate network adapters: out of memory.");
         return false;
     }
     ULONG result = GetAdaptersAddresses(AF_INET,
@@ -495,40 +589,156 @@ bool resolve_network_interface() {
         }
     }
     if (addresses == nullptr || result != NO_ERROR) {
-        human_line("ERROR", "Could not enumerate network adapters (result=%lu).", result);
+        defer_line("Could not enumerate network adapters (result=%lu).", result);
         if (addresses != nullptr) HeapFree(GetProcessHeap(), 0, addresses);
         return false;
     }
 
-    for (IP_ADAPTER_ADDRESSES *adapter = addresses;
-         adapter != nullptr && !g_network_ready; adapter = adapter->Next) {
+    // The address the stock segatools.ini told the game to expect. If a real
+    // adapter owns it, that adapter is the answer with no further decisions.
+    in_addr expected = {};
+    bool have_expected = false;
+    if (g_segatools.found && g_segatools.netenv.enable) {
+        expected = segatools::expected_address(g_segatools);
+        have_expected = true;
+    }
+
+    IP_ADAPTER_ADDRESSES *chosen = nullptr;
+    IP_ADAPTER_UNICAST_ADDRESS *chosen_address = nullptr;
+    char rejected[1024] = {};
+
+    for (IP_ADAPTER_ADDRESSES *adapter = addresses; adapter != nullptr; adapter = adapter->Next) {
         for (IP_ADAPTER_UNICAST_ADDRESS *unicast = adapter->FirstUnicastAddress;
              unicast != nullptr; unicast = unicast->Next) {
             if (unicast->Address.lpSockaddr == nullptr ||
                 unicast->Address.lpSockaddr->sa_family != AF_INET) continue;
-            const sockaddr_in *address = reinterpret_cast<const sockaddr_in *>(
+            const sockaddr_in *candidate = reinterpret_cast<const sockaddr_in *>(
                 unicast->Address.lpSockaddr);
-            if (address->sin_addr.s_addr != g_interface_address.s_addr) continue;
-            g_interface_index = adapter->IfIndex;
-            g_interface_prefix_length = unicast->OnLinkPrefixLength;
-            wide_to_utf8(adapter->FriendlyName, g_interface_name, sizeof(g_interface_name));
-            g_network_ready = adapter->OperStatus == IfOperStatusUp;
-            if (!g_network_ready) {
-                human_line("ERROR", "The configured interface %s (%s) is not up.",
-                    g_config.interface_address, g_interface_name);
+
+            if (have_requested) {
+                if (candidate->sin_addr.s_addr != requested.s_addr) continue;
+            } else if (have_index) {
+                if (adapter->IfIndex != requested_index) continue;
+            } else if (have_expected) {
+                if (candidate->sin_addr.s_addr != expected.s_addr) continue;
+            } else {
+                continue;
             }
+            if (adapter->OperStatus != IfOperStatusUp) continue;
+            chosen = adapter;
+            chosen_address = unicast;
             break;
         }
+        if (chosen != nullptr) break;
     }
+
+    // Fallbacks when nothing was named and the stock configuration did not point at
+    // a specific address. Candidates are restricted to link types the game can
+    // actually accept (docs/adapter-selection.md): Ethernet always, wireless because
+    // it is rewritten to Ethernet, loopback only when asked for. Excluding the rest
+    // keeps a Tailscale or TAP adapter (IfType 53) from making the choice look
+    // ambiguous when it would have been rejected regardless.
+    if (chosen == nullptr && !have_requested && !have_index) {
+        const uint32_t network = ntohl(segatools::subnet_network(g_segatools).s_addr);
+        IP_ADAPTER_ADDRESSES *candidates[16] = {};
+        IP_ADAPTER_UNICAST_ADDRESS *candidate_addresses[16] = {};
+        int candidate_count = 0;
+        char list[512] = {};
+
+        for (IP_ADAPTER_ADDRESSES *adapter = addresses; adapter != nullptr;
+             adapter = adapter->Next) {
+            if (adapter->OperStatus != IfOperStatusUp) continue;
+            const bool acceptable_type = adapter->IfType == kEthernetType ||
+                adapter->IfType == kWirelessType ||
+                (g_config.allow_loopback && adapter->IfType == kLoopbackType);
+            if (!acceptable_type) continue;
+            for (IP_ADAPTER_UNICAST_ADDRESS *unicast = adapter->FirstUnicastAddress;
+                 unicast != nullptr; unicast = unicast->Next) {
+                if (unicast->Address.lpSockaddr == nullptr ||
+                    unicast->Address.lpSockaddr->sa_family != AF_INET) continue;
+                const uint32_t host = ntohl(
+                    reinterpret_cast<const sockaddr_in *>(unicast->Address.lpSockaddr)
+                        ->sin_addr.s_addr);
+                if ((host >> 24) == 127) continue;
+                if ((host & 0xFFFF0000u) == 0xA9FE0000u) continue; // 169.254/16 APIPA
+                if (candidate_count >= (int)(sizeof(candidates) / sizeof(candidates[0]))) break;
+                candidates[candidate_count] = adapter;
+                candidate_addresses[candidate_count] = unicast;
+                ++candidate_count;
+                char text[INET_ADDRSTRLEN] = {};
+                InetNtopA(AF_INET, &unicast->Address.lpSockaddr->sa_data[2], text,
+                    sizeof(text));
+                _snprintf_s(list + strlen(list), sizeof(list) - strlen(list), _TRUNCATE,
+                    "%s%s (index %lu)", list[0] ? ", " : "", text, adapter->IfIndex);
+                break;
+            }
+        }
+
+        if (candidate_count == 1) {
+            chosen = candidates[0];
+            chosen_address = candidate_addresses[0];
+        } else if (candidate_count > 1 && g_segatools.found) {
+            // Prefer the one inside the subnet the keychip told the game to expect.
+            int matches = 0;
+            for (int i = 0; i < candidate_count; ++i) {
+                const uint32_t host = ntohl(
+                    reinterpret_cast<const sockaddr_in *>(
+                        candidate_addresses[i]->Address.lpSockaddr)->sin_addr.s_addr);
+                if ((host & 0xFFFFFF00u) != network) continue;
+                ++matches;
+                chosen = candidates[i];
+                chosen_address = candidate_addresses[i];
+            }
+            if (matches != 1) {
+                chosen = nullptr;
+                chosen_address = nullptr;
+            }
+        }
+        if (chosen == nullptr && candidate_count > 1) {
+            defer_line("%d network interfaces could each carry the LAN (%s); set "
+                "[network] interface to say which one.", candidate_count, list);
+        }
+    }
+
+    if (chosen != nullptr) {
+        g_interface_index = chosen->IfIndex;
+        g_interface_prefix_length = chosen_address->OnLinkPrefixLength;
+        wide_to_utf8(chosen->FriendlyName, g_interface_name, sizeof(g_interface_name));
+        g_interface_address =
+            reinterpret_cast<const sockaddr_in *>(chosen_address->Address.lpSockaddr)->sin_addr;
+        {
+            const uint32_t prefix = g_interface_prefix_length == 0 ? 24 : g_interface_prefix_length;
+            const uint32_t mask = prefix >= 32 ? 0xFFFFFFFFu : (0xFFFFFFFFu << (32 - prefix));
+            g_interface_mask.s_addr = htonl(mask);
+        }
+        g_network_ready = true;
+    }
+
     HeapFree(GetProcessHeap(), 0, addresses);
+
     if (!g_network_ready) {
-        human_line("ERROR", "No active adapter owns interfaceAddress %s.",
-            g_config.interface_address);
+        char request[160] = {};
+        if (have_requested) {
+            _snprintf_s(request, sizeof(request), _TRUNCATE, "address %s", selector);
+        } else if (have_index) {
+            _snprintf_s(request, sizeof(request), _TRUNCATE, "index %lu", requested_index);
+        } else if (have_expected) {
+            char text[INET_ADDRSTRLEN] = {};
+            InetNtopA(AF_INET, &expected, text, sizeof(text));
+            _snprintf_s(request, sizeof(request), _TRUNCATE,
+                "the address %s that segatools.ini implies (subnet %s, addrSuffix %u)",
+                text, g_segatools.keychip.subnet_text, g_segatools.netenv.addr_suffix);
+        } else {
+            _snprintf_s(request, sizeof(request), _TRUNCATE, "an unspecified adapter");
+        }
+        defer_line("No usable network interface was found for %s.%s", request,
+            g_interface_explicit
+                ? " The request was explicit, so this is a configuration error."
+                : " Set [network] interface to the adapter that carries the LAN.");
+        (void)rejected;
         return false;
     }
-    human_line("INFO", "Using network interface %s (%s, index %lu, prefix /%lu).",
-        g_config.interface_address, g_interface_name, g_interface_index,
-        g_interface_prefix_length);
+
     return true;
 }
 
@@ -592,15 +802,19 @@ void log_adapters() {
         log_line("INTERFACE", "network disabled; interfaceAddress is ignored");
     } else if (!g_network_ready) {
         log_line("INTERFACE", "no interface selected for %s; traffic is not pinned",
-            g_config.interface_address);
+            g_interface_ready_text());
     } else {
+        char selected_text[INET_ADDRSTRLEN] = {};
+        InetNtopA(AF_INET, &g_interface_address, selected_text, sizeof(selected_text));
         log_line("INTERFACE", "selected=%s index=%lu name=\"%s\" prefix=/%lu "
-            "broadcast_pin=%s tcp_source_pin=%s strict=%s",
-            g_config.interface_address, g_interface_index, g_interface_name,
+            "broadcast_pin=%s directed_pin=%s tcp_source_pin=%s strict=%s exclusive=%s",
+            selected_text, g_interface_index, g_interface_name,
             g_interface_prefix_length,
             g_config.force_limited_broadcast ? "on" : "off",
+            g_config.force_directed_broadcast ? "on" : "off",
             g_config.force_tcp_source ? "on" : "off",
-            g_config.strict ? "on" : "off");
+            g_config.strict ? "on" : "off",
+            g_config.exclusive ? "on" : "off");
     }
 }
 
@@ -627,16 +841,36 @@ void log_route_for(const sockaddr *address, int length) {
     }
 }
 
-bool limited_broadcast_target(const sockaddr *address, int length) {
-    return address != nullptr && address->sa_family == AF_INET &&
-        length >= (int)sizeof(sockaddr_in) &&
-        reinterpret_cast<const sockaddr_in *>(address)->sin_addr.s_addr == INADDR_BROADCAST;
+// The game addresses the directed subnet broadcast (a.b.c.255), not the limited
+// broadcast: every captured ROUTE line shows e.g. 192.168.139.255. Matching only
+// INADDR_BROADCAST - which is what this used to do - meant the pin never engaged.
+// Both forms are matched now; the enabled set is gated by two separate switches.
+bool broadcast_target(const sockaddr *address, int length, bool *directed) {
+    if (directed != nullptr) *directed = false;
+    if (address == nullptr || address->sa_family != AF_INET ||
+        length < (int)sizeof(sockaddr_in)) return false;
+    const uint32_t host = ntohl(
+        reinterpret_cast<const sockaddr_in *>(address)->sin_addr.s_addr);
+    if (host == 0xFFFFFFFFu) return true; // 255.255.255.255
+    if (!g_network_ready) return false;
+    const uint32_t mask = ntohl(g_interface_mask.s_addr);
+    const uint32_t network = ntohl(g_interface_address.s_addr) & mask;
+    if (mask == 0 || mask == 0xFFFFFFFFu) return false;
+    if (host == (network | ~mask)) {
+        if (directed != nullptr) *directed = true;
+        return true;
+    }
+    return false;
+}
+
+bool broadcast_pin_enabled(bool directed) {
+    return directed ? g_config.force_directed_broadcast : g_config.force_limited_broadcast;
 }
 
 bool network_failure(const char *operation, uint16_t port, int error) {
     human_line("ERROR", "%s failed for %s (%u) on interface %s: %d/%s.%s",
         operation, service(port), port,
-        g_config.interface_address[0] ? g_config.interface_address : "(not configured)",
+        g_interface_ready_text(),
         error, wsa_name(error),
         g_config.strict ? " The packet was blocked by strict mode." : " Falling back to Windows routing.");
     if (g_config.strict) {
@@ -646,15 +880,35 @@ bool network_failure(const char *operation, uint16_t port, int error) {
     return true;
 }
 
+// Distinguishes "nothing was configured and nothing could be inferred" from "the user
+// named an interface and it is wrong".
+//
+// Only the second is a policy violation worth blocking on. Treating the first as a
+// failure would mean a stock install with no matching adapter could not send a
+// broadcast at all, which is worse than the unpinned behaviour it replaces.
+bool network_unresolved(const char *operation, uint16_t port) {
+    if (g_interface_explicit) {
+        return network_failure(operation, port, WSAENETUNREACH);
+    }
+    static volatile LONG warned = 0;
+    if (InterlockedExchange(&warned, 1) == 0) {
+        human_line("ERROR", "%s: no interface is selected, so nothing was pinned. Game "
+            "traffic follows Windows routing. Set [network] interface to the adapter that "
+            "carries the LAN.", operation);
+    }
+    return true;
+}
+
 bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
-    if (!g_config.network_enable || !g_config.force_limited_broadcast) return true;
+    if (!g_config.network_enable ||
+        (!g_config.force_limited_broadcast && !g_config.force_directed_broadcast)) return true;
     const int saved_error = WSAGetLastError();
     SocketState *state = state_for(socket, true);
     if (state != nullptr && state->broadcast_interface_configured) {
         WSASetLastError(saved_error);
         return true;
     }
-    if (!g_network_ready) return network_failure("Selecting the broadcast interface", port, WSAENETUNREACH);
+    if (!g_network_ready) return network_unresolved("Selecting the broadcast interface", port);
     const DWORD interface_index = htonl(g_interface_index);
     const int result = setsockopt(socket, IPPROTO_IP, IP_UNICAST_IF,
         reinterpret_cast<const char *>(&interface_index), sizeof(interface_index));
@@ -663,10 +917,10 @@ bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
     }
     if (state != nullptr) state->broadcast_interface_configured = true;
     human_line("INFO", "%s broadcast is pinned to %s (%s, index %lu).",
-        service(port), g_config.interface_address, g_interface_name, g_interface_index);
+        service(port), g_interface_ready_text(), g_interface_name, g_interface_index);
     log_line("INTERFACE", "action=force_broadcast socket=%llu service=%s port=%u address=%s if_index=%lu result=0",
         (unsigned long long)(uintptr_t)socket, service(port), port,
-        g_config.interface_address, g_interface_index);
+        g_interface_ready_text(), g_interface_index);
     WSASetLastError(saved_error);
     return true;
 }
@@ -689,7 +943,7 @@ bool ensure_tcp_source(SOCKET socket, uint16_t port,
         WSASetLastError(saved_error);
         return true;
     }
-    if (!g_network_ready) return network_failure("Binding the TCP source address", port, WSAENETUNREACH);
+    if (!g_network_ready) return network_unresolved("Binding the TCP source address", port);
 
     sockaddr_in current = {};
     int current_length = sizeof(current);
@@ -715,10 +969,10 @@ bool ensure_tcp_source(SOCKET socket, uint16_t port,
         save_address(state, reinterpret_cast<const sockaddr *>(&source), sizeof(source), false);
     }
     human_line("INFO", "%s TCP connections are pinned to source address %s.",
-        service(port), g_config.interface_address);
+        service(port), g_interface_ready_text());
     log_line("INTERFACE", "action=bind_tcp_source socket=%llu service=%s port=%u address=%s result=0",
         (unsigned long long)(uintptr_t)socket, service(port), port,
-        g_config.interface_address);
+        g_interface_ready_text());
     WSASetLastError(saved_error);
     return true;
 }
@@ -936,6 +1190,24 @@ SOCKET WSAAPI hook_socket(int af, int type, int protocol) {
     return s;
 }
 
+// Traces every bind, including binds on ports this hook has no interest in.
+//
+// log_io drops any call whose port is not one of the five known services, which makes
+// "the game never called bind" and "the game called bind with an address we did not
+// expect" indistinguishable in a captured log. That ambiguity is what left the Setting
+// bind question open on the Child: its Setting bind is guarded by a game-side
+// condition, and a missing bind could not be told apart from an unlogged one.
+// Ported from the Port 1 branch, where it settled that question.
+void log_bind_always(const char *op, SOCKET s, int result, int error,
+                     const sockaddr *name, int namelen) {
+    char requested[96] = "-";
+    endpoint(name, namelen, requested, sizeof(requested));
+    log_line("BIND", "%s sock=%llu af=%d requested=%s namelen=%d result=%d error=%d/%s",
+        op, (unsigned long long)(uintptr_t)s,
+        name != nullptr ? (int)name->sa_family : -1,
+        requested, namelen, result, error, wsa_name(error));
+}
+
 int WSAAPI hook_bind(SOCKET s, const sockaddr *name, int namelen) {
     const uint16_t port = port_of(name, namelen);
     if (g_config.lan_install_enable && lan_install_port(port)) {
@@ -943,11 +1215,13 @@ int WSAAPI hook_bind(SOCKET s, const sockaddr *name, int namelen) {
         if (state) { state->virtual_lan_port = port; save_address(state, name, namelen, false); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
         log_line("LAN_VIRT", "bind_skipped port=%u requested=%s result=0", port, requested);
+        log_bind_always("bind_virtualized", s, 0, 0, name, namelen);
         return 0;
     }
     int r = g_next_bind(s, name, namelen);
     int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (r == 0) { SocketState *st = state_for(s, true); if (st) save_address(st, name, namelen, false); }
+    log_bind_always("bind", s, r, e, name, namelen);
     log_io("bind", s, r, e, name, namelen, nullptr, 0); if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1044,8 +1318,9 @@ int WSAAPI hook_sendto(SOCKET s, const char *buf, int len, int flags, const sock
         state->route_logged = true;
         log_route_for(to, tolen);
     }
-    if (relevant(port) && limited_broadcast_target(to, tolen) &&
-        !ensure_broadcast_interface(s, port)) return SOCKET_ERROR;
+    bool directed = false;
+    if (relevant(port) && broadcast_target(to, tolen, &directed) &&
+        broadcast_pin_enabled(directed) && !ensure_broadcast_interface(s, port)) return SOCKET_ERROR;
     int r = g_next_sendto(s, buf, len, flags, to, tolen); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (state && r > 0) {
         refresh_addresses(state);
@@ -1162,8 +1437,9 @@ int WSAAPI hook_wsasendto(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent,
         state->route_logged = true;
         log_route_for(to, tolen);
     }
-    if (relevant(port) && limited_broadcast_target(to, tolen) &&
-        !ensure_broadcast_interface(s, port)) {
+    bool directed = false;
+    if (relevant(port) && broadcast_target(to, tolen, &directed) &&
+        broadcast_pin_enabled(directed) && !ensure_broadcast_interface(s, port)) {
         if (sent) *sent = 0;
         return SOCKET_ERROR;
     }
@@ -1328,28 +1604,39 @@ HookSpec g_hooks[] = {
     {"WSAAccept",0,(void *)hook_wsaaccept,(void **)&g_next_wsaaccept}, {"socket",23,(void *)hook_socket,(void **)&g_next_socket},
 };
 
-bool install_iat_hooks(HMODULE module) {
-    if (!module) return false;
+// Adapter presentation is installed separately from the WinSock table because it
+// comes from iphlpapi.dll and, unlike the WinSock hooks, it has to be in place
+// before the game enumerates adapters. See docs/netenv-takeover.md #7.
+HookSpec g_iphlp_hooks[] = {
+    {"GetAdaptersInfo", 0, (void *)adapter_override::hook_GetAdaptersInfo,
+        (void **)&adapter_override::next_info()},
+    {"GetAdaptersAddresses", 0, (void *)adapter_override::hook_GetAdaptersAddresses,
+        (void **)&adapter_override::next_addresses()},
+    {"GetIfTable", 0, (void *)adapter_override::hook_GetIfTable,
+        (void **)&adapter_override::next_table()},
+};
+
+struct InstallReport { LONG candidates; LONG patched; LONG already; LONG failed; };
+
+// `quiet` is required when this runs from DllMain: the normal loggers take a lock and
+// touch the filesystem, which is forbidden under the loader lock.
+InstallReport install_hook_table(HMODULE module, const char *dll_a, const char *dll_b,
+                                 HookSpec *specs, size_t spec_count, const char *tag,
+                                 bool quiet) {
+    InstallReport report = {};
+    if (!module) return report;
     unsigned char *base = reinterpret_cast<unsigned char *>(module);
     IMAGE_DOS_HEADER *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return report;
     IMAGE_NT_HEADERS *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return report;
     const IMAGE_DATA_DIRECTORY &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dir.VirtualAddress) return false;
-    // Coverage is recorded per socket function, not just as a total, because
-    // "iat=installed" only means at least one slot was rewritten. A build that
-    // patched socket() but silently failed to patch bind() would still report
-    // installed, and the resulting gap would only show up as a missing call in
-    // the log. The counters below make that gap explicit.
-    const LONG patched_before = g_hook_count;
-    LONG candidates = 0;
-    LONG already_patched = 0;
-    LONG failed = 0;
+    if (!dir.VirtualAddress) return report;
+
     IMAGE_IMPORT_DESCRIPTOR *desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(base + dir.VirtualAddress);
     for (; desc->Name; ++desc) {
         const char *dll = reinterpret_cast<const char *>(base + desc->Name);
-        if (_stricmp(dll, "ws2_32.dll") && _stricmp(dll, "wsock32.dll")) continue;
+        if (_stricmp(dll, dll_a) && (!dll_b || _stricmp(dll, dll_b))) continue;
         if (!desc->OriginalFirstThunk) continue;
 #ifdef _WIN64
         IMAGE_THUNK_DATA64 *names = reinterpret_cast<IMAGE_THUNK_DATA64 *>(base + desc->OriginalFirstThunk);
@@ -1372,11 +1659,15 @@ bool install_iat_hooks(HMODULE module) {
                     reinterpret_cast<IMAGE_IMPORT_BY_NAME *>(base + names->u1.AddressOfData);
                 name = reinterpret_cast<const char *>(import_name->Name);
             }
-            for (auto &hook : g_hooks) {
+            for (size_t index = 0; index < spec_count; ++index) {
+                HookSpec &hook = specs[index];
                 if ((by_ordinal && ordinal != hook.ordinal) || (!by_ordinal && (!name || strcmp(name, hook.name)))) continue;
                 void **slot = reinterpret_cast<void **>(&iat->u1.Function);
-                if (*slot == hook.replacement) { ++already_patched; break; }
-                ++candidates;
+                if (*slot == hook.replacement) { ++report.already; break; }
+                ++report.candidates;
+                // `next` is normally resolved from the real export before this runs
+                // (see prepare()), so a slot another component already patched does not
+                // become our trampoline. Capture only when nothing was resolved.
                 if (*hook.next == nullptr) *hook.next = *slot;
                 DWORD old = 0;
                 if (VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old)) {
@@ -1384,32 +1675,57 @@ bool install_iat_hooks(HMODULE module) {
                     DWORD ignored; VirtualProtect(slot, sizeof(void *), old, &ignored);
                     FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void *));
                     InterlockedIncrement(&g_hook_count);
+                    ++report.patched;
                 } else {
                     // Never silent: a slot left unpatched means every call through
                     // it bypasses the hook and is invisible in the log.
                     const DWORD protect_error = GetLastError();
-                    ++failed;
-                    log_line("IAT", "patch_failed function=%s slot=%p error=%lu/%s",
-                        hook.name, (void *)slot, protect_error, "WIN32_ERROR");
+                    ++report.failed;
+                    if (quiet)
+                        defer_line("[%s] could not patch %s (%p): error %lu", tag, hook.name,
+                            (void *)slot, protect_error);
+                    else
+                        log_line("IAT", "patch_failed table=%s function=%s slot=%p error=%lu/%s",
+                            tag, hook.name, (void *)slot, protect_error, "WIN32_ERROR");
                 }
                 break;
             }
         }
     }
-    const LONG patched_now = g_hook_count - patched_before;
-    log_line("IAT", "coverage module_base=%p candidates=%ld patched=%ld already=%ld failed=%ld total=%ld",
-        (void *)base, candidates, patched_now, already_patched, failed, g_hook_count);
-    // Any function in the table that was never seen in this module's imports is
-    // reported too: that is how a build ends up hooking fewer paths than intended.
-    // ordinal==0 marks a table entry matched by name, so print the name only.
-    for (auto &hook : g_hooks) {
-        if (*hook.next != nullptr) continue;
-        if (hook.ordinal != 0)
-            log_line("IAT", "not_present function=%s ordinal=%u", hook.name, hook.ordinal);
-        else
-            log_line("IAT", "not_present function=%s", hook.name);
+
+    if (quiet) {
+        if (report.patched)
+            human_line("INFO", "[%s] installed %ld hook slot(s) in module %p.", tag, report.patched,
+                (void *)base);
+    } else {
+        log_line("IAT", "coverage table=%s module_base=%p candidates=%ld patched=%ld already=%ld failed=%ld",
+            tag, (void *)base, report.candidates, report.patched, report.already, report.failed);
+        // Any function in the table that was never seen in this module's imports is
+        // reported too: that is how a build ends up hooking fewer paths than intended.
+        // ordinal==0 marks a table entry matched by name, so print the name only.
+        for (size_t index = 0; index < spec_count; ++index) {
+            HookSpec &hook = specs[index];
+            if (*hook.next != nullptr) continue;
+            if (hook.ordinal != 0)
+                log_line("IAT", "not_present table=%s function=%s ordinal=%u", tag, hook.name, hook.ordinal);
+            else
+                log_line("IAT", "not_present table=%s function=%s", tag, hook.name);
+        }
     }
-    return g_hook_count != 0;
+    return report;
+}
+
+bool install_iat_hooks(HMODULE module) {
+    const InstallReport report = install_hook_table(module, "ws2_32.dll", "wsock32.dll",
+        g_hooks, sizeof(g_hooks) / sizeof(g_hooks[0]), "ws2_32", false);
+    return report.patched != 0 || report.already != 0;
+}
+
+// DllMain-safe. Returns the number of slots patched.
+LONG install_adapter_hooks(HMODULE module) {
+    const InstallReport report = install_hook_table(module, "iphlpapi.dll", nullptr,
+        g_iphlp_hooks, sizeof(g_iphlp_hooks) / sizeof(g_iphlp_hooks[0]), "iphlpapi", true);
+    return report.patched;
 }
 
 #ifdef _WIN64
@@ -1448,25 +1764,169 @@ extern "C" __declspec(noinline) bool lan_duplicate_server_false() {
 }
 #endif
 
-DWORD WINAPI initialize(void *) {
+
+// Decides whether this process presents a shaped adapter list to the game, and
+// fills in the shape. Runs from DllMain, so it may only call defer_line().
+void configure_presentation() {
+    AdapterPresentation &presentation = adapter_override::state();
+    presentation = {};
+
+    if (!g_config.network_enable) return;
+
+    if (g_segatools.found && g_segatools.netenv.enable) {
+        // netenv patches the same three functions at the EXE entry point, which is
+        // after this DLL's DllMain. It would overwrite these slots and its synthetic
+        // adapter would be what the game sees, so presenting our own list here would
+        // only produce a half-applied chain. Say which one is in charge and leave it.
+        defer_line("segatools.ini has [netenv] enable=1, so segatools still owns adapter "
+            "presentation. This hook is leaving it alone; set [netenv] enable=0 in %ws to "
+            "let the hook take over.", g_segatools.path);
+        return;
+    }
+
+    if (g_network_ready) {
+        presentation.present = true;
+        presentation.exclusive = g_config.exclusive;
+        presentation.if_index = g_interface_index;
+        presentation.address = g_interface_address;
+        presentation.mask = g_interface_mask;
+        presentation.prefix_length = g_interface_prefix_length;
+        {
+            // Prefer the real MAC so anything that keys on it stays consistent.
+            ULONG size = 0;
+            if (GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &size) == ERROR_BUFFER_OVERFLOW) {
+                IP_ADAPTER_ADDRESSES *buffer = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(
+                    HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size));
+                if (buffer != nullptr) {
+                    if (GetAdaptersAddresses(AF_INET, 0, nullptr, buffer, &size) == NO_ERROR) {
+                        for (IP_ADAPTER_ADDRESSES *a = buffer; a != nullptr; a = a->Next) {
+                            if (a->IfIndex != g_interface_index) continue;
+                            if (a->PhysicalAddressLength == 6) {
+                                memcpy(presentation.mac, a->PhysicalAddress, 6);
+                                presentation.mac_length = 6;
+                            }
+                            if (a->IfType != kEthernetType) {
+                                presentation.forced_type = true;
+                                defer_line("Adapter %s reports IfType %lu (%s); presenting it as "
+                                    "ethernet (6) because chusanApp accepts nothing else.",
+                                    g_interface_name, (unsigned long)a->IfType,
+                                    a->IfType == kWirelessType ? "wireless" : "other");
+                            }
+                            break;
+                        }
+                    }
+                    HeapFree(GetProcessHeap(), 0, buffer);
+                }
+            }
+        }
+        return;
+    }
+
+    if (g_config.mode == 2 && g_segatools.found) {
+        // Explicit compat: reproduce netenv's synthetic adapter. Only reachable when
+        // asked for, because the fake address is not owned by any adapter and
+        // bind() to it fails with WSAEADDRNOTAVAIL unless it happens to be real.
+        presentation.present = true;
+        presentation.fabricate = true;
+        presentation.if_index = 1;
+        memcpy(presentation.mac, g_segatools.netenv.mac, 6);
+        presentation.mac_length = 6;
+        presentation.synthetic_address = segatools::expected_address(g_segatools);
+        presentation.synthetic_gateway = segatools::router_address(g_segatools);
+        presentation.synthetic_mask.s_addr = htonl(0xFFFFFF00u);
+        defer_line("mode=compat: presenting a synthetic adapter for %s, as netenv would. "
+            "Traffic is not pinned, because no real interface carries that address.",
+            g_interface_ready_text());
+        return;
+    }
+
+    // Nothing chosen and fabrication not requested: leave the real topology alone.
+}
+
+// Synchronous phase, called from DllMain. Everything here must be loader-lock safe:
+// no logging (defer_line only), no thread creation, no LoadLibrary.
+void prepare() {
     configure_paths();
     load_config();
+
+    if (!g_config.network_enable) return;
+
+    wchar_t dll_dir[MAX_PATH] = {};
+    GetModuleFileNameW(g_dll, dll_dir, MAX_PATH);
+    wchar_t *separator = wcsrchr(dll_dir, L'\\');
+    if (separator != nullptr) *separator = L'\0';
+
+    wchar_t problem[512] = {};
+    if (!segatools::load(&g_segatools, dll_dir, g_config.segatools_path, problem,
+            _countof(problem)) && problem[0] != 0) {
+        defer_line("%ws", problem);
+    }
+
+    resolve_network_interface();
+
+    if (g_network_ready && g_segatools.found) {
+        const uint32_t own = ntohl(g_interface_address.s_addr);
+        const uint32_t network = ntohl(segatools::subnet_network(g_segatools).s_addr);
+        if ((own & 0xFFFFFF00u) != network) {
+            defer_line("The chosen adapter's address is not inside [keychip] subnet %s. The game "
+                "will advertise an address the LAN cannot reach; set subnet to the LAN's /24.",
+                g_segatools.keychip.subnet_text);
+        }
+    }
+
+    configure_presentation();
+    if (adapter_override::state().present) {
+        // Resolve the real exports rather than trusting whatever occupies the IAT slot:
+        // if another component patched it first, capturing that pointer would make this
+        // hook a passthrough to it instead of to the system.
+        const HMODULE iphlpapi = GetModuleHandleW(L"iphlpapi.dll");
+        if (iphlpapi != nullptr) {
+            adapter_override::next_info() =
+                (adapter_override::get_adapters_info_fn)GetProcAddress(iphlpapi, "GetAdaptersInfo");
+            adapter_override::next_addresses() =
+                (adapter_override::get_adapters_addresses_fn)GetProcAddress(iphlpapi,
+                    "GetAdaptersAddresses");
+            adapter_override::next_table() =
+                (adapter_override::get_if_table_fn)GetProcAddress(iphlpapi, "GetIfTable");
+        }
+        if (adapter_override::next_info() == nullptr ||
+            adapter_override::next_addresses() == nullptr ||
+            adapter_override::next_table() == nullptr) {
+            defer_line("Could not resolve the real iphlpapi exports; adapter presentation is off.");
+            adapter_override::state().present = false;
+        } else {
+            const LONG patched = install_adapter_hooks(GetModuleHandleW(nullptr));
+            if (patched == 0) {
+                defer_line("Adapter presentation was requested but no iphlpapi import slot could "
+                    "be patched; the game will see the real adapter list.");
+                adapter_override::state().present = false;
+            }
+        }
+    }
+}
+
+DWORD WINAPI initialize(void *) {
     char config_path[512] = {};
     wide_to_utf8(g_config_path, config_path, sizeof(config_path));
-    status_line("config=%s network.enable=%d interfaceAddress=%s forceLimitedBroadcast=%d "
-        "forceTcpSource=%d strict=%d lanInstall.enable=%d log.enable=%d log.detailed=%d log.writeFile=%d",
-        config_path, g_config.network_enable ? 1 : 0,
-        g_config.interface_address[0] ? g_config.interface_address : "(empty)",
-        g_config.force_limited_broadcast ? 1 : 0, g_config.force_tcp_source ? 1 : 0,
-        g_config.strict ? 1 : 0, g_config.lan_install_enable ? 1 : 0,
-        g_config.log_enable ? 1 : 0, g_config.log_detailed ? 1 : 0,
-        g_config.log_write_file ? 1 : 0);
     open_log_file();
     HMODULE process = GetModuleHandleW(nullptr);
     char path[MAX_PATH] = {};
     GetModuleFileNameA(process, path, sizeof(path));
     const char *exe = strrchr(path, '\\');
     exe = exe ? exe + 1 : path;
+
+    // Anything the DllMain phase could not log (loader lock) is flushed first, so
+    // the diagnostics appear in the order the decisions were made.
+    flush_pending();
+
+    status_line("config=%s network.enable=%d interface=%s mode=%d exclusive=%d strict=%d "
+        "lanInstall.enable=%d log.enable=%d log.detailed=%d log.writeFile=%d",
+        config_path, g_config.network_enable ? 1 : 0,
+        g_config.interface_selector[0] ? g_config.interface_selector : "(auto)",
+        g_config.mode, g_config.exclusive ? 1 : 0, g_config.strict ? 1 : 0,
+        g_config.lan_install_enable ? 1 : 0, g_config.log_enable ? 1 : 0,
+        g_config.log_detailed ? 1 : 0, g_config.log_write_file ? 1 : 0);
+
     human_line("INFO", "Starting in %s (%s).", exe,
 #ifdef _WIN64
         "x64"
@@ -1476,7 +1936,15 @@ DWORD WINAPI initialize(void *) {
     );
     if (g_config.log_write_file && g_log_file == INVALID_HANDLE_VALUE)
         human_line("ERROR", "File logging was requested, but the log file could not be created.");
-    resolve_network_interface();
+    if (g_network_ready) {
+        char text[INET_ADDRSTRLEN] = {};
+        char mask[INET_ADDRSTRLEN] = {};
+        InetNtopA(AF_INET, &g_interface_address, text, sizeof(text));
+        InetNtopA(AF_INET, &g_interface_mask, mask, sizeof(mask));
+        human_line("INFO", "Using %s (%s) address=%s mask=%s prefix=/%lu index=%lu.",
+            g_interface_name, "interface", text, mask, g_interface_prefix_length,
+            g_interface_index);
+    }
     initialize_crypto();
     log_adapters();
     bool iat = install_iat_hooks(process);
@@ -1495,8 +1963,10 @@ DWORD WINAPI initialize(void *) {
 #endif
     const char *network_status = !g_config.network_enable ? "disabled" :
         (g_network_ready ? "ready" : "failed");
+    char interface_text[INET_ADDRSTRLEN] = "(not selected)";
+    if (g_network_ready) InetNtopA(AF_INET, &g_interface_address, interface_text, sizeof(interface_text));
     status_line("startup process=%s architecture=%s iat_hooks=%s lanInstallHook=%s network=%s "
-        "interface=%s config=%s",
+        "adapter_presentation=%s interface=%s config=%s",
         exe,
 #ifdef _WIN64
         "x64",
@@ -1504,20 +1974,27 @@ DWORD WINAPI initialize(void *) {
         "x86",
 #endif
         iat ? "installed" : "not_installed", lan_hook_status, network_status,
-        g_network_ready ? g_config.interface_address : "(not selected)", config_path);
+        adapter_override::state().present ? "active" : "off",
+        interface_text, config_path);
     human_line("INFO", "WinSock hooks are %s. LAN Install virtualization is %s.",
         iat ? "active" : "not active", g_config.lan_install_enable ? "enabled" : "disabled");
     human_line("INFO", "Logging is in %s mode%s.",
         g_config.log_detailed ? "detailed diagnostic" : "concise",
         g_config.log_write_file ? " and is also written to a file" : "");
     log_line("CONFIG",
-        "network_enable=%d interface_address=%s force_limited_broadcast=%d force_tcp_source=%d strict=%d "
+        "network_enable=%d interface_selector=%s interface_address=%s interface_index=%lu "
+        "mode=%d exclusive=%d allow_loopback=%d force_limited_broadcast=%d "
+        "force_directed_broadcast=%d force_tcp_source=%d strict=%d "
         "lan_install_enable=%d log_enable=%d log_detailed=%d log_write_file=%d",
-        g_config.network_enable ? 1 : 0, g_config.interface_address,
-        g_config.force_limited_broadcast ? 1 : 0, g_config.force_tcp_source ? 1 : 0,
-        g_config.strict ? 1 : 0, g_config.lan_install_enable ? 1 : 0,
-        g_config.log_enable ? 1 : 0, g_config.log_detailed ? 1 : 0,
-        g_config.log_write_file ? 1 : 0);
+        g_config.network_enable ? 1 : 0,
+        g_config.interface_selector[0] ? g_config.interface_selector : "(auto)",
+        g_interface_ready_text(), g_interface_index,
+        g_config.mode, g_config.exclusive ? 1 : 0, g_config.allow_loopback ? 1 : 0,
+        g_config.force_limited_broadcast ? 1 : 0,
+        g_config.force_directed_broadcast ? 1 : 0,
+        g_config.force_tcp_source ? 1 : 0, g_config.strict ? 1 : 0,
+        g_config.lan_install_enable ? 1 : 0, g_config.log_enable ? 1 : 0,
+        g_config.log_detailed ? 1 : 0, g_config.log_write_file ? 1 : 0);
     return 0;
 }
 
@@ -1529,6 +2006,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(instance);
         QueryPerformanceFrequency(&g_qpc_frequency);
         QueryPerformanceCounter(&g_qpc_start);
+        // Adapter presentation has to be in place before the game enumerates, and the
+        // game does that from its own startup path, not from a thread this DLL owns.
+        // Deferring it to the worker thread made the outcome depend on scheduling,
+        // which is what docs/broadcast-interface-regression.md could not explain.
+        prepare();
         HANDLE thread = CreateThread(nullptr, 0, initialize, nullptr, 0, nullptr);
         if (thread) CloseHandle(thread);
     }

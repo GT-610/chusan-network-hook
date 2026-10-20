@@ -2,11 +2,19 @@
 
 An experimental pair of injection DLLs for controlling and diagnosing the local network behavior of `chusan`.
 
-The project currently provides three related features:
+The project provides four related features:
 
-- pin the game's limited broadcasts to a configured Windows network interface;
+- choose one network interface and present it to the game the way segatools' `[netenv]`
+  did, without inventing an address;
+- pin the game's LAN broadcasts to that interface, including the directed subnet
+  broadcast the game actually uses;
 - bind outgoing game TCP connections to the same local IPv4 address;
 - optionally virtualize LAN Install so that UDP 40112 and TCP 40110 never reach the network.
+
+With no configuration at all, the hook reads `segatools.ini` and reuses the address
+segatools already tells the game to expect. See
+[`docs/netenv-takeover.md`](docs/netenv-takeover.md) for the design and
+[`docs/adapter-selection.md`](docs/adapter-selection.md) for the evidence behind it.
 
 ## Version support
 
@@ -60,18 +68,26 @@ inject_x86 -d -k chusanhook_x86.dll -k chusan_network_hook_x86.dll chusanApp.exe
 
 ## Configuration
 
-The supplied configuration is conservative: interface forcing is disabled, LAN Install virtualization is enabled, concise console logging is enabled, and file logging is disabled.
+The supplied configuration enables interface selection with automatic choice, LAN Install
+virtualization, and concise console logging.
 
 ```ini
 [network]
-enable=0
-interfaceAddress=192.168.139.10
+enable=1
+interface=
+mode=auto
+exclusive=1
+allowLoopback=0
+forceDirectedBroadcast=1
 forceLimitedBroadcast=1
 forceTcpSource=1
 strict=1
 
 [lanInstall]
 enable=1
+
+[segatools]
+path=
 
 [log]
 enable=1
@@ -81,22 +97,74 @@ writeFile=0
 
 All Boolean fields use `0` for disabled and `1` for enabled.
 
-### Network interface control
+### Choosing the interface
 
-`[network] enable=1` activates interface selection. `interfaceAddress` must be an IPv4 address currently assigned to an active Windows adapter. Using the address instead of an interface index avoids relying on an index that may change after adapter installation or reboot.
+`[network] interface` accepts an IPv4 address, an adapter friendly name, or a numeric
+interface index. Leave it empty to let the hook decide:
 
-`forceLimitedBroadcast=1` applies `IP_UNICAST_IF` before relevant UDP packets are sent to `255.255.255.255`. The destination address and packet payload are not changed. The current scope is:
+1. the address implied by `segatools.ini` — `[keychip] subnet` combined with
+   `[netenv] addrSuffix` — **if a real adapter owns it**;
+2. the only acceptable adapter inside `[keychip] subnet`;
+3. the only acceptable adapter with a routable IPv4.
 
-- UDP 40112, when LAN Install virtualization is disabled;
-- UDP 50200 for Party;
-- UDP 50201 for Setting;
-- UDP 50202 for Advertise.
+"Acceptable" means a link type the game can use: Ethernet, or wireless (rewritten to
+Ethernet). TAP, Tailscale and similar virtual adapters report a link type the game
+rejects anyway, so they are not counted — which prevents them from making the choice
+look ambiguous.
 
-`forceTcpSource=1` binds an unbound client socket to `interfaceAddress` before connecting to TCP 40110 or 50200-50202. Connections to `127.0.0.0/8` are left on the loopback interface so the game's local Join Party path can connect to itself. Listener sockets are not restricted and may continue to listen on `0.0.0.0`.
+`mode` selects the policy when nothing real qualifies:
 
-`strict=1` blocks the affected operation when the configured address is missing, the adapter is down, or Windows rejects the interface selection. This prevents a silent fallback to an unintended adapter. With `strict=0`, the hook reports the problem and lets Windows use its normal routing rules.
+| value | behaviour |
+| --- | --- |
+| `auto` | the order above; if nothing qualifies, no adapter is presented and the hook says so |
+| `native` | never synthesise; fail loudly |
+| `compat` | reproduce netenv's synthetic adapter, for hosts where nothing real qualifies |
 
-Interface forcing controls the local socket path. It does not rewrite an IPv4 address already serialized inside a game packet. The host address advertised by the game must still be reachable through the selected interface.
+### How the adapter is presented
+
+The hook rewrites **only the fields the game refuses**, and keeps the real identity:
+
+- `chusanApp.exe` accepts `IP_ADAPTER_INFO.Type == 6` and nothing else, so a wireless
+  adapter is reported as Ethernet. Ethernet needs no rewrite at all.
+- `IfIndex`, the IPv4 address and the prefix stay real. That is what makes
+  `bind()` and `IP_UNICAST_IF` work on the real stack, and what keeps `amdaemon`, which
+  looks adapters up by index through a second API, consistent.
+- `exclusive=1` presents only the chosen adapter, so a lower-index adapter cannot win by
+  accident.
+
+`[netenv] enable=1` in `segatools.ini` takes precedence: segatools patches the same three
+functions at the executable entry point and would overwrite these hooks, so the hook does
+not fight it. It reports the conflict instead, naming the file to edit. Set
+`[netenv] enable=0` to hand adapter presentation to this hook.
+
+### Interface pinning
+
+`forceLimitedBroadcast` covers `255.255.255.255`; `forceDirectedBroadcast` covers the
+subnet broadcast the game actually addresses, e.g. `192.168.139.255`. Both apply
+`IP_UNICAST_IF` with the **real** interface index before the packet is sent, leaving the
+destination and payload untouched. The scope is UDP 50200 for Party, 50201 for Setting,
+50202 for Advertise, and UDP 40112 when LAN Install virtualization is disabled.
+
+`forceTcpSource=1` binds an unbound client socket to the interface address before
+connecting to TCP 40110 or 50200-50202. Connections to `127.0.0.0/8` are left alone so the
+game's local Join Party path can reach itself. Listener sockets are never restricted.
+
+`strict=1` turns a **misconfigured** interface into a hard block: if `interface` names
+something that cannot be resolved, the affected operation fails instead of silently using
+a different adapter. A hook that simply has not worked out an interface is reported once
+and left unpinned rather than blocked — an absent configuration is not a misconfiguration.
+
+### Preflight diagnostics
+
+Every decision is reported before the game starts: which `segatools.ini` was found, the
+subnet and suffix read from it, the resolved adapter with its address, mask, prefix and
+index, whether any field had to be rewritten, and every problem as an explicit `ERROR`
+line with the fix. Notable checks:
+
+- the chosen address is not inside `[keychip] subnet`;
+- several interfaces could each carry the LAN;
+- no interface qualifies, naming what was looked for;
+- `[netenv] enable=1` would take adapter presentation back.
 
 ### LAN Install virtualization
 
@@ -148,6 +216,8 @@ This project cannot guarantee connectivity under all circumstances. If you are s
 | Recruitment is not visible | UDP 50200 | Wrong broadcast interface, firewall rules, VLAN isolation, router broadcast handling, or VPN limitations |
 | An invitation is visible but clicking it does nothing | TCP 50200 | The advertised host address is unreachable, TCP uses the wrong source interface, or the peer connection is blocked |
 | Advertise state does not synchronize | UDP 50202 | Wrong interface, firewall rules, or broadcast isolation |
+| The game reports no usable network adapter | adapter enumeration | Every adapter was refused: on Wi-Fi, [netenv] enable=1 in segatools.ini |
+| Startup prints [netenv] enable=1 ... leaving it alone | adapter enumeration | segatools owns adapter presentation; set [netenv] enable=0 so this hook can take over |
 
 ## License
 
