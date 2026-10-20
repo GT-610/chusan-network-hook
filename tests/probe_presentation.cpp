@@ -10,6 +10,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <icmpapi.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,6 +118,30 @@ int wmain(int argc, wchar_t **argv) {
             }
         }
         free(table);
+    }
+
+    /* ---- IcmpSendEcho2: the gateway probe amdaemon runs ---- */
+    HANDLE icmp = IcmpCreateFile();
+    if (icmp != INVALID_HANDLE_VALUE) {
+        struct { ICMP_ECHO_REPLY reply; unsigned char data[64]; } buffer = {};
+        HANDLE event = CreateEventW(NULL, TRUE, FALSE, NULL);
+        const char *targets[] = { "172.16.10.254", "8.8.8.8" };
+        printf("=== IcmpSendEcho2 (async form, as amdaemon calls it) ===\n");
+        for (int i = 0; i < 2; ++i) {
+            IPAddr destination = inet_addr(targets[i]);
+            ResetEvent(event);
+            SetLastError(0);
+            const DWORD count = IcmpSendEcho2(icmp, event, NULL, NULL, destination,
+                NULL, 0, NULL, &buffer, sizeof(buffer), 500);
+            const DWORD error = GetLastError();
+            printf("  %-14s count=%lu error=%lu/%s status=%s\n", targets[i], count, error,
+                error == ERROR_IO_PENDING ? "IO_PENDING" : (error == 0 ? "OK" : "other"),
+                count == 0 && error == ERROR_IO_PENDING
+                    ? (buffer.reply.Status == IP_SUCCESS ? "IP_SUCCESS (virtualized)" : "?")
+                    : (count > 0 ? "real reply" : "real failure"));
+        }
+        CloseHandle(event);
+        IcmpCloseHandle(icmp);
     }
 
     WSACleanup();

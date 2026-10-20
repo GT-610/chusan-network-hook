@@ -46,6 +46,7 @@ struct Config {
     bool exclusive = true;
     bool allow_loopback = false;
     bool force_directed_broadcast = true;
+    bool virtualize_icmp = true;
     bool force_limited_broadcast = true;
     bool force_tcp_source = true;
     bool strict = true;
@@ -318,6 +319,7 @@ void load_config() {
 
     g_config.exclusive = config_bool(L"network", L"exclusive", true);
     g_config.allow_loopback = config_bool(L"network", L"allowLoopback", false);
+    g_config.virtualize_icmp = config_bool(L"network", L"virtualizeIcmp", true);
     g_config.force_directed_broadcast =
         config_bool(L"network", L"forceDirectedBroadcast", true);
     g_config.force_limited_broadcast =
@@ -1614,6 +1616,10 @@ HookSpec g_iphlp_hooks[] = {
         (void **)&adapter_override::next_addresses()},
     {"GetIfTable", 0, (void *)adapter_override::hook_GetIfTable,
         (void **)&adapter_override::next_table()},
+    // amdaemon measures the gateway with an ICMP echo; netenv answered all of them as
+    // successes. See hook_IcmpSendEcho2 for why that matters on a router-less segment.
+    {"IcmpSendEcho2", 0, (void *)adapter_override::hook_IcmpSendEcho2,
+        (void **)&adapter_override::next_icmp()},
 };
 
 struct InstallReport { LONG candidates; LONG patched; LONG already; LONG failed; };
@@ -1791,6 +1797,12 @@ void configure_presentation() {
         presentation.address = g_interface_address;
         presentation.mask = g_interface_mask;
         presentation.prefix_length = g_interface_prefix_length;
+        // The presented subnet bounds which ICMP echoes are answered; see
+        // hook_IcmpSendEcho2.
+        presentation.presented_mask = g_interface_mask;
+        presentation.presented_network.s_addr =
+            htonl(ntohl(g_interface_address.s_addr) & ntohl(g_interface_mask.s_addr));
+        presentation.virtualize_icmp = g_config.virtualize_icmp;
         {
             // Prefer the real MAC so anything that keys on it stays consistent.
             ULONG size = 0;
@@ -1911,6 +1923,13 @@ void prepare() {
                     "GetAdaptersAddresses");
             adapter_override::next_table() =
                 (adapter_override::get_if_table_fn)GetProcAddress(iphlpapi, "GetIfTable");
+            // Optional: not every process imports it, and its absence must not disable
+            // adapter presentation.
+            adapter_override::next_icmp() =
+                (adapter_override::icmp_send_echo2_fn)GetProcAddress(iphlpapi, "IcmpSendEcho2");
+            if (adapter_override::next_icmp() == nullptr) {
+                adapter_override::state().virtualize_icmp = false;
+            }
         }
         if (adapter_override::next_info() == nullptr ||
             adapter_override::next_addresses() == nullptr ||

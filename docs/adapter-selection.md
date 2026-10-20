@@ -274,3 +274,47 @@ rewriting) and `ws2_32!connect` (port remapping). Both are off by default —
 `send`/`connect` hooks because they are applied later (at `platform_hook_init`, which runs
 after this DLL's `DllMain`) and therefore chain in front: `dns.c` -> this hook -> real.
 No arbitration is needed, but the ordering is what makes it work.
+## 11. The gateway check, and why netenv's ICMP hook mattered
+
+Measured on a ZeroTier-only host, with the takeover active:
+
+| configuration | IP ADDRESS | GATEWAY |
+| --- | --- | --- |
+| `[netenv] enable=1`, hook idle (baseline) | GOOD | **GOOD** |
+| `[netenv] enable=0`, takeover active | GOOD | **BAD** |
+| `[netenv] enable=0`, hook idle (control) | BAD, error 8002 | - |
+
+The interesting row is the first. The baseline ran on the *same* router-less ZeroTier
+segment as the second, so "the adapter has no route to the internet" cannot explain the
+difference between them. What differs is that netenv answers every ICMP echo as a success
+(`netenv.c:490-559`) without transmitting anything.
+
+amdaemon's gateway probe is exactly that:
+
+```c
+/* FUN_1403f0b00, altrIcmpSendEcho */
+DVar1 = IcmpSendEcho2(handle, event, NULL, NULL, *(IPAddr *)(param_1 + 0xc), NULL, 0,
+                      &options, reply, reply_size, timeout);
+if ((DVar1 == 0) && (DVar1 = GetLastError(), DVar1 != 0x3E5)) { /* failure -> returns 2 */ }
+else { /* success */ }
+```
+
+`0x3E5` is `ERROR_IO_PENDING`, which is precisely what netenv reports: it calls
+`SetEvent(event)` and sets `ERROR_IO_PENDING` when an event is supplied. So under netenv
+the gateway check passes on a segment that has no router at all.
+
+The control row explains the other direction: with no shaping, `chusanApp` sees the full
+real adapter list and picks an unacceptable one, so even the address check fails with 8002.
+That is the failure the takeover fixes.
+
+`hook_IcmpSendEcho2` therefore answers echoes **to destinations inside the presented
+subnet** as successes, in the same async shape netenv used, and passes everything else
+through so that a genuine failure outside the LAN is still reported. Measured:
+
+```
+172.16.10.254  count=0 error=997/IO_PENDING status=IP_SUCCESS (virtualized)   <- inside
+8.8.8.8        count=0 error=5/other status=real failure                      <- outside
+```
+
+`virtualizeIcmp=0` disables it, at the cost of the gateway check failing on any segment
+without a reachable router.

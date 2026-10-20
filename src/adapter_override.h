@@ -18,6 +18,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <icmpapi.h>
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -53,6 +54,15 @@ struct AdapterPresentation {
     // router here; this keeps that behaviour only as the fallback.
     bool dns_fallback_enabled = true;
     in_addr dns_fallback = {};
+
+    // amdaemon's gateway check is an ICMP echo (altrIcmpSendEcho @ 0x1403f0b00 ->
+    // IcmpSendEcho2), and netenv made every echo succeed. Without that, a host whose
+    // presented interface has no reachable router fails the check even though the LAN
+    // is fine -- which is exactly what ZeroTier does, since it is a flat L2 network
+    // with no router. Scope: destinations inside the presented subnet.
+    bool virtualize_icmp = true;
+    in_addr presented_network = {};
+    in_addr presented_mask = {};
 };
 
 namespace adapter_override {
@@ -66,6 +76,9 @@ using get_adapters_info_fn = ULONG (WINAPI *)(PIP_ADAPTER_INFO, PULONG);
 using get_adapters_addresses_fn = ULONG (WINAPI *)(ULONG, ULONG, PVOID,
                                                    PIP_ADAPTER_ADDRESSES, PULONG);
 using get_if_table_fn = ULONG (WINAPI *)(PMIB_IFTABLE, PULONG, BOOL);
+using icmp_send_echo2_fn = ULONG (WINAPI *)(HANDLE, HANDLE, void *, PVOID, IPAddr,
+                                            LPVOID, WORD, PIP_OPTION_INFORMATION, LPVOID,
+                                            DWORD, DWORD);
 
 inline get_adapters_info_fn &next_info() {
     static get_adapters_info_fn fn = nullptr;
@@ -77,6 +90,10 @@ inline get_adapters_addresses_fn &next_addresses() {
 }
 inline get_if_table_fn &next_table() {
     static get_if_table_fn fn = nullptr;
+    return fn;
+}
+inline icmp_send_echo2_fn &next_icmp() {
+    static icmp_send_echo2_fn fn = nullptr;
     return fn;
 }
 
@@ -385,6 +402,62 @@ inline ULONG WINAPI hook_GetIfTable(PMIB_IFTABLE table, PULONG size, BOOL order)
     }
     table->dwNumEntries = kept;
     return result;
+}
+
+// amdaemon measures the gateway with an ICMP echo:
+//   altrIcmpSendEcho @ 0x1403f0b00 -> IcmpSendEcho2(h, Event, NULL, NULL, dest, ...)
+// and treats getlastError() == 0x3E5 (ERROR_IO_PENDING) as success. netenv answered
+// every echo as a success without transmitting anything, so on a host whose presented
+// interface has no router -- ZeroTier is a flat L2 network with none -- the check passed
+// under netenv and fails without it.
+//
+// Only destinations inside the presented subnet are answered, so a genuine failure to
+// reach something outside the LAN is still reported as a failure.
+inline ULONG WINAPI hook_IcmpSendEcho2(HANDLE icmp, HANDLE event, void *apc,
+                                       PVOID apc_context, IPAddr destination,
+                                       LPVOID request_data, WORD request_size,
+                                       PIP_OPTION_INFORMATION request_options,
+                                       LPVOID reply_buffer, DWORD reply_size, DWORD timeout) {
+    const AdapterPresentation &p = state();
+    if (!p.present || !p.virtualize_icmp) {
+        return next_icmp() ? next_icmp()(icmp, event, apc, apc_context, destination,
+            request_data, request_size, request_options, reply_buffer, reply_size, timeout)
+            : 0;
+    }
+
+    const uint32_t host = ntohl((uint32_t)destination);
+    const uint32_t mask = ntohl(p.presented_mask.s_addr);
+    const uint32_t network = ntohl(p.presented_network.s_addr) & mask;
+    const bool inside = mask != 0 && mask != 0xFFFFFFFFu && (host & mask) == network;
+    if (!inside) {
+        return next_icmp() ? next_icmp()(icmp, event, apc, apc_context, destination,
+            request_data, request_size, request_options, reply_buffer, reply_size, timeout)
+            : 0;
+    }
+
+    if (apc != nullptr || reply_buffer == nullptr || reply_size < sizeof(ICMP_ECHO_REPLY)) {
+        // Fall through for anything this hook cannot answer faithfully.
+        return next_icmp() ? next_icmp()(icmp, event, apc, apc_context, destination,
+            request_data, request_size, request_options, reply_buffer, reply_size, timeout)
+            : 0;
+    }
+
+    ICMP_ECHO_REPLY *reply = reinterpret_cast<ICMP_ECHO_REPLY *>(reply_buffer);
+    memset(reply, 0, sizeof(*reply));
+    reply->Address = destination;
+    reply->Status = IP_SUCCESS;
+    reply->RoundTripTime = 1;
+    reply->DataSize = 0;
+    reply->Reserved = 1;
+
+    if (event != nullptr) {
+        // Async form: the caller waits on the event, exactly as netenv presented it.
+        SetLastError(ERROR_IO_PENDING);
+        SetEvent(event);
+        return 0;
+    }
+    SetLastError(ERROR_SUCCESS);
+    return 1;
 }
 
 } // namespace adapter_override
