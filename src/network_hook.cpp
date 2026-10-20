@@ -290,6 +290,10 @@ void configure_paths() {
         now.wSecond, GetCurrentProcessId());
 }
 
+// Called from the adapter hooks so the log states what the game was actually handed,
+// rather than leaving it to be inferred from the network test screen.
+
+
 void load_config() {
     g_config.network_enable = config_bool(L"network", L"enable", false);
     wchar_t interface_address[INET_ADDRSTRLEN] = {};
@@ -1844,9 +1848,7 @@ void configure_presentation() {
                             // an adapter with no DNS server must not hand it a blank list.
                             // Keep the real server when there is one; otherwise fall back
                             // to the router, which is what netenv always reported.
-                            if (a->FirstDnsServerAddress != nullptr &&
-                                a->FirstDnsServerAddress->Address.lpSockaddr != nullptr &&
-                                a->FirstDnsServerAddress->Address.lpSockaddr->sa_family == AF_INET) {
+                            if (chain_has_ipv4(a->FirstDnsServerAddress)) {
                                 presentation.dns_fallback_enabled = false;
                             } else {
                                 presentation.dns_fallback_enabled = true;
@@ -1867,8 +1869,7 @@ void configure_presentation() {
                             // A flat L2 segment such as ZeroTier reports no gateway either.
                             // The gateway check then has nothing to probe and fails without
                             // sending a packet, so supply the address netenv supplied.
-                            if (a->FirstGatewayAddress != nullptr &&
-                                a->FirstGatewayAddress->Address.lpSockaddr != nullptr) {
+                            if (chain_has_ipv4(a->FirstGatewayAddress)) {
                                 presentation.gateway_fallback_enabled = false;
                             } else {
                                 presentation.gateway_fallback = g_segatools.found
@@ -2016,6 +2017,9 @@ void prepare() {
                 adapter_override::state().virtualize_icmp = false;
             }
         }
+        adapter_override::log_sink() = [](const char *message) {
+            human_line("ADAPTER_HOOK", "%s", message);
+        };
         if (adapter_override::next_info() == nullptr ||
             adapter_override::next_addresses() == nullptr ||
             adapter_override::next_table() == nullptr) {

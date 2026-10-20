@@ -20,13 +20,42 @@
 #include <iphlpapi.h>
 #include <icmpapi.h>
 
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 constexpr ULONG kEthernetType = 6;      // MIB_IF_TYPE_ETHERNET / IF_TYPE_ETHERNET_CSMACD
 constexpr ULONG kWirelessType = 71;     // IF_TYPE_IEEE80211
 constexpr ULONG kLoopbackType = 24;     // IF_TYPE_SOFTWARE_LOOPBACK
+
+// A chain of IP_ADAPTER_*_ADDRESS entries counts as usable only if some node really
+// carries an AF_INET address that is not 0.0.0.0. Testing the head pointer alone is not
+// enough: Windows hands back a placeholder node for an adapter whose gateway is
+// unspecified, and treating that as "the adapter has a gateway" skips the fallback and
+// leaves the game probing 0.0.0.0, which fails immediately rather than timing out.
+//
+// Offsets come from offsetof rather than being written out: Next and Address both shift
+// with the pointer size, and a hard-coded x64 offset reads iSockaddrLength on x86 and
+// dereferences it as a pointer.
+inline bool chain_has_ipv4(const void *head) {
+    for (const unsigned char *node = reinterpret_cast<const unsigned char *>(head);
+         node != nullptr;
+         node = *reinterpret_cast<const unsigned char *const *>(
+             node + offsetof(IP_ADAPTER_DNS_SERVER_ADDRESS, Next))) {
+        const SOCKET_ADDRESS *address = reinterpret_cast<const SOCKET_ADDRESS *>(
+            node + offsetof(IP_ADAPTER_DNS_SERVER_ADDRESS, Address));
+        if (address->lpSockaddr == nullptr) continue;
+        if (address->lpSockaddr->sa_family != AF_INET) continue;
+        if (address->iSockaddrLength < (INT)sizeof(sockaddr_in)) continue;
+        const sockaddr_in *v4 = reinterpret_cast<const sockaddr_in *>(address->lpSockaddr);
+        if (v4->sin_addr.s_addr == 0) continue;
+        return true;
+    }
+    return false;
+}
+
 
 struct AdapterPresentation {
     bool present = false;       // install any shaping at all
@@ -78,6 +107,34 @@ inline AdapterPresentation &state() {
     static AdapterPresentation presentation;
     return presentation;
 }
+
+// Sink installed by the host translation unit, so the hooks can report what they actually
+// did to the game's view instead of the outcome being inferred from a screenshot. A sink
+// rather than an extern function because the host's logger lives in an anonymous
+// namespace.
+using adapter_log_sink = void (*)(const char *message);
+
+// Call counters: the difference between "the game never asked" and "we answered and it
+// still failed" is not visible in the network test screen, only in the log.
+inline volatile LONG g_info_calls = 0;
+inline volatile LONG g_addresses_calls = 0;
+inline volatile LONG g_icmp_calls = 0;
+
+inline adapter_log_sink &log_sink() {
+    static adapter_log_sink sink = nullptr;
+    return sink;
+}
+
+inline void adapter_hook_log(const char *format, ...) {
+    if (log_sink() == nullptr) return;
+    char message[512] = {};
+    va_list args;
+    va_start(args, format);
+    _vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args);
+    va_end(args);
+    log_sink()(message);
+}
+
 
 using get_adapters_info_fn = ULONG (WINAPI *)(PIP_ADAPTER_INFO, PULONG);
 using get_adapters_addresses_fn = ULONG (WINAPI *)(ULONG, ULONG, PVOID,
@@ -264,7 +321,13 @@ inline ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO info, PULONG size) {
     for (PIP_ADAPTER_INFO entry = info; entry != nullptr; entry = entry->Next) {
         if (entry->Index == p.if_index) { keep = entry; break; }
     }
-    if (keep == nullptr) return result; // adapter vanished; do not lie
+    if (keep == nullptr) {
+        const LONG call = InterlockedIncrement(&g_info_calls);
+        if (call <= 4)
+            adapter_hook_log("GetAdaptersInfo #%ld: presented if_index %lu not in the "
+                "returned list, nothing rewritten", call, p.if_index);
+        return result; // adapter vanished; do not lie
+    }
 
     if (p.forced_type) keep->Type = kEthernetType;
 
@@ -355,7 +418,13 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
     for (PIP_ADAPTER_ADDRESSES entry = addresses; entry != nullptr; entry = entry->Next) {
         if (entry->IfIndex == p.if_index) { keep = entry; break; }
     }
-    if (keep == nullptr) return result;
+    if (keep == nullptr) {
+        const LONG call = InterlockedIncrement(&g_addresses_calls);
+        if (call <= 4)
+            adapter_hook_log("GetAdaptersAddresses #%ld: presented if_index %lu not in the "
+                "returned list, nothing rewritten", call, p.if_index);
+        return result;
+    }
 
     if (p.forced_type) {
         keep->IfType = kEthernetType;
@@ -368,7 +437,7 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
     // legitimately has no DNS server (static IP, no DHCP) would hand the game an empty
     // list, which is a state netenv never produced. Fall back to the gateway, which is
     // what netenv reported unconditionally.
-    if (p.dns_fallback_enabled && keep->FirstDnsServerAddress == nullptr) {
+    if (p.dns_fallback_enabled && !chain_has_ipv4(keep->FirstDnsServerAddress)) {
         DnsFallbackEntry &fallback = dns_fallback_entry();
         memset(&fallback, 0, sizeof(fallback));
         fallback.entry.Length = sizeof(fallback.entry);
@@ -377,12 +446,19 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
         fallback.address.sin_family = AF_INET;
         fallback.address.sin_addr = p.dns_fallback;
         keep->FirstDnsServerAddress = &fallback.entry;
+        adapter_hook_log("GetAdaptersAddresses: injected DNS server for if_index %lu",
+            p.if_index);
     }
 
     // A flat L2 segment reports no gateway. The gateway check then has nothing to probe
     // and reports BAD without sending a packet, which no amount of ICMP virtualisation
     // can fix. Supply one, as netenv did.
-    if (p.gateway_fallback_enabled && keep->FirstGatewayAddress == nullptr) {
+    if (!chain_has_ipv4(keep->FirstGatewayAddress)) {
+        adapter_hook_log("GetAdaptersAddresses: adapter if_index %lu reports no usable "
+            "gateway; fallback %s", p.if_index,
+            p.gateway_fallback_enabled ? "applied" : "NOT applied");
+    }
+    if (p.gateway_fallback_enabled && !chain_has_ipv4(keep->FirstGatewayAddress)) {
         GatewayFallbackEntry &fallback = gateway_fallback_entry();
         memset(&fallback, 0, sizeof(fallback));
         fallback.entry.Length = sizeof(fallback.entry);
@@ -391,6 +467,7 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
         fallback.address.sin_family = AF_INET;
         fallback.address.sin_addr = p.gateway_fallback;
         keep->FirstGatewayAddress = &fallback.entry;
+        adapter_hook_log("GetAdaptersAddresses: injected gateway for if_index %lu", p.if_index);
     }
 
     if (p.exclusive) {
