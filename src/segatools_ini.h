@@ -32,11 +32,20 @@ struct KeychipConfig {
     char broadcast_text[16] = "255.255.255.255";
 };
 
+// segatools' [dns] section. Not used for resolution here - that is segatools'
+// hooklib/dns.c - but the target tells us where the *server* lives, which is a
+// different egress path from the game LAN and is worth reporting.
+struct DnsConfig {
+    bool enable = true;                        // config.c:92, default 1
+    char default_target[128] = "localhost";    // config.c:97
+};
+
 struct Config {
     bool found = false;
     wchar_t path[MAX_PATH] = {};
     NetenvConfig netenv;
     KeychipConfig keychip;
+    DnsConfig dns;
 };
 
 // `subnet` in segatools.ini is the network part ("192.168.139.0"); the address the
@@ -186,6 +195,14 @@ inline bool load(Config *cfg, const wchar_t *dll_dir, const wchar_t *explicit_pa
         }
         WideCharToMultiByte(CP_UTF8, 0, text, -1, cfg->keychip.broadcast_text,
             sizeof(cfg->keychip.broadcast_text), nullptr, nullptr);
+    }
+
+    cfg->dns.enable = read_uint(found, L"dns", L"enable", 1) != 0;
+    {
+        wchar_t text[128] = {};
+        read_text(found, L"dns", L"default", L"localhost", text, _countof(text));
+        WideCharToMultiByte(CP_UTF8, 0, text, -1, cfg->dns.default_target,
+            sizeof(cfg->dns.default_target), nullptr, nullptr);
     }
     return true;
 }

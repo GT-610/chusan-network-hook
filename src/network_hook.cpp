@@ -81,7 +81,9 @@ segatools::Config g_segatools;
 // misconfiguration and must be treated differently from "nothing was configured".
 bool g_interface_explicit;
 // Messages raised before the logging thread exists; flushed once logging is up.
-char g_pending[8][512];
+// Severity travels with the line so a decision is not reported as a failure.
+struct PendingLine { bool error; char text[512]; };
+PendingLine g_pending[8];
 volatile LONG g_pending_count;
 BCRYPT_ALG_HANDLE g_aes_provider;
 BCRYPT_KEY_HANDLE g_aes_key;
@@ -346,19 +348,33 @@ void human_line(const char *category, const char *format, ...);
 // Buffers a diagnostic raised before the logging thread exists. Calling the normal
 // logger from DllMain would take a lock and touch the filesystem under the loader
 // lock, which is exactly what the loader-lock rules forbid.
-void defer_line(const char *format, ...) {
+void defer_v(bool error, const char *format, va_list args) {
     const LONG slot = InterlockedIncrement(&g_pending_count) - 1;
     if (slot < 0 || slot >= (LONG)(sizeof(g_pending) / sizeof(g_pending[0]))) return;
+    g_pending[slot].error = error;
+    _vsnprintf_s(g_pending[slot].text, sizeof(g_pending[slot].text), _TRUNCATE, format, args);
+}
+
+void defer_line(const char *format, ...) {
     va_list args;
     va_start(args, format);
-    _vsnprintf_s(g_pending[slot], sizeof(g_pending[slot]), _TRUNCATE, format, args);
+    defer_v(true, format, args);
+    va_end(args);
+}
+
+// Same buffer and ordering, but reported as INFO: a decision, not a problem. Using
+// defer_line for these made routine start-up decisions print as ERROR.
+void defer_info(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    defer_v(false, format, args);
     va_end(args);
 }
 
 void flush_pending() {
     const LONG count = g_pending_count;
     for (LONG i = 0; i < count && i < (LONG)(sizeof(g_pending) / sizeof(g_pending[0])); ++i) {
-        human_line("ERROR", "%s", g_pending[i]);
+        human_line(g_pending[i].error ? "ERROR" : "INFO", "%s", g_pending[i].text);
     }
     InterlockedExchange(&g_pending_count, 0);
 }
@@ -1819,7 +1835,7 @@ void configure_presentation() {
                             }
                             if (a->IfType != kEthernetType) {
                                 presentation.forced_type = true;
-                                defer_line("Adapter %s reports IfType %lu (%s); presenting it as "
+                                defer_info("Adapter %s reports IfType %lu (%s); presenting it as "
                                     "ethernet (6) because chusanApp accepts nothing else.",
                                     g_interface_name, (unsigned long)a->IfType,
                                     a->IfType == kWirelessType ? "wireless" : "other");
@@ -1842,7 +1858,7 @@ void configure_presentation() {
                                 } else {
                                     char text[INET_ADDRSTRLEN] = {};
                                     InetNtopA(AF_INET, &presentation.dns_fallback, text, sizeof(text));
-                                    defer_line("Adapter %s reports no DNS server; presenting %s "
+                                    defer_info("Adapter %s reports no DNS server; presenting %s "
                                         "(the [netenv] routerSuffix address) so the game does "
                                         "not enumerate an empty DNS list.", g_interface_name, text);
                                 }
@@ -1878,6 +1894,53 @@ void configure_presentation() {
     // Nothing chosen and fabrication not requested: leave the real topology alone.
 }
 
+// The game has two network roles that must not share an egress path: the LAN peer
+// (LAN Install, Party, Setting, Advertise) and the internet client (the server).
+// Everything this hook pins is scoped by port to the LAN role, so the server keeps
+// using the normal route. That invariant is worth stating at start-up rather than
+// leaving to inference, because getting it wrong looks like "the game cannot reach
+// the server" with no clue why.
+//
+// Runs from DllMain: defer_line only.
+void report_server_route() {
+    if (!g_segatools.found || !g_segatools.dns.enable) return;
+    const char *target = g_segatools.dns.default_target;
+    if (target[0] == 0) return;
+
+    in_addr address = {};
+    if (InetPtonA(AF_INET, target, &address) != 1) {
+        // A hostname would need getaddrinfo, which must not run under the loader lock.
+        defer_info("Server target from [dns] default is \"%s\" (a hostname); its egress "
+            "interface is decided at connect time by the system resolver, not by this "
+            "hook. LAN traffic stays pinned to ports 40110/40112/50200-50202.", target);
+        return;
+    }
+    if (address.s_addr == 0) return;
+
+    SOCKADDR_INET destination = {};
+    destination.Ipv4.sin_family = AF_INET;
+    destination.Ipv4.sin_addr = address;
+    SOCKADDR_INET source = {};
+    MIB_IPFORWARD_ROW2 route = {};
+    const DWORD result = GetBestRoute2(nullptr, 0, nullptr, &destination, 0, &route, &source);
+    if (result != NO_ERROR) {
+        defer_line("No route to the server address %s ([dns] default), so the game will not "
+            "reach it. That is a routing problem, not something this hook pins.", target);
+        return;
+    }
+
+    if (g_network_ready && route.InterfaceIndex == g_interface_index) {
+        defer_info("Server traffic to %s leaves through the same interface as the game LAN "
+            "(index %lu). That only works if that interface really reaches the server.",
+            target, route.InterfaceIndex);
+    } else {
+        defer_info("Server traffic to %s leaves through interface %lu, not the pinned LAN "
+            "interface (index %lu). The game LAN and the server therefore take different "
+            "paths, which is what a LAN-only virtual adapter such as ZeroTier needs.",
+            target, route.InterfaceIndex, g_interface_index);
+    }
+}
+
 // Synchronous phase, called from DllMain. Everything here must be loader-lock safe:
 // no logging (defer_line only), no thread creation, no LoadLibrary.
 void prepare() {
@@ -1898,6 +1961,7 @@ void prepare() {
     }
 
     resolve_network_interface();
+    report_server_route();
 
     if (g_network_ready && g_segatools.found) {
         const uint32_t own = ntohl(g_interface_address.s_addr);

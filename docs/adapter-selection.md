@@ -318,3 +318,59 @@ through so that a genuine failure outside the LAN is still reported. Measured:
 
 `virtualizeIcmp=0` disables it, at the cost of the gateway check failing on any segment
 without a reachable router.
+## 12. The two egress paths, and why they must stay separate
+
+A host doing remote head-to-head over a virtual L2 network (ZeroTier, Tailscale, a
+TAP bridge) has two network roles that must not share one interface:
+
+| role | destinations | must use |
+| --- | --- | --- |
+| LAN peer | UDP 40112, TCP 40110, UDP/TCP 50200-50202 | the LAN adapter, possibly a virtual one |
+| internet client | the game server, `[dns] default` | whatever the default route says |
+
+Pinning everything to the LAN adapter would leave the game unable to reach a server that
+lives on the public internet, which is the normal deployment. The implementation therefore
+scopes pinning **by port**, not by process:
+
+- `ensure_broadcast_interface` is reached only from `hook_sendto` / `hook_wsasendto`, and
+  those call it only when `relevant(port)` holds, i.e. ports 40110, 40112, 50200-50202.
+- `ensure_tcp_source` is reached only from `hook_connect` / `hook_wsaconnect`, again only
+  under `relevant(port)`.
+
+Every other socket in the process - WinHTTP, DNS, the keychip layer - is untouched, so it
+keeps the system's normal source-address selection and default route.
+
+Adapter presentation does not change that either. It patches `GetAdaptersInfo`,
+`GetAdaptersAddresses` and `GetIfTable`; the server path runs through WinHTTP and
+`DnsQuery`, neither of which consults those. `amdaemon` imports 18 WinHTTP entry points and
+does its server I/O there, so hiding the other adapters cannot redirect it.
+
+### It is checked at start-up, not assumed
+
+`report_server_route()` reads `[dns] default` and asks `GetBestRoute2` which interface the
+system would use, then says so. Three measured cases:
+
+```
+# server on the public internet, default route shared with the LAN adapter
+INFO  Server traffic to 8.8.8.8 leaves through the same interface as the game LAN
+      (index 10). That only works if that interface really reaches the server.
+
+# LAN pinned to one adapter, server reached through another
+INFO  Server traffic to 100.76.171.50 leaves through interface 7, not the pinned LAN
+      interface (index 10). The game LAN and the server therefore take different paths,
+      which is what a LAN-only virtual adapter such as ZeroTier needs.
+
+# [dns] default is a hostname, so the route is decided at connect time
+INFO  Server target from [dns] default is "game.example.net" (a hostname); its egress
+      interface is decided at connect time by the system resolver, not by this hook.
+```
+
+The first line is the one that matters for the hybrid case: when it appears with two
+different indices, the LAN is pinned and the server still has its own way out.
+
+### What this does not do
+
+It reports; it does not reroute. If the LAN adapter is the only one with a default route
+and it cannot reach the server, the hook says so and stops there - fixing that is a
+routing or server-placement decision, not something an adapter hook should silently paper
+over.
