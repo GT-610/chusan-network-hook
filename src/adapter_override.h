@@ -346,7 +346,9 @@ inline ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO info, PULONG size) {
     // chusanApp's GetAdaptersInfo pass reads GatewayList (+0x1d4 in the x86 layout), so
     // the same empty-gateway problem exists on this API. Fill it with the same address
     // the addresses API is given.
-    if (p.gateway_fallback_enabled && keep->GatewayList.IpAddress.String[0] == 0) {
+    // Overwrite rather than fill-if-empty: the two enumeration APIs must report the same
+    // gateway, otherwise the answer depends on which one amdaemon asked.
+    if (p.gateway_fallback_enabled) {
         _snprintf_s(keep->GatewayList.IpAddress.String,
             sizeof(keep->GatewayList.IpAddress.String), _TRUNCATE, "%u.%u.%u.%u",
             (ntohl(p.gateway_fallback.s_addr) >> 24) & 255,
