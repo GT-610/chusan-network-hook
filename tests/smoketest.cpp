@@ -147,6 +147,34 @@ static int test_lan_sync_suppressed() {
     return 0;
 }
 
+// The DLL loads its configuration synchronously from DllMain, but patches the import table
+// on a worker thread it creates before returning, so there is a window right after
+// LoadLibrary where calls still reach the real stack. A fixed sleep is a race, and a busy
+// machine loses it: compiled seconds earlier, the DLL is still being scanned when this
+// starts.
+//
+// So wait for the hook to answer instead. Nothing is asserted here -- the checks below say
+// what is actually wrong, and a genuine regression simply never answers and fails them.
+static bool wait_until_hooked(int seconds) {
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(seconds) * 1000;
+    for (;;) {
+        SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (udp != INVALID_SOCKET) {
+            sockaddr_in beacon = {};
+            beacon.sin_family = AF_INET;
+            beacon.sin_port = htons(40112);
+            beacon.sin_addr.s_addr = INADDR_BROADCAST;
+            const char byte = 0;
+            const int sent = sendto(udp, &byte, 1, 0,
+                reinterpret_cast<const sockaddr *>(&beacon), sizeof(beacon));
+            closesocket(udp);
+            if (sent == 1) return true;
+        }
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(50);
+    }
+}
+
 int wmain(int argc, wchar_t **argv) {
     if (argc != 2) {
         fwprintf(stderr, L"Usage: %s <hook.dll>\n", argv[0]);
@@ -156,7 +184,10 @@ int wmain(int argc, wchar_t **argv) {
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return fail("WSAStartup", WSAGetLastError());
     HMODULE hook = LoadLibraryW(argv[1]);
     if (hook == nullptr) return fail("LoadLibraryW", GetLastError());
-    Sleep(300);
+    if (!wait_until_hooked(10)) {
+        fputs("note: the hook answered no beacon within 10s; running the checks anyway\n",
+            stderr);
+    }
 
     if (test_party_loopback() != 0) return 1;
     if (test_lan_beacon_suppressed() != 0) return 1;
