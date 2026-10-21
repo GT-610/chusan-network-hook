@@ -105,11 +105,11 @@ writeFile=0
 `[network] interface` accepts an IPv4 address, an adapter friendly name, or a numeric
 interface index. Left empty, the hook decides:
 
-1. the address implied by `segatools.ini` — `[keychip] subnet` with `[netenv] addrSuffix` —
-   **if a real adapter owns it**. This is the common case and what makes the stock file
-   work;
-2. the only acceptable adapter inside `[keychip] subnet`;
-3. the only acceptable adapter with a routable IPv4.
+1. the only acceptable adapter inside `[keychip] subnet`, taken from `segatools.ini`;
+2. the only acceptable adapter with a routable IPv4.
+
+Nothing is chosen at all when `[netenv] enable=1` is set: segatools owns the network then,
+so the hook resolves no interface and pins no traffic (see [Interface pinning](#interface-pinning)).
 
 A name that does not match is a hard error, never a silent fall-through to the automatic
 order. A non-ASCII friendly name requires `network_hook.ini` to be saved as UTF-16, because

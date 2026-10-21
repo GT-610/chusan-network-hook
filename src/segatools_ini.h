@@ -16,12 +16,13 @@
 
 namespace segatools {
 
+// Only what this hook still acts on. The rest of the [netenv] section -- addrSuffix, macAddr,
+// redirectBroadcast -- described how netenv invented an adapter, and nothing here adopts
+// that adapter any more: `enable` decides who owns the network, and the gateway fallback
+// still wants routerSuffix.
 struct NetenvConfig {
     bool enable = false;              // config.c:191, default 0
-    bool redirect_broadcast = true;   // config.c:192, default 1
-    unsigned addr_suffix = 11;        // config.c:198, default 11
     unsigned router_suffix = 254;     // config.c:204, default 254
-    unsigned char mac[6] = {1, 2, 3, 4, 5, 6}; // config.c:210
 };
 
 struct KeychipConfig {
@@ -48,15 +49,8 @@ struct Config {
     DnsConfig dns;
 };
 
-// `subnet` in segatools.ini is the network part ("192.168.139.0"); the address the
-// game is told to expect is that network ORed with addrSuffix (netenv.c:192).
-inline in_addr expected_address(const Config &cfg) {
-    in_addr result = {};
-    result.s_addr = htonl((ntohl(cfg.keychip.subnet.s_addr) & 0xFFFFFF00u) |
-                          (cfg.netenv.addr_suffix & 0xFFu));
-    return result;
-}
-
+// `subnet` in segatools.ini is the network part ("192.168.139.0"). Kept as a helper because
+// the presented-subnet check and the gateway fallback both reason in network terms.
 inline in_addr subnet_network(const Config &cfg) {
     in_addr result = {};
     result.s_addr = htonl(ntohl(cfg.keychip.subnet.s_addr) & 0xFFFFFF00u);
@@ -95,16 +89,6 @@ inline bool parse_ipv4(const wchar_t *text, in_addr *out) {
     reinterpret_cast<unsigned char *>(&out->s_addr)[2] = (unsigned char)octet[2];
     reinterpret_cast<unsigned char *>(&out->s_addr)[3] = (unsigned char)octet[3];
     return true;
-}
-
-inline void parse_mac(const wchar_t *text, unsigned char *out) {
-    wchar_t buffer[32] = {};
-    wcsncpy_s(buffer, text, _TRUNCATE);
-    unsigned value[6] = {};
-    if (swscanf_s(buffer, L"%x:%x:%x:%x:%x:%x", &value[0], &value[1], &value[2],
-                  &value[3], &value[4], &value[5]) != 6)
-        return;
-    for (int i = 0; i < 6; ++i) out[i] = (unsigned char)value[i];
 }
 
 // Finds segatools.ini. `dll_dir` is where network_hook.dll lives, which in a
@@ -163,15 +147,7 @@ inline bool load(Config *cfg, const wchar_t *dll_dir, const wchar_t *explicit_pa
     cfg->found = true;
 
     cfg->netenv.enable = read_uint(found, L"netenv", L"enable", 0) != 0;
-    cfg->netenv.redirect_broadcast =
-        read_uint(found, L"netenv", L"redirectBroadcast", 1) != 0;
-    cfg->netenv.addr_suffix = read_uint(found, L"netenv", L"addrSuffix", 11) & 0xFFu;
     cfg->netenv.router_suffix = read_uint(found, L"netenv", L"routerSuffix", 254) & 0xFFu;
-    {
-        wchar_t mac[32] = {};
-        read_text(found, L"netenv", L"macAddr", L"01:02:03:04:05:06", mac, _countof(mac));
-        parse_mac(mac, cfg->netenv.mac);
-    }
 
     cfg->keychip.enable = read_uint(found, L"keychip", L"enable", 1) != 0;
     {

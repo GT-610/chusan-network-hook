@@ -638,15 +638,6 @@ bool resolve_network_interface() {
         return false;
     }
 
-    // The address the stock segatools.ini told the game to expect. If a real
-    // adapter owns it, that adapter is the answer with no further decisions.
-    in_addr expected = {};
-    bool have_expected = false;
-    if (g_segatools.found && g_segatools.netenv.enable) {
-        expected = segatools::expected_address(g_segatools);
-        have_expected = true;
-    }
-
     IP_ADAPTER_ADDRESSES *chosen = nullptr;
     IP_ADAPTER_UNICAST_ADDRESS *chosen_address = nullptr;
 
@@ -665,8 +656,6 @@ bool resolve_network_interface() {
             } else if (have_name) {
                 if (adapter->FriendlyName == nullptr ||
                     _wcsicmp(adapter->FriendlyName, requested_name) != 0) continue;
-            } else if (have_expected) {
-                if (candidate->sin_addr.s_addr != expected.s_addr) continue;
             } else {
                 continue;
             }
@@ -678,8 +667,7 @@ bool resolve_network_interface() {
         if (chosen != nullptr) break;
     }
 
-    // Fallbacks when nothing was named and the stock configuration did not point at
-    // a specific address. Candidates are restricted to link types the game can
+    // Fallbacks when nothing was named. Candidates are restricted to link types the game can
     // actually accept (docs/adapter-selection.md): Ethernet always, wireless because
     // it is rewritten to Ethernet, loopback only when asked for. Excluding the rest
     // keeps a Tailscale or TAP adapter (IfType 53) from making the choice look
@@ -776,12 +764,6 @@ bool resolve_network_interface() {
             char name[160] = {};
             wide_to_utf8(requested_name, name, sizeof(name));
             _snprintf_s(request, sizeof(request), _TRUNCATE, "the adapter named \"%s\"", name);
-        } else if (have_expected) {
-            char text[INET_ADDRSTRLEN] = {};
-            InetNtopA(AF_INET, &expected, text, sizeof(text));
-            _snprintf_s(request, sizeof(request), _TRUNCATE,
-                "the address %s that segatools.ini implies (subnet %s, addrSuffix %u)",
-                text, g_segatools.keychip.subnet_text, g_segatools.netenv.addr_suffix);
         } else {
             _snprintf_s(request, sizeof(request), _TRUNCATE, "an unspecified adapter");
         }
