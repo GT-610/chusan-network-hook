@@ -40,12 +40,7 @@ constexpr unsigned char kProtocolKey[16] = {
 
 struct Config {
     bool network_enable = false;
-    char interface_address[INET_ADDRSTRLEN] = {};
     char interface_selector[128] = {};
-    // `compat` is the only mode that changes behaviour: it reproduces netenv's synthetic
-    // adapter when no real one qualifies. `auto` (the default) never fabricates; it
-    // reports what it could not find and leaves the real list alone.
-    bool fabricate_allowed = false;
     bool exclusive = true;
     bool allow_loopback = false;
     bool force_directed_broadcast = true;
@@ -58,6 +53,7 @@ struct Config {
     bool log_enable = true;
     bool log_detailed = false;
     bool log_write_file = false;
+    wchar_t legacy_mode[16] = {};
     wchar_t segatools_path[MAX_PATH] = {};
 };
 
@@ -81,6 +77,26 @@ segatools::Config g_segatools;
 // Set when the interface was named explicitly and could not be resolved. That is a
 // misconfiguration and must be treated differently from "nothing was configured".
 bool g_interface_explicit;
+
+// Who presents the network to the game, and pins its traffic.
+//
+// Exactly one component may do either. segatools' netenv patches the same three
+// enumeration functions, and it does so at the EXE entry point -- after this DLL's
+// DllMain -- so a list presented here would be whatever the later patch left behind.
+// Pinning is the other half of the same decision: netenv presents a synthetic address that
+// no adapter owns, so pinning the LAN to a real source address makes the game's own bind()
+// fail with WSAEADDRNOTAVAIL. When netenv is on, this hook therefore resolves nothing and
+// pins nothing.
+//
+// LAN Install virtualisation is deliberately not part of this. It suppresses traffic game
+// code would otherwise emit, has no counterpart in segatools, and does not depend on
+// owning an address, so it stays under the user's switch in either configuration.
+enum class NetworkOwner { none, segatools, hook };
+NetworkOwner g_owner = NetworkOwner::none;
+
+// False under segatools' netenv: no pin belongs to this hook then.
+bool owns_network() { return g_owner == NetworkOwner::hook; }
+
 // Messages raised before the logging thread exists; flushed once logging is up.
 // Severity travels with the line so a decision is not reported as a failure.
 struct PendingLine { bool error; char text[512]; };
@@ -291,36 +307,30 @@ void configure_paths() {
         now.wSecond, GetCurrentProcessId());
 }
 
-// Called from the adapter hooks so the log states what the game was actually handed,
-// rather than leaving it to be inferred from the network test screen.
-
-
 void load_config() {
     g_config.network_enable = config_bool(L"network", L"enable", false);
-    wchar_t interface_address[INET_ADDRSTRLEN] = {};
-    GetPrivateProfileStringW(L"network", L"interfaceAddress", L"",
-        interface_address, (DWORD)(sizeof(interface_address) / sizeof(interface_address[0])),
-        g_config_path);
-    WideCharToMultiByte(CP_UTF8, 0, interface_address, -1,
-        g_config.interface_address, sizeof(g_config.interface_address), nullptr, nullptr);
 
-    // `interface` supersedes `interfaceAddress`: it accepts an address, a friendly
-    // name or an index, and an address is what interfaceAddress already was.
+    // `interfaceAddress` is the key name this file used before `interface` existed, kept
+    // so an ini written against the old name keeps working. `interface` supersedes it: it
+    // accepts an address, a friendly name or an index, and an address is what
+    // interfaceAddress already was.
+    wchar_t legacy_interface[INET_ADDRSTRLEN] = {};
+    GetPrivateProfileStringW(L"network", L"interfaceAddress", L"",
+        legacy_interface, _countof(legacy_interface), g_config_path);
+
     wchar_t selector[128] = {};
     GetPrivateProfileStringW(L"network", L"interface", L"", selector, _countof(selector),
         g_config_path);
     if (selector[0] == 0) {
-        wcsncpy_s(selector, interface_address, _TRUNCATE);
+        wcsncpy_s(selector, legacy_interface, _TRUNCATE);
     }
     WideCharToMultiByte(CP_UTF8, 0, selector, -1,
         g_config.interface_selector, sizeof(g_config.interface_selector), nullptr, nullptr);
 
-    wchar_t mode[16] = {};
-    GetPrivateProfileStringW(L"network", L"mode", L"auto", mode, _countof(mode), g_config_path);
-    // Only `compat` differs from the default. `auto` and `native` both refuse to
-    // fabricate; they were documented as different but never were, so there is one
-    // switch left rather than two names for the same behaviour.
-    g_config.fabricate_allowed = _wcsicmp(mode, L"compat") == 0;
+    // `mode` is gone: this hook presents only a real adapter, and fabricating one is
+    // netenv's job. Reported from prepare(), where the deferred log is available.
+    GetPrivateProfileStringW(L"network", L"mode", L"", g_config.legacy_mode,
+        _countof(g_config.legacy_mode), g_config_path);
 
     GetPrivateProfileStringW(L"segatools", L"path", L"", g_config.segatools_path,
         MAX_PATH, g_config_path);
@@ -628,18 +638,8 @@ bool resolve_network_interface() {
         return false;
     }
 
-    // The address the stock segatools.ini told the game to expect. If a real
-    // adapter owns it, that adapter is the answer with no further decisions.
-    in_addr expected = {};
-    bool have_expected = false;
-    if (g_segatools.found && g_segatools.netenv.enable) {
-        expected = segatools::expected_address(g_segatools);
-        have_expected = true;
-    }
-
     IP_ADAPTER_ADDRESSES *chosen = nullptr;
     IP_ADAPTER_UNICAST_ADDRESS *chosen_address = nullptr;
-    char rejected[1024] = {};
 
     for (IP_ADAPTER_ADDRESSES *adapter = addresses; adapter != nullptr; adapter = adapter->Next) {
         for (IP_ADAPTER_UNICAST_ADDRESS *unicast = adapter->FirstUnicastAddress;
@@ -656,8 +656,6 @@ bool resolve_network_interface() {
             } else if (have_name) {
                 if (adapter->FriendlyName == nullptr ||
                     _wcsicmp(adapter->FriendlyName, requested_name) != 0) continue;
-            } else if (have_expected) {
-                if (candidate->sin_addr.s_addr != expected.s_addr) continue;
             } else {
                 continue;
             }
@@ -669,8 +667,7 @@ bool resolve_network_interface() {
         if (chosen != nullptr) break;
     }
 
-    // Fallbacks when nothing was named and the stock configuration did not point at
-    // a specific address. Candidates are restricted to link types the game can
+    // Fallbacks when nothing was named. Candidates are restricted to link types the game can
     // actually accept (docs/adapter-selection.md): Ethernet always, wireless because
     // it is rewritten to Ethernet, loopback only when asked for. Excluding the rest
     // keeps a Tailscale or TAP adapter (IfType 53) from making the choice look
@@ -767,20 +764,17 @@ bool resolve_network_interface() {
             char name[160] = {};
             wide_to_utf8(requested_name, name, sizeof(name));
             _snprintf_s(request, sizeof(request), _TRUNCATE, "the adapter named \"%s\"", name);
-        } else if (have_expected) {
-            char text[INET_ADDRSTRLEN] = {};
-            InetNtopA(AF_INET, &expected, text, sizeof(text));
-            _snprintf_s(request, sizeof(request), _TRUNCATE,
-                "the address %s that segatools.ini implies (subnet %s, addrSuffix %u)",
-                text, g_segatools.keychip.subnet_text, g_segatools.netenv.addr_suffix);
         } else {
             _snprintf_s(request, sizeof(request), _TRUNCATE, "an unspecified adapter");
         }
         defer_line("No usable network interface was found for %s.%s", request,
             g_interface_explicit
-                ? " The request was explicit, so this is a configuration error."
-                : " Set [network] interface to the adapter that carries the LAN.");
-        (void)rejected;
+                ? " The request was explicit, so this is a configuration error: correct "
+                  "[network] interface, or set [netenv] enable=1 in segatools.ini to let "
+                  "segatools own the network instead."
+                : " Set [network] interface to the adapter that carries the LAN, or set "
+                  "[netenv] enable=1 in segatools.ini to let segatools own the network "
+                  "instead.");
         return false;
     }
 
@@ -844,7 +838,10 @@ void log_adapters() {
     // hooks will use, and whether any traffic was pinned to it. Everything above is
     // observation; this line is the hook's decision.
     if (!g_config.network_enable) {
-        log_line("INTERFACE", "network disabled; interfaceAddress is ignored");
+        log_line("INTERFACE", "network disabled; [network] interface is ignored");
+    } else if (g_owner == NetworkOwner::segatools) {
+        log_line("INTERFACE", "owned by segatools ([netenv] enable=1); nothing presented or "
+            "pinned, LAN Install virtualisation still follows its own switch");
     } else if (!g_network_ready) {
         log_line("INTERFACE", "no interface selected for %s; traffic is not pinned",
             g_interface_ready_text());
@@ -955,7 +952,7 @@ void log_action(const char *service_name, const char *action, SOCKET socket, uin
 }
 
 bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
-    if (!g_config.network_enable ||
+    if (!g_config.network_enable || !owns_network() ||
         (!g_config.force_limited_broadcast && !g_config.force_directed_broadcast)) return true;
     const int saved_error = WSAGetLastError();
     SocketState *state = state_for(socket, true);
@@ -981,7 +978,7 @@ bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
 
 bool ensure_tcp_source(SOCKET socket, uint16_t port,
                        const sockaddr *target, int target_length) {
-    if (!g_config.network_enable || !g_config.force_tcp_source) return true;
+    if (!g_config.network_enable || !owns_network() || !g_config.force_tcp_source) return true;
     if (loopback_target(target, target_length)) {
         char destination[96] = {};
         endpoint(target, target_length, destination, sizeof(destination));
@@ -1851,24 +1848,10 @@ void configure_presentation() {
 
     if (!g_config.network_enable) return;
 
-    if (g_segatools.found && g_segatools.netenv.enable) {
-        // netenv patches the same three functions at the EXE entry point, which is
-        // after this DLL's DllMain. It would overwrite these slots and its synthetic
-        // adapter would be what the game sees, so presenting our own list here would
-        // only produce a half-applied chain. Say which one is in charge and leave it.
-        defer_line("segatools.ini has [netenv] enable=1, so segatools still owns adapter "
-            "presentation. This hook is leaving it alone; set [netenv] enable=0 in %ws to "
-            "let the hook take over.", g_segatools.path);
-        return;
-    }
-
     if (g_network_ready) {
         presentation.present = true;
         presentation.exclusive = g_config.exclusive;
         presentation.if_index = g_interface_index;
-        presentation.address = g_interface_address;
-        presentation.mask = g_interface_mask;
-        presentation.prefix_length = g_interface_prefix_length;
         presentation.virtualize_icmp = g_config.virtualize_icmp;
         if (!g_config.virtualize_icmp) {
             defer_info("ICMP virtualisation is off, so the GATEWAY and NUMBER OF HOP items "
@@ -1950,31 +1933,9 @@ void configure_presentation() {
         return;
     }
 
-    if (g_config.fabricate_allowed && g_segatools.found) {
-        // Explicit compat: reproduce netenv's synthetic adapter. Only reachable when
-        // asked for, because the fake address is not owned by any adapter and
-        // bind() to it fails with WSAEADDRNOTAVAIL unless it happens to be real.
-        presentation.present = true;
-        presentation.fabricate = true;
-        presentation.if_index = 1;
-        memcpy(presentation.mac, g_segatools.netenv.mac, 6);
-        presentation.mac_length = 6;
-        presentation.synthetic_address = segatools::expected_address(g_segatools);
-        presentation.synthetic_gateway = segatools::router_address(g_segatools);
-        presentation.synthetic_mask.s_addr = htonl(0xFFFFFF00u);
-        // g_interface_ready_text() reports the selected real interface, and this branch is
-        // reached precisely when none qualified - it would print "(not selected)" where the
-        // message claims to name the address the game will see. Format the synthetic one.
-        char synthetic_text[INET_ADDRSTRLEN] = {};
-        InetNtopA(AF_INET, &presentation.synthetic_address, synthetic_text,
-            sizeof(synthetic_text));
-        defer_info("mode=compat: presenting a synthetic adapter for %s, as netenv would. "
-            "Traffic is not pinned, because no real interface carries that address.",
-            synthetic_text);
-        return;
-    }
-
-    // Nothing chosen and fabrication not requested: leave the real topology alone.
+    // Nothing qualified. Leave the real topology alone and say so: fabricating an adapter
+    // is netenv's job, reachable by setting [netenv] enable=1 and letting segatools own
+    // the network, which this hook then yields to.
 }
 
 // The game has two network roles that must not share an egress path: the LAN peer
@@ -2030,6 +1991,12 @@ void prepare() {
     configure_paths();
     load_config();
 
+    if (g_config.legacy_mode[0] != 0 && _wcsicmp(g_config.legacy_mode, L"auto") != 0) {
+        defer_line("[network] mode=%ws is no longer read: this hook presents only a real "
+            "adapter. To fabricate one, set [netenv] enable=1 in segatools.ini and let "
+            "segatools own the network.", g_config.legacy_mode);
+    }
+
     if (!g_config.network_enable) return;
 
     wchar_t dll_dir[MAX_PATH] = {};
@@ -2042,6 +2009,17 @@ void prepare() {
             _countof(problem)) && problem[0] != 0) {
         defer_line("%ws", problem);
     }
+
+    if (g_segatools.found && g_segatools.netenv.enable) {
+        g_owner = NetworkOwner::segatools;
+        defer_line("segatools.ini has [netenv] enable=1, so segatools owns adapter "
+            "presentation and this hook pins no traffic: netenv presents an address no "
+            "adapter owns, and a real source address pinned to it would make the game's own "
+            "bind fail. LAN Install virtualisation is unaffected. Set [netenv] enable=0 in "
+            "%ws to let the hook take over.", g_segatools.path);
+        return;
+    }
+    g_owner = NetworkOwner::hook;
 
     resolve_network_interface();
     report_server_route();
@@ -2138,14 +2116,14 @@ DWORD WINAPI initialize(void *) {
         exe, process, iat ? "installed" : "not_installed");
 #endif
     log_line("CONFIG",
-        "network_enable=%d interface_selector=%s interface_address=%s interface_index=%lu "
-        "compat=%d exclusive=%d allow_loopback=%d force_limited_broadcast=%d "
+        "network_enable=%d interface_selector=%s resolved_address=%s interface_index=%lu "
+        "exclusive=%d allow_loopback=%d force_limited_broadcast=%d "
         "force_directed_broadcast=%d force_tcp_source=%d strict=%d virtualize_icmp=%d "
         "lan_install_enable=%d log_enable=%d log_detailed=%d log_write_file=%d",
         g_config.network_enable ? 1 : 0,
         g_config.interface_selector[0] ? g_config.interface_selector : "(auto)",
         g_interface_ready_text(), g_interface_index,
-        g_config.fabricate_allowed ? 1 : 0, g_config.exclusive ? 1 : 0,
+        g_config.exclusive ? 1 : 0,
         g_config.allow_loopback ? 1 : 0,
         g_config.force_limited_broadcast ? 1 : 0,
         g_config.force_directed_broadcast ? 1 : 0,
@@ -2171,7 +2149,9 @@ DWORD WINAPI initialize(void *) {
             "x86",
 #endif
             iat ? "installed" : "not_installed", lan_hook_status,
-            !g_config.network_enable ? "disabled" : (g_network_ready ? "ready" : "failed"),
+            !g_config.network_enable ? "disabled"
+                : (g_owner == NetworkOwner::segatools ? "segatools"
+                    : (g_network_ready ? "ready" : "failed")),
             adapter_override::state().present ? "active" : "off", interface_text,
             g_config.log_detailed ? "detailed" : "concise", config_path);
     }

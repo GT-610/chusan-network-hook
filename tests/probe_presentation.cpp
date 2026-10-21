@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -75,11 +76,17 @@ int wmain(int argc, wchar_t **argv) {
     }
 
     /* ---- GetAdaptersAddresses: what chusanApp uses for enrichment ---- */
+    //
+    // GAA_FLAG_INCLUDE_GATEWAYS is not optional even for a listing: without it
+    // FirstGatewayAddress is null for every adapter, so the gateway column below would
+    // read as "no adapter has a gateway" on every host. The hook sets it for the same
+    // reason (see configure_presentation).
+    const ULONG gaa_flags = GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_INCLUDE_GATEWAYS;
     ULONG gaa = 0;
-    result = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL, NULL, &gaa);
+    result = GetAdaptersAddresses(AF_INET, gaa_flags, NULL, NULL, &gaa);
     if (result == ERROR_BUFFER_OVERFLOW && gaa != 0) {
         IP_ADAPTER_ADDRESSES *addresses = (IP_ADAPTER_ADDRESSES *)calloc(1, gaa);
-        result = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL, addresses, &gaa);
+        result = GetAdaptersAddresses(AF_INET, gaa_flags, NULL, addresses, &gaa);
         printf("=== GetAdaptersAddresses (result=%lu) ===\n", result);
         if (result == NO_ERROR) {
             for (IP_ADAPTER_ADDRESSES *a = addresses; a != NULL; a = a->Next) {
@@ -132,7 +139,23 @@ int wmain(int argc, wchar_t **argv) {
         free(table);
     }
 
-    /* ---- IcmpSendEcho2: the gateway probe amdaemon runs ---- */
+    /* ---- IcmpSendEcho2: what amdaemon's network test observes ----
+     *
+     * The hook answers every destination at every TTL, so a segment address that no host
+     * owns has to look exactly like a public one: this is what holds the NUMBER OF HOP
+     * item at 1.
+     *
+     * This section reports what the build returns; it cannot prove virtualization on its
+     * own, because a reachable public address produces the same success through the real
+     * stack. Run it twice with virtualizeIcmp=1 and =0, or use tests/probe_icmp.cpp, which
+     * is what actually enforces the behaviour.
+     *
+     * The async form is what amdaemon calls, and the reply is what it reads. The event is
+     * reported as well because a timed-out call still signals it, so the event alone says
+     * nothing; what separates the two is the status. It matters that the status is printed
+     * rather than inferred from the zeroed buffer, since IP_SUCCESS is 0 and an unanswered
+     * call leaves that same buffer zeroed.
+     */
     HANDLE icmp = IcmpCreateFile();
     if (icmp != INVALID_HANDLE_VALUE) {
         struct { ICMP_ECHO_REPLY reply; unsigned char data[64]; } buffer = {};
@@ -143,15 +166,22 @@ int wmain(int argc, wchar_t **argv) {
             IPAddr destination = INADDR_NONE;
             InetPtonA(AF_INET, targets[i], &destination);
             ResetEvent(event);
+            memset(&buffer, 0, sizeof(buffer));
             SetLastError(0);
             const DWORD count = IcmpSendEcho2(icmp, event, NULL, NULL, destination,
                 NULL, 0, NULL, &buffer, sizeof(buffer), 500);
             const DWORD error = GetLastError();
-            printf("  %-14s count=%lu error=%lu/%s status=%s\n", targets[i], count, error,
+            const bool pending = count == 0 && error == ERROR_IO_PENDING;
+            const DWORD signalled = pending ? WaitForSingleObject(event, 1000) : WAIT_FAILED;
+            const bool answered = pending && signalled == WAIT_OBJECT_0 &&
+                buffer.reply.Status == IP_SUCCESS;
+            printf("  %-14s count=%lu error=%lu/%s event=%s status=%lu -> %s\n",
+                targets[i], count, error,
                 error == ERROR_IO_PENDING ? "IO_PENDING" : (error == 0 ? "OK" : "other"),
-                count == 0 && error == ERROR_IO_PENDING
-                    ? (buffer.reply.Status == IP_SUCCESS ? "IP_SUCCESS (virtualized)" : "?")
-                    : (count > 0 ? "real reply" : "real failure"));
+                signalled == WAIT_OBJECT_0 ? "signalled"
+                    : (signalled == WAIT_TIMEOUT ? "timed_out" : "not_waited"),
+                (unsigned long)buffer.reply.Status,
+                answered ? "answered" : "no answer");
         }
         CloseHandle(event);
         IcmpCloseHandle(icmp);
