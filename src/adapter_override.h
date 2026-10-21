@@ -68,16 +68,17 @@ struct AdapterPresentation {
     bool forced_type = false;   // Type/IfType had to be rewritten to Ethernet
 
     // Real adapter, used when !fabricate.
+    //
+    // Only the identity and the MAC are recorded: the adapter is real, so its address,
+    // mask and prefix are already correct in the stack, and the hooks select by index and
+    // leave them untouched.
     ULONG if_index = 0;
-    in_addr address = {};
-    in_addr mask = {};
-    ULONG prefix_length = 24;
     unsigned char mac[8] = {};
     ULONG mac_length = 6;
 
-    // Fabrication parameters, used when fabricate (netenv-compatible).
+    // Fabrication parameters, used when fabricate (netenv-compatible). The fabricated
+    // prefix is fixed at /24 (see build_fabricated); only the address and gateway vary.
     in_addr synthetic_address = {};
-    in_addr synthetic_mask = {};
     in_addr synthetic_gateway = {};
 
     // chusanApp reads IP_ADAPTER_ADDRESSES.FirstDnsServerAddress (+0x1c) while it
@@ -300,6 +301,8 @@ inline void build_fabricated(const AdapterPresentation &p, Fabricated *env) {
     env->iface.ValidLifetime = UINT32_MAX;
     env->iface.PreferredLifetime = UINT32_MAX;
     env->iface.LeaseLifetime = 86400;
+    // /24 is what netenv fabricated, and both of these must agree with the
+    // 255.255.255.0 written into the GetAdaptersInfo path below.
     env->iface.OnLinkPrefixLength = 24;
 
     env->prefix.Length = sizeof(env->prefix);

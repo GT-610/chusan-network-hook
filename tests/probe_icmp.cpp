@@ -41,11 +41,11 @@ void check(bool condition, const char *what) {
 void present(void) {
     AdapterPresentation &p = adapter_override::state();
     p = {};
+    // These two are all the ICMP item consults: it answers every destination at every
+    // TTL, which is exactly what the network test depends on, so there is no address,
+    // mask or index to set here.
     p.present = true;
     p.virtualize_icmp = true;
-    p.if_index = 10;
-    p.address = addr_of("172.16.10.235");
-    p.mask = addr_of("255.255.192.0");
 }
 
 struct Outcome {

@@ -40,7 +40,6 @@ constexpr unsigned char kProtocolKey[16] = {
 
 struct Config {
     bool network_enable = false;
-    char interface_address[INET_ADDRSTRLEN] = {};
     char interface_selector[128] = {};
     // `compat` is the only mode that changes behaviour: it reproduces netenv's synthetic
     // adapter when no real one qualifies. `auto` (the default) never fabricates; it
@@ -291,26 +290,22 @@ void configure_paths() {
         now.wSecond, GetCurrentProcessId());
 }
 
-// Called from the adapter hooks so the log states what the game was actually handed,
-// rather than leaving it to be inferred from the network test screen.
-
-
 void load_config() {
     g_config.network_enable = config_bool(L"network", L"enable", false);
-    wchar_t interface_address[INET_ADDRSTRLEN] = {};
-    GetPrivateProfileStringW(L"network", L"interfaceAddress", L"",
-        interface_address, (DWORD)(sizeof(interface_address) / sizeof(interface_address[0])),
-        g_config_path);
-    WideCharToMultiByte(CP_UTF8, 0, interface_address, -1,
-        g_config.interface_address, sizeof(g_config.interface_address), nullptr, nullptr);
 
-    // `interface` supersedes `interfaceAddress`: it accepts an address, a friendly
-    // name or an index, and an address is what interfaceAddress already was.
+    // `interfaceAddress` is the key name this file used before `interface` existed, kept
+    // so an ini written against the old name keeps working. `interface` supersedes it: it
+    // accepts an address, a friendly name or an index, and an address is what
+    // interfaceAddress already was.
+    wchar_t legacy_interface[INET_ADDRSTRLEN] = {};
+    GetPrivateProfileStringW(L"network", L"interfaceAddress", L"",
+        legacy_interface, _countof(legacy_interface), g_config_path);
+
     wchar_t selector[128] = {};
     GetPrivateProfileStringW(L"network", L"interface", L"", selector, _countof(selector),
         g_config_path);
     if (selector[0] == 0) {
-        wcsncpy_s(selector, interface_address, _TRUNCATE);
+        wcsncpy_s(selector, legacy_interface, _TRUNCATE);
     }
     WideCharToMultiByte(CP_UTF8, 0, selector, -1,
         g_config.interface_selector, sizeof(g_config.interface_selector), nullptr, nullptr);
@@ -639,7 +634,6 @@ bool resolve_network_interface() {
 
     IP_ADAPTER_ADDRESSES *chosen = nullptr;
     IP_ADAPTER_UNICAST_ADDRESS *chosen_address = nullptr;
-    char rejected[1024] = {};
 
     for (IP_ADAPTER_ADDRESSES *adapter = addresses; adapter != nullptr; adapter = adapter->Next) {
         for (IP_ADAPTER_UNICAST_ADDRESS *unicast = adapter->FirstUnicastAddress;
@@ -780,7 +774,6 @@ bool resolve_network_interface() {
             g_interface_explicit
                 ? " The request was explicit, so this is a configuration error."
                 : " Set [network] interface to the adapter that carries the LAN.");
-        (void)rejected;
         return false;
     }
 
@@ -844,7 +837,7 @@ void log_adapters() {
     // hooks will use, and whether any traffic was pinned to it. Everything above is
     // observation; this line is the hook's decision.
     if (!g_config.network_enable) {
-        log_line("INTERFACE", "network disabled; interfaceAddress is ignored");
+        log_line("INTERFACE", "network disabled; [network] interface is ignored");
     } else if (!g_network_ready) {
         log_line("INTERFACE", "no interface selected for %s; traffic is not pinned",
             g_interface_ready_text());
@@ -1866,9 +1859,6 @@ void configure_presentation() {
         presentation.present = true;
         presentation.exclusive = g_config.exclusive;
         presentation.if_index = g_interface_index;
-        presentation.address = g_interface_address;
-        presentation.mask = g_interface_mask;
-        presentation.prefix_length = g_interface_prefix_length;
         presentation.virtualize_icmp = g_config.virtualize_icmp;
         if (!g_config.virtualize_icmp) {
             defer_info("ICMP virtualisation is off, so the GATEWAY and NUMBER OF HOP items "
@@ -1961,7 +1951,6 @@ void configure_presentation() {
         presentation.mac_length = 6;
         presentation.synthetic_address = segatools::expected_address(g_segatools);
         presentation.synthetic_gateway = segatools::router_address(g_segatools);
-        presentation.synthetic_mask.s_addr = htonl(0xFFFFFF00u);
         // g_interface_ready_text() reports the selected real interface, and this branch is
         // reached precisely when none qualified - it would print "(not selected)" where the
         // message claims to name the address the game will see. Format the synthetic one.
@@ -2138,7 +2127,7 @@ DWORD WINAPI initialize(void *) {
         exe, process, iat ? "installed" : "not_installed");
 #endif
     log_line("CONFIG",
-        "network_enable=%d interface_selector=%s interface_address=%s interface_index=%lu "
+        "network_enable=%d interface_selector=%s resolved_address=%s interface_index=%lu "
         "compat=%d exclusive=%d allow_loopback=%d force_limited_broadcast=%d "
         "force_directed_broadcast=%d force_tcp_source=%d strict=%d virtualize_icmp=%d "
         "lan_install_enable=%d log_enable=%d log_detailed=%d log_write_file=%d",
