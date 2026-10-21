@@ -33,15 +33,18 @@ That produces:
 - `build\chusan_network_hook_x86.dll` for `chusanApp.exe`;
 - x64 and x86 smoke-test executables;
 - `build\probe_icmp_x64.exe`, which exercises the ICMP behaviour directly;
+- `build\probe_ownership_x64.exe`, which checks that `[netenv] enable=1` leaves the network
+  to segatools without switching LAN Install virtualisation off;
 - a copy of `network_hook.ini` beside the DLLs.
 
 ```bat
 build\network_hook_smoketest_x64.exe build\chusan_network_hook_x64.dll
 build\network_hook_smoketest_x86.exe build\chusan_network_hook_x86.dll
 build\probe_icmp_x64.exe
+build\probe_ownership_x64.exe build\chusan_network_hook_x64.dll
 ```
 
-All three run in `release.yml` before anything is published, so a tag cannot ship from a
+All four run in `release.yml` before anything is published, so a tag cannot ship from a
 tree where they fail.
 
 ## Injection

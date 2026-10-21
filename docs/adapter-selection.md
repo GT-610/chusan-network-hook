@@ -383,11 +383,12 @@ host, and those probes are gone: they measured the Windows stack and the game's 
 filters, not this hook, so none of them could fail when the hook regressed. Git history
 still has them if a measurement has to be repeated.
 
-Two probes remain, and both do guard shipped code:
+Three probes remain, and all three guard shipped behaviour:
 
 | probe | what it pins down | built | run |
 |---|---|---|---|
 | `tests/probe_icmp.cpp` | `hook_IcmpSendEcho2` answers every destination, at any TTL | `build.bat` | `release.yml` |
+| `tests/probe_ownership.cpp` | `[netenv] enable=1` leaves presentation and pinning to segatools while LAN Install virtualisation keeps running | `build.bat` | `release.yml` |
 | `tests/smoketest.cpp` | LAN Install virtualisation, and the loopback Party path | `build.bat` | `release.yml` |
 
 `tests/probe_presentation.cpp` stays as a hand-held inspection tool: it loads the DLL into

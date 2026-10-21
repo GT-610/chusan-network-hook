@@ -29,6 +29,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\build\probe_icmp_x64.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\build\probe_ownership_x64.exe .\build\chusan_network_hook_x64.dll
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Assemble release archive
         shell: pwsh
