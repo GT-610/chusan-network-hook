@@ -28,6 +28,11 @@ cl /nologo /std:c++17 /O2 /MT /W4 /DWIN32 /D_WINDOWS ^
   /Fo"%OUT%\network_hook_smoketest_x64.obj" ^
   /link /MACHINE:X64 /SUBSYSTEM:CONSOLE /OUT:"%OUT%\network_hook_smoketest_x64.exe" ws2_32.lib
 if errorlevel 1 exit /b 1
+cl /nologo /std:c++17 /O2 /MT /W4 /DWIN32 /D_WINDOWS ^
+  "%ROOT%tests\probe_icmp.cpp" ^
+  /Fo"%OUT%\probe_icmp_x64.obj" ^
+  /link /MACHINE:X64 /SUBSYSTEM:CONSOLE /OUT:"%OUT%\probe_icmp_x64.exe" ws2_32.lib iphlpapi.lib
+if errorlevel 1 exit /b 1
 
 call "%VSROOT%\Common7\Tools\VsDevCmd.bat" -arch=x86 -host_arch=x64 >nul
 if errorlevel 1 exit /b 1
@@ -50,4 +55,5 @@ echo   %OUT%\chusan_network_hook_x64.dll
 echo   %OUT%\chusan_network_hook_x86.dll
 echo   %OUT%\network_hook_smoketest_x64.exe
 echo   %OUT%\network_hook_smoketest_x86.exe
+echo   %OUT%\probe_icmp_x64.exe
 exit /b 0
