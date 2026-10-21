@@ -76,7 +76,6 @@ use `0` and `1`.
 [network]
 enable=1
 interface=
-mode=auto
 exclusive=1
 allowLoopback=0
 forceDirectedBroadcast=1
@@ -118,11 +117,12 @@ works and needs no encoding.
 Ethernet). TAP, Tailscale and similar adapters report a link type the game rejects anyway,
 so they are not counted, which keeps them from making the choice look ambiguous.
 
-`mode=compat` additionally reproduces netenv's synthetic adapter when nothing real
-qualifies. It is off by default because that fake address is owned by no adapter, so
-`bind()` to it fails with `10049 WSAEADDRNOTAVAIL` unless it happens to be real. With
-`mode=auto` nothing is fabricated: the hook says what it could not find and leaves the real
-list alone.
+When nothing real qualifies the hook does not invent an adapter: it reports what it could not
+find and leaves the real list alone. Fabricating one is `[netenv]`'s job, and `[netenv] enable=1`
+is how you ask segatools for it — the hook then steps out of the way entirely (see
+[Interface pinning](#interface-pinning)). That combination is the supported way to run a host
+with no usable LAN: segatools supplies the adapter, and `[lanInstall] enable=1` — which has no
+counterpart in netenv — keeps LAN Install from scanning a network that is not there.
 
 ### How the adapter is presented
 
@@ -151,10 +151,16 @@ during enumeration, so an out-of-subnet gateway left in that API while the other
 corrected is exactly the inconsistency that makes the item fail. An empty DNS list,
 likewise, is a state netenv never produced.
 
-`[netenv] enable=1` in `segatools.ini` takes precedence: segatools patches the same three
-functions at the executable entry point and would overwrite these hooks, so the hook does not
-fight it. It reports the conflict, naming the file to edit. Set `[netenv] enable=0` to hand
-adapter presentation to this hook.
+`[netenv] enable=1` in `segatools.ini` takes precedence, and not only for enumeration:
+segatools patches the same three functions at the executable entry point and would overwrite
+these hooks, so the hook neither presents nor pins. It reports which one is in charge, naming
+the file to edit. Set `[netenv] enable=0` to hand the network to this hook.
+
+Pinning has to follow presentation rather than be a separate courtesy: netenv presents an
+address no adapter owns, so a real source address pinned to it is exactly what makes the game's
+own `bind()` fail with `10049 WSAEADDRNOTAVAIL`. `[lanInstall]` is deliberately outside this
+rule — it suppresses traffic the game would otherwise emit, needs no owned address, and has no
+counterpart in segatools, so it keeps following its own switch either way.
 
 ### Interface pinning
 
@@ -210,7 +216,7 @@ with the fix. Notable checks:
 - the chosen address is not inside `[keychip] subnet`;
 - several interfaces could each carry the LAN;
 - no interface qualifies, naming what was looked for;
-- `[netenv] enable=1` would take adapter presentation back.
+- `[netenv] enable=1` would take the network back, leaving the hook neither presenting nor pinning.
 
 ### LAN Install virtualization
 
@@ -285,8 +291,8 @@ game cross-checks.**
 | Recruitment is not visible | UDP 50200 | wrong broadcast interface, firewall rules, VLAN isolation, router broadcast handling, or VPN limitations |
 | An invitation is visible but clicking it does nothing | TCP 50200 | the advertised host address is unreachable, TCP uses the wrong source interface, or the peer connection is blocked |
 | Advertise state does not synchronize | UDP 50202 | wrong interface, firewall rules, or broadcast isolation |
-| The game reports no usable network adapter | adapter enumeration | every adapter was refused: on Wi-Fi, `[netenv] enable=1` is still in control |
-| Startup prints `[netenv] enable=1 ... leaving it alone` | adapter enumeration | segatools owns adapter presentation; set `[netenv] enable=0` so this hook can take over |
+| The game reports no usable network adapter | adapter enumeration | every adapter was refused, and nothing is invented: point `[network] interface` at the right one, or set `[netenv] enable=1` to have segatools supply an adapter |
+| Startup prints `[netenv] enable=1 ...` | adapter enumeration and pinning | segatools owns the network, so this hook neither presents nor pins; set `[netenv] enable=0` so it can take over |
 | `Setting` bind fails with `10013 WSAEACCES` | TCP 50201 | the port falls inside a Windows excluded range, not that it is occupied. Exclusion ranges are per protocol. Remove the range or stop `winnat` |
 
 ## License

@@ -41,10 +41,6 @@ constexpr unsigned char kProtocolKey[16] = {
 struct Config {
     bool network_enable = false;
     char interface_selector[128] = {};
-    // `compat` is the only mode that changes behaviour: it reproduces netenv's synthetic
-    // adapter when no real one qualifies. `auto` (the default) never fabricates; it
-    // reports what it could not find and leaves the real list alone.
-    bool fabricate_allowed = false;
     bool exclusive = true;
     bool allow_loopback = false;
     bool force_directed_broadcast = true;
@@ -57,6 +53,7 @@ struct Config {
     bool log_enable = true;
     bool log_detailed = false;
     bool log_write_file = false;
+    wchar_t legacy_mode[16] = {};
     wchar_t segatools_path[MAX_PATH] = {};
 };
 
@@ -330,12 +327,10 @@ void load_config() {
     WideCharToMultiByte(CP_UTF8, 0, selector, -1,
         g_config.interface_selector, sizeof(g_config.interface_selector), nullptr, nullptr);
 
-    wchar_t mode[16] = {};
-    GetPrivateProfileStringW(L"network", L"mode", L"auto", mode, _countof(mode), g_config_path);
-    // Only `compat` differs from the default. `auto` and `native` both refuse to
-    // fabricate; they were documented as different but never were, so there is one
-    // switch left rather than two names for the same behaviour.
-    g_config.fabricate_allowed = _wcsicmp(mode, L"compat") == 0;
+    // `mode` is gone: this hook presents only a real adapter, and fabricating one is
+    // netenv's job. Reported from prepare(), where the deferred log is available.
+    GetPrivateProfileStringW(L"network", L"mode", L"", g_config.legacy_mode,
+        _countof(g_config.legacy_mode), g_config_path);
 
     GetPrivateProfileStringW(L"segatools", L"path", L"", g_config.segatools_path,
         MAX_PATH, g_config_path);
@@ -1952,30 +1947,9 @@ void configure_presentation() {
         return;
     }
 
-    if (g_config.fabricate_allowed && g_segatools.found) {
-        // Explicit compat: reproduce netenv's synthetic adapter. Only reachable when
-        // asked for, because the fake address is not owned by any adapter and
-        // bind() to it fails with WSAEADDRNOTAVAIL unless it happens to be real.
-        presentation.present = true;
-        presentation.fabricate = true;
-        presentation.if_index = 1;
-        memcpy(presentation.mac, g_segatools.netenv.mac, 6);
-        presentation.mac_length = 6;
-        presentation.synthetic_address = segatools::expected_address(g_segatools);
-        presentation.synthetic_gateway = segatools::router_address(g_segatools);
-        // g_interface_ready_text() reports the selected real interface, and this branch is
-        // reached precisely when none qualified - it would print "(not selected)" where the
-        // message claims to name the address the game will see. Format the synthetic one.
-        char synthetic_text[INET_ADDRSTRLEN] = {};
-        InetNtopA(AF_INET, &presentation.synthetic_address, synthetic_text,
-            sizeof(synthetic_text));
-        defer_info("mode=compat: presenting a synthetic adapter for %s, as netenv would. "
-            "Traffic is not pinned, because no real interface carries that address.",
-            synthetic_text);
-        return;
-    }
-
-    // Nothing chosen and fabrication not requested: leave the real topology alone.
+    // Nothing qualified. Leave the real topology alone and say so: fabricating an adapter
+    // is netenv's job, reachable by setting [netenv] enable=1 and letting segatools own
+    // the network, which this hook then yields to.
 }
 
 // The game has two network roles that must not share an egress path: the LAN peer
@@ -2030,6 +2004,12 @@ void report_server_route() {
 void prepare() {
     configure_paths();
     load_config();
+
+    if (g_config.legacy_mode[0] != 0 && _wcsicmp(g_config.legacy_mode, L"auto") != 0) {
+        defer_line("[network] mode=%ws is no longer read: this hook presents only a real "
+            "adapter. To fabricate one, set [netenv] enable=1 in segatools.ini and let "
+            "segatools own the network.", g_config.legacy_mode);
+    }
 
     if (!g_config.network_enable) return;
 
@@ -2151,13 +2131,13 @@ DWORD WINAPI initialize(void *) {
 #endif
     log_line("CONFIG",
         "network_enable=%d interface_selector=%s resolved_address=%s interface_index=%lu "
-        "compat=%d exclusive=%d allow_loopback=%d force_limited_broadcast=%d "
+        "exclusive=%d allow_loopback=%d force_limited_broadcast=%d "
         "force_directed_broadcast=%d force_tcp_source=%d strict=%d virtualize_icmp=%d "
         "lan_install_enable=%d log_enable=%d log_detailed=%d log_write_file=%d",
         g_config.network_enable ? 1 : 0,
         g_config.interface_selector[0] ? g_config.interface_selector : "(auto)",
         g_interface_ready_text(), g_interface_index,
-        g_config.fabricate_allowed ? 1 : 0, g_config.exclusive ? 1 : 0,
+        g_config.exclusive ? 1 : 0,
         g_config.allow_loopback ? 1 : 0,
         g_config.force_limited_broadcast ? 1 : 0,
         g_config.force_directed_broadcast ? 1 : 0,

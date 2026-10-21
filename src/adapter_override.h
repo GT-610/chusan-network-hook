@@ -10,8 +10,8 @@
 //     address must stay real.
 //
 // Therefore the normal path rewrites only the fields the game refuses and filters
-// the rest of the chain. Fabrication (netenv's approach) is kept solely as the
-// legacy path for hosts where no acceptable adapter exists at all.
+// the rest of the chain. It does not fabricate an adapter: that is netenv's job, and
+// `[netenv] enable=1` in segatools.ini is how you ask for it.
 #pragma once
 
 #include <winsock2.h>
@@ -29,10 +29,6 @@
 constexpr ULONG kEthernetType = 6;      // MIB_IF_TYPE_ETHERNET / IF_TYPE_ETHERNET_CSMACD
 constexpr ULONG kWirelessType = 71;     // IF_TYPE_IEEE80211
 constexpr ULONG kLoopbackType = 24;     // IF_TYPE_SOFTWARE_LOOPBACK
-// The MAC length netenv presented, and the value amdaemon's GetAdaptersInfo filter tests
-// (`+0x194 == 6`). IP_ADAPTER_INFO.Address and IP_ADAPTER_ADDRESSES.PhysicalAddress both
-// hold it; the latter has room for 8, which is not permission to report 8.
-constexpr ULONG kMacLength = 6;
 
 // A chain of IP_ADAPTER_*_ADDRESS entries counts as usable only if some node really
 // carries an AF_INET address that is not 0.0.0.0. Testing the head pointer alone is not
@@ -64,10 +60,9 @@ inline bool chain_has_ipv4(const void *head) {
 struct AdapterPresentation {
     bool present = false;       // install any shaping at all
     bool exclusive = true;      // hide adapters other than the chosen one
-    bool fabricate = false;     // no acceptable real adapter: synthesise one
     bool forced_type = false;   // Type/IfType had to be rewritten to Ethernet
 
-    // Real adapter, used when !fabricate.
+    // The chosen adapter.
     //
     // Only the identity and the MAC are recorded: the adapter is real, so its address,
     // mask and prefix are already correct in the stack, and the hooks select by index and
@@ -75,11 +70,6 @@ struct AdapterPresentation {
     ULONG if_index = 0;
     unsigned char mac[8] = {};
     ULONG mac_length = 6;
-
-    // Fabrication parameters, used when fabricate (netenv-compatible). The fabricated
-    // prefix is fixed at /24 (see build_fabricated); only the address and gateway vary.
-    in_addr synthetic_address = {};
-    in_addr synthetic_gateway = {};
 
     // chusanApp reads IP_ADAPTER_ADDRESSES.FirstDnsServerAddress (+0x1c) while it
     // enumerates (allnet_enumerate_adapters), so the list has to be non-empty even
@@ -240,95 +230,6 @@ inline GatewayFallbackEntry &gateway_fallback_entry() {
 }
 
 // ---------------------------------------------------------------------------
-// Fabricated adapter, layout mirrors netenv.c:25-39 so the game sees the same
-// shape it has always seen on a netenv host.
-// ---------------------------------------------------------------------------
-struct Fabricated {
-    IP_ADAPTER_ADDRESSES head;
-    char name[64];
-    wchar_t dns_suffix[64];
-    wchar_t description[64];
-    wchar_t friendly_name[64];
-    IP_ADAPTER_PREFIX prefix;
-    IP_ADAPTER_UNICAST_ADDRESS iface;
-    IP_ADAPTER_GATEWAY_ADDRESS router;
-    IP_ADAPTER_DNS_SERVER_ADDRESS dns;
-    sockaddr_in prefix_sa;
-    sockaddr_in iface_sa;
-    sockaddr_in router_sa;
-    sockaddr_in dns_sa;
-};
-
-inline void build_fabricated(const AdapterPresentation &p, Fabricated *env) {
-    memset(env, 0, sizeof(*env));
-
-    env->head.Length = sizeof(env->head);
-    env->head.IfIndex = 1;
-    env->head.AdapterName = env->name;
-    env->head.FirstUnicastAddress = &env->iface;
-    env->head.FirstDnsServerAddress = &env->dns;
-    env->head.DnsSuffix = env->dns_suffix;
-    env->head.Description = env->description;
-    env->head.FriendlyName = env->friendly_name;
-    // sizeof(p.mac) is 8 - the array is oversized so GetAdaptersAddresses has somewhere
-    // to write - and copying that many bytes would report a MAC length of 8 while
-    // hook_GetAdaptersInfo reports AddressLength 6 for the same adapter. amdaemon tests
-    // that length (`+0x194 == 6`) before accepting anything, so the two APIs have to
-    // agree on 6, which is also what netenv presented (netenv.c:260-263).
-    const ULONG mac_length =
-        p.mac_length != 0 && p.mac_length < kMacLength ? p.mac_length : kMacLength;
-    memcpy(env->head.PhysicalAddress, p.mac, mac_length);
-    env->head.PhysicalAddressLength = mac_length;
-    env->head.Flags = IP_ADAPTER_DHCP_ENABLED | IP_ADAPTER_IPV4_ENABLED;
-    env->head.Mtu = 4200;
-    env->head.IfType = kEthernetType;
-    env->head.OperStatus = IfOperStatusUp;
-    env->head.FirstPrefix = &env->prefix;
-    env->head.FirstGatewayAddress = &env->router;
-
-    strcpy_s(env->name, _countof(env->name), "{00000000-0000-0000-0000-000000000000}");
-    wcscpy_s(env->dns_suffix, _countof(env->dns_suffix), L"local");
-    wcscpy_s(env->description, _countof(env->description), L"Interface Description");
-    wcscpy_s(env->friendly_name, _countof(env->friendly_name), L"Fake Ethernet");
-
-    env->iface.Length = sizeof(env->iface);
-    env->iface.Flags = 0;
-    env->iface.Address.lpSockaddr = (struct sockaddr *)&env->iface_sa;
-    env->iface.Address.iSockaddrLength = sizeof(env->iface_sa);
-    env->iface.PrefixOrigin = IpPrefixOriginDhcp;
-    env->iface.SuffixOrigin = IpSuffixOriginDhcp;
-    env->iface.DadState = IpDadStatePreferred;
-    env->iface.ValidLifetime = UINT32_MAX;
-    env->iface.PreferredLifetime = UINT32_MAX;
-    env->iface.LeaseLifetime = 86400;
-    // /24 is what netenv fabricated, and both of these must agree with the
-    // 255.255.255.0 written into the GetAdaptersInfo path below.
-    env->iface.OnLinkPrefixLength = 24;
-
-    env->prefix.Length = sizeof(env->prefix);
-    env->prefix.Address.lpSockaddr = (struct sockaddr *)&env->prefix_sa;
-    env->prefix.Address.iSockaddrLength = sizeof(env->prefix_sa);
-    env->prefix.PrefixLength = 24;
-
-    env->router.Length = sizeof(env->router);
-    env->router.Address.lpSockaddr = (struct sockaddr *)&env->router_sa;
-    env->router.Address.iSockaddrLength = sizeof(env->router_sa);
-
-    env->dns.Length = sizeof(env->dns);
-    env->dns.Address.lpSockaddr = (struct sockaddr *)&env->dns_sa;
-    env->dns.Address.iSockaddrLength = sizeof(env->dns_sa);
-
-    env->prefix_sa.sin_family = AF_INET;
-    env->prefix_sa.sin_addr = p.synthetic_address;
-    env->iface_sa.sin_family = AF_INET;
-    env->iface_sa.sin_addr = p.synthetic_address;
-    env->router_sa.sin_family = AF_INET;
-    env->router_sa.sin_addr = p.synthetic_gateway;
-    env->dns_sa.sin_family = AF_INET;
-    env->dns_sa.sin_addr = p.synthetic_gateway;
-}
-
-// ---------------------------------------------------------------------------
 // Hooks
 // ---------------------------------------------------------------------------
 
@@ -336,42 +237,6 @@ inline ULONG WINAPI hook_GetAdaptersInfo(PIP_ADAPTER_INFO info, PULONG size) {
     const AdapterPresentation &p = state();
     if (!p.present) {
         return next_info() ? next_info()(info, size) : ERROR_INVALID_PARAMETER;
-    }
-
-    if (p.fabricate) {
-        if (info == nullptr || size == nullptr || *size < sizeof(IP_ADAPTER_INFO)) {
-            if (size != nullptr) *size = sizeof(IP_ADAPTER_INFO);
-            return ERROR_BUFFER_OVERFLOW;
-        }
-        PIP_ADAPTER_INFO entry = info;
-        memset(entry, 0, sizeof(*entry));
-        strcpy_s(entry->AdapterName, _countof(entry->AdapterName), "Fake Ethernet");
-        strcpy_s(entry->Description, _countof(entry->Description), "Adapter Description");
-        entry->AddressLength = kMacLength;
-        memcpy(entry->Address, p.mac, kMacLength);
-        entry->Index = 1;
-        entry->Type = kEthernetType;
-        entry->DhcpEnabled = 1;
-        _snprintf_s(entry->IpAddressList.IpAddress.String,
-            sizeof(entry->IpAddressList.IpAddress.String), _TRUNCATE, "%u.%u.%u.%u",
-            (ntohl(p.synthetic_address.s_addr) >> 24) & 255,
-            (ntohl(p.synthetic_address.s_addr) >> 16) & 255,
-            (ntohl(p.synthetic_address.s_addr) >> 8) & 255,
-            ntohl(p.synthetic_address.s_addr) & 255);
-        strcpy_s(entry->IpAddressList.IpMask.String,
-            sizeof(entry->IpAddressList.IpMask.String), "255.255.255.0");
-        _snprintf_s(entry->GatewayList.IpAddress.String,
-            sizeof(entry->GatewayList.IpAddress.String), _TRUNCATE, "%u.%u.%u.%u",
-            (ntohl(p.synthetic_gateway.s_addr) >> 24) & 255,
-            (ntohl(p.synthetic_gateway.s_addr) >> 16) & 255,
-            (ntohl(p.synthetic_gateway.s_addr) >> 8) & 255,
-            ntohl(p.synthetic_gateway.s_addr) & 255);
-        strcpy_s(entry->GatewayList.IpMask.String,
-            sizeof(entry->GatewayList.IpMask.String), "255.255.255.0");
-        entry->LeaseObtained = (UINT32)time(nullptr) - 3600;
-        entry->LeaseExpires = (UINT32)time(nullptr) + 86400;
-        *size = sizeof(IP_ADAPTER_INFO);
-        return ERROR_SUCCESS;
     }
 
     const ULONG result = next_info()(info, size);
@@ -430,51 +295,6 @@ inline ULONG WINAPI hook_GetAdaptersAddresses(ULONG family, ULONG flags, PVOID r
     if (!p.present) {
         return next_addresses() ? next_addresses()(family, flags, reserved, addresses, size)
                                 : ERROR_INVALID_PARAMETER;
-    }
-
-    if (p.fabricate) {
-        if (reserved != nullptr || size == nullptr) return ERROR_INVALID_PARAMETER;
-        const ULONG available = *size;
-        *size = sizeof(Fabricated);
-        if (addresses == nullptr || available < sizeof(Fabricated)) return ERROR_BUFFER_OVERFLOW;
-        Fabricated env = {};
-        build_fabricated(p, &env);
-        memcpy(addresses, &env, sizeof(env));
-        // Re-point the internal pointers at the copy actually handed to the caller.
-        PIP_ADAPTER_ADDRESSES head = addresses;
-        const Fabricated *original = &env;
-        auto relocate = [&](PVOID pointer) -> PVOID {
-            if (pointer == nullptr) return nullptr;
-            const uintptr_t offset = (uintptr_t)pointer - (uintptr_t)original;
-            return (PVOID)((uintptr_t)head + offset);
-        };
-        head->AdapterName = (PCHAR)relocate(head->AdapterName);
-        head->DnsSuffix = (PWCHAR)relocate(head->DnsSuffix);
-        head->Description = (PWCHAR)relocate(head->Description);
-        head->FriendlyName = (PWCHAR)relocate(head->FriendlyName);
-        head->FirstUnicastAddress = (PIP_ADAPTER_UNICAST_ADDRESS)relocate(head->FirstUnicastAddress);
-        head->FirstPrefix = (PIP_ADAPTER_PREFIX)relocate(head->FirstPrefix);
-        head->FirstGatewayAddress =
-            (PIP_ADAPTER_GATEWAY_ADDRESS)relocate(head->FirstGatewayAddress);
-        head->FirstDnsServerAddress =
-            (PIP_ADAPTER_DNS_SERVER_ADDRESS)relocate(head->FirstDnsServerAddress);
-        head->FirstUnicastAddress->Address.lpSockaddr =
-            (struct sockaddr *)relocate(head->FirstUnicastAddress->Address.lpSockaddr);
-        head->FirstPrefix->Address.lpSockaddr =
-            (struct sockaddr *)relocate(head->FirstPrefix->Address.lpSockaddr);
-        head->FirstGatewayAddress->Address.lpSockaddr =
-            (struct sockaddr *)relocate(head->FirstGatewayAddress->Address.lpSockaddr);
-        head->FirstDnsServerAddress->Address.lpSockaddr =
-            (struct sockaddr *)relocate(head->FirstDnsServerAddress->Address.lpSockaddr);
-
-        // The chain walked by the game must terminate. netenv's struct leaves these
-        // at zero, which is fine for netenv's own copy but not for a chain a caller
-        // may follow, so they are set explicitly here.
-        head->FirstUnicastAddress->Next = nullptr;
-        head->FirstPrefix->Next = nullptr;
-        head->FirstGatewayAddress->Next = nullptr;
-        head->FirstDnsServerAddress->Next = nullptr;
-        return ERROR_SUCCESS;
     }
 
     const ULONG result = next_addresses()(family, flags, reserved, addresses, size);
@@ -638,28 +458,6 @@ inline ULONG WINAPI hook_GetIfTable(PMIB_IFTABLE table, PULONG size, BOOL order)
     const AdapterPresentation &p = state();
     if (!p.present) {
         return next_table() ? next_table()(table, size, order) : ERROR_INVALID_PARAMETER;
-    }
-
-    if (p.fabricate) {
-        const ULONG needed = sizeof(DWORD) + sizeof(MIB_IFROW);
-        if (table == nullptr || size == nullptr || *size < needed) {
-            if (size != nullptr) *size = needed;
-            return ERROR_INSUFFICIENT_BUFFER;
-        }
-        table->dwNumEntries = 1;
-        MIB_IFROW *row = table->table;
-        memset(row, 0, sizeof(*row));
-        wcscpy_s(row->wszName, _countof(row->wszName), L"Fake Ethernet");
-        row->dwIndex = 1;
-        row->dwType = kEthernetType;
-        row->dwMtu = 4200;
-        row->dwSpeed = 1000000000;
-        row->dwPhysAddrLen = 6;
-        memcpy(row->bPhysAddr, p.mac, 6);
-        row->dwAdminStatus = 1;
-        row->dwOperStatus = IF_OPER_STATUS_OPERATIONAL;
-        *size = needed;
-        return ERROR_SUCCESS;
     }
 
     const ULONG result = next_table()(table, size, order);
