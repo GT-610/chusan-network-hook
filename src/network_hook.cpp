@@ -80,6 +80,26 @@ segatools::Config g_segatools;
 // Set when the interface was named explicitly and could not be resolved. That is a
 // misconfiguration and must be treated differently from "nothing was configured".
 bool g_interface_explicit;
+
+// Who presents the network to the game, and pins its traffic.
+//
+// Exactly one component may do either. segatools' netenv patches the same three
+// enumeration functions, and it does so at the EXE entry point -- after this DLL's
+// DllMain -- so a list presented here would be whatever the later patch left behind.
+// Pinning is the other half of the same decision: netenv presents a synthetic address that
+// no adapter owns, so pinning the LAN to a real source address makes the game's own bind()
+// fail with WSAEADDRNOTAVAIL. When netenv is on, this hook therefore resolves nothing and
+// pins nothing.
+//
+// LAN Install virtualisation is deliberately not part of this. It suppresses traffic game
+// code would otherwise emit, has no counterpart in segatools, and does not depend on
+// owning an address, so it stays under the user's switch in either configuration.
+enum class NetworkOwner { none, segatools, hook };
+NetworkOwner g_owner = NetworkOwner::none;
+
+// False under segatools' netenv: no pin belongs to this hook then.
+bool owns_network() { return g_owner == NetworkOwner::hook; }
+
 // Messages raised before the logging thread exists; flushed once logging is up.
 // Severity travels with the line so a decision is not reported as a failure.
 struct PendingLine { bool error; char text[512]; };
@@ -838,6 +858,9 @@ void log_adapters() {
     // observation; this line is the hook's decision.
     if (!g_config.network_enable) {
         log_line("INTERFACE", "network disabled; [network] interface is ignored");
+    } else if (g_owner == NetworkOwner::segatools) {
+        log_line("INTERFACE", "owned by segatools ([netenv] enable=1); nothing presented or "
+            "pinned, LAN Install virtualisation still follows its own switch");
     } else if (!g_network_ready) {
         log_line("INTERFACE", "no interface selected for %s; traffic is not pinned",
             g_interface_ready_text());
@@ -948,7 +971,7 @@ void log_action(const char *service_name, const char *action, SOCKET socket, uin
 }
 
 bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
-    if (!g_config.network_enable ||
+    if (!g_config.network_enable || !owns_network() ||
         (!g_config.force_limited_broadcast && !g_config.force_directed_broadcast)) return true;
     const int saved_error = WSAGetLastError();
     SocketState *state = state_for(socket, true);
@@ -974,7 +997,7 @@ bool ensure_broadcast_interface(SOCKET socket, uint16_t port) {
 
 bool ensure_tcp_source(SOCKET socket, uint16_t port,
                        const sockaddr *target, int target_length) {
-    if (!g_config.network_enable || !g_config.force_tcp_source) return true;
+    if (!g_config.network_enable || !owns_network() || !g_config.force_tcp_source) return true;
     if (loopback_target(target, target_length)) {
         char destination[96] = {};
         endpoint(target, target_length, destination, sizeof(destination));
@@ -1844,17 +1867,6 @@ void configure_presentation() {
 
     if (!g_config.network_enable) return;
 
-    if (g_segatools.found && g_segatools.netenv.enable) {
-        // netenv patches the same three functions at the EXE entry point, which is
-        // after this DLL's DllMain. It would overwrite these slots and its synthetic
-        // adapter would be what the game sees, so presenting our own list here would
-        // only produce a half-applied chain. Say which one is in charge and leave it.
-        defer_line("segatools.ini has [netenv] enable=1, so segatools still owns adapter "
-            "presentation. This hook is leaving it alone; set [netenv] enable=0 in %ws to "
-            "let the hook take over.", g_segatools.path);
-        return;
-    }
-
     if (g_network_ready) {
         presentation.present = true;
         presentation.exclusive = g_config.exclusive;
@@ -2032,6 +2044,17 @@ void prepare() {
         defer_line("%ws", problem);
     }
 
+    if (g_segatools.found && g_segatools.netenv.enable) {
+        g_owner = NetworkOwner::segatools;
+        defer_line("segatools.ini has [netenv] enable=1, so segatools owns adapter "
+            "presentation and this hook pins no traffic: netenv presents an address no "
+            "adapter owns, and a real source address pinned to it would make the game's own "
+            "bind fail. LAN Install virtualisation is unaffected. Set [netenv] enable=0 in "
+            "%ws to let the hook take over.", g_segatools.path);
+        return;
+    }
+    g_owner = NetworkOwner::hook;
+
     resolve_network_interface();
     report_server_route();
 
@@ -2160,7 +2183,9 @@ DWORD WINAPI initialize(void *) {
             "x86",
 #endif
             iat ? "installed" : "not_installed", lan_hook_status,
-            !g_config.network_enable ? "disabled" : (g_network_ready ? "ready" : "failed"),
+            !g_config.network_enable ? "disabled"
+                : (g_owner == NetworkOwner::segatools ? "segatools"
+                    : (g_network_ready ? "ready" : "failed")),
             adapter_override::state().present ? "active" : "off", interface_text,
             g_config.log_detailed ? "detailed" : "concise", config_path);
     }
