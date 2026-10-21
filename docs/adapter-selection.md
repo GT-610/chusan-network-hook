@@ -387,7 +387,7 @@ Two probes remain, and both do guard shipped code:
 
 | probe | what it pins down | built | run |
 |---|---|---|---|
-| `tests/probe_icmp.cpp` | `hook_IcmpSendEcho2` answers every destination, at any TTL | `build.bat` | manually |
+| `tests/probe_icmp.cpp` | `hook_IcmpSendEcho2` answers every destination, at any TTL | `build.bat` | `release.yml` |
 | `tests/smoketest.cpp` | LAN Install virtualisation, and the loopback Party path | `build.bat` | `release.yml` |
 
 `tests/probe_presentation.cpp` stays as a hand-held inspection tool: it loads the DLL into

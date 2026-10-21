@@ -41,6 +41,9 @@ build\network_hook_smoketest_x86.exe build\chusan_network_hook_x86.dll
 build\probe_icmp_x64.exe
 ```
 
+All three run in `release.yml` before anything is published, so a tag cannot ship from a
+tree where they fail.
+
 ## Injection
 
 Load the matching DLL as an additional `capnhook` module. `amdaemon.exe` is the 64-bit

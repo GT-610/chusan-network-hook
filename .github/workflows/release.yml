@@ -20,12 +20,14 @@ jobs:
         shell: cmd
         run: build.bat
 
-      - name: Run smoke tests
+      - name: Run smoke tests and probes
         shell: pwsh
         run: |
           .\build\network_hook_smoketest_x64.exe .\build\chusan_network_hook_x64.dll
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\build\network_hook_smoketest_x86.exe .\build\chusan_network_hook_x86.dll
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\build\probe_icmp_x64.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Assemble release archive
