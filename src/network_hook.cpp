@@ -787,8 +787,12 @@ bool resolve_network_interface() {
         }
         defer_line("No usable network interface was found for %s.%s", request,
             g_interface_explicit
-                ? " The request was explicit, so this is a configuration error."
-                : " Set [network] interface to the adapter that carries the LAN.");
+                ? " The request was explicit, so this is a configuration error: correct "
+                  "[network] interface, or set [netenv] enable=1 in segatools.ini to let "
+                  "segatools own the network instead."
+                : " Set [network] interface to the adapter that carries the LAN, or set "
+                  "[netenv] enable=1 in segatools.ini to let segatools own the network "
+                  "instead.");
         return false;
     }
 
