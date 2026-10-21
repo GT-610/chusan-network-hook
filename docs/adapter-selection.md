@@ -106,7 +106,7 @@ x64, which moves every following field by 4 relative to the x86 table above:
 | `Type` | `0x1A0` | `0x1A4` |
 | `DhcpEnabled` | `0x1A4` | `0x1A8` |
 
-Measured with `tests/probe_struct_offsets.cpp` on both architectures. The `0x194 == 6` test
+Measured on both architectures; §10 records the provenance. The `0x194 == 6` test
 is therefore `AddressLength == 6` (MAC length), and `0x1A4` is `Type` — not the Wi-Fi/link
 field it first resembles.
 
@@ -123,7 +123,7 @@ argument for keeping the index real instead of inventing one.
 
 ## 3. Measured on this host
 
-`tests/probe_adapter_table.cpp` reproduces passes 1–2 against the live stack:
+Passes 1–2 reproduced against the live stack:
 
 | Idx | Type | Description | IP | verdict |
 |---|---|---|---|---|
@@ -376,21 +376,23 @@ Reproducing a genuinely measured hop count is not attempted: TTL-expired replies
 to be invented for routers that cannot be observed, so any other value would be an equally
 fabricated constant, merely a less familiar one.
 
-## 10. Reproducing
+## 10. Provenance
 
-```bat
-cl /nologo /std:c++17 /O2 /MT /W4 tests\probe_adapter_table.cpp ^
-  /link /SUBSYSTEM:CONSOLE /OUT:build\probe_adapter_table.exe ws2_32.lib iphlpapi.lib
-build\probe_adapter_table.exe
-```
+The numbers in §1–3 and in "NUMBER OF HOP reads 1" came from throwaway probes run on this
+host, and those probes are gone: they measured the Windows stack and the game's own
+filters, not this hook, so none of them could fail when the hook regressed. Git history
+still has them if a measurement has to be repeated.
 
-| probe | what it pins down |
-|---|---|
-| `probe_adapter_table.cpp` | the game's passes 1–2 against the live stack |
-| `probe_presentation.cpp` | the list as the game sees it, through all three APIs, with the hook loaded |
-| `probe_struct_offsets.cpp` | the x86/x64 `IP_ADAPTER_*` offset tables in §1–2 |
-| `probe_unicast_if.cpp` | `IP_UNICAST_IF` moves broadcast egress to the chosen index |
-| `probe_icmp.cpp` | `hook_IcmpSendEcho2` answers every destination, at any TTL |
+Two probes remain, and both do guard shipped code:
+
+| probe | what it pins down | built | run |
+|---|---|---|---|
+| `tests/probe_icmp.cpp` | `hook_IcmpSendEcho2` answers every destination, at any TTL | `build.bat` | manually |
+| `tests/smoketest.cpp` | LAN Install virtualisation, and the loopback Party path | `build.bat` | `release.yml` |
+
+`tests/probe_presentation.cpp` stays as a hand-held inspection tool: it loads the DLL into
+a scratch process and prints the adapter list all three APIs return, which is the only way
+to see a presentation decision without starting the game.
 
 Ghidra side: `allnet_enumerate_adapters` @ `0x01026820`, single caller `0x0044dcc5`;
 `alwAuthPhaseGateway` @ `0x1403c0270`; `alwAuthPhaseTraceroute` @ `0x1403c1a00`;

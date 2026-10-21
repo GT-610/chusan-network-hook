@@ -258,7 +258,7 @@ an unexpected exit.
 |---|---|---|
 | adapter identity | invented: `subnet \| addrSuffix`, mask `/24`, `IfIndex = 1`, MAC `01:02:03:04:05:06` | the real adapter: real address, mask, prefix, `IfIndex`, MAC |
 | acceptance by the game | fakes the whole enumeration | rewrites only `Type`/`IfType` when the link type is not Ethernet |
-| `IP_UNICAST_IF` | `1`, a hardcoded index that pins nothing (`netenv.c:253`) | the real index (`probe_unicast_if.cpp` proves the egress moves) |
+| `IP_UNICAST_IF` | `1`, a hardcoded index that pins nothing (`netenv.c:253`) | the real index, so the egress actually moves |
 | directed broadcast | rewritten to `255.255.255.255` (`redirectBroadcast`), hiding a subnet mismatch | sent as the game addressed it, pinned to the real interface |
 | `bind()` | only safe when the fake address happens to equal a real one; otherwise `10049 WSAEADDRNOTAVAIL` | always safe, because the address is owned |
 | `GetBestRoute` | fixed row, `IfIndex 1` | presented interface, next hop consistent with the adapter |
