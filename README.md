@@ -33,6 +33,8 @@ That produces:
 - `build\chusan_network_hook_x86.dll` for `chusanApp.exe`;
 - x64 and x86 smoke-test executables;
 - `build\probe_icmp_x64.exe`, which exercises the ICMP behaviour directly;
+- `build\probe_logging_x64.exe`, which asserts that `detailed=0` still logs the identity and
+  decisions, and that a poll loop on a virtualised port is folded instead of printed per call;
 - `build\probe_ownership_x64.exe`, which checks that `[netenv] enable=1` leaves the network
   to segatools without switching LAN Install virtualisation off;
 - a copy of `network_hook.ini` beside the DLLs.
@@ -41,10 +43,11 @@ That produces:
 build\network_hook_smoketest_x64.exe build\chusan_network_hook_x64.dll
 build\network_hook_smoketest_x86.exe build\chusan_network_hook_x86.dll
 build\probe_icmp_x64.exe
+build\probe_logging_x64.exe build\chusan_network_hook_x64.dll
 build\probe_ownership_x64.exe build\chusan_network_hook_x64.dll
 ```
 
-All four run in `release.yml` before anything is published, so a tag cannot ship from a
+All five run in `release.yml` before anything is published, so a tag cannot ship from a
 tree where they fail.
 
 ## Injection
@@ -232,6 +235,11 @@ with the fix. Notable checks:
 - the known x64 `amdaemon.exe` duplicate-server check is patched to return `false` after its
   prologue is verified.
 
+Because every one of those answers is produced here, a caller that polls the port gets the
+same answer on every poll. The first call of each kind is logged; repeats are counted and
+reported once a second as `folded=N`, so a poll loop shows up as a rate instead of one line
+per millisecond (see [Logging](#logging)).
+
 Set `enable=0` to pass real 40110/40112 traffic through WinSock. The duplicate-server patch
 is then not installed, and the `[network]` settings can pin real LAN Install traffic to the
 configured adapter.
@@ -241,21 +249,34 @@ This does not fabricate a remote server, transfer installation data, or complete
 
 ### Logging
 
-`[log] enable=0` silences everything except one `STATUS` line, always printed to `stderr` and
-`OutputDebugStringA`. That line is the proof the DLL loaded: it names the process, the
-architecture, whether the WinSock and LAN Install hooks installed, whether adapter
-presentation is active, and which interface was chosen.
+Two levels, because they answer different questions.
 
-With `enable=1` and `detailed=0` there are three lines at start-up — the status, the chosen
-interface, and any decision that changed what the game will see. Failures print as `ERROR`
-with the operation, the service, the address and the fix.
+**`detailed=0` — concise — is the session record.** It states what this DLL is and what it
+decided: the `STATUS` line, `START` and `CONFIG` (which process, whether the hooks installed,
+the settings this run actually used), which interface carries the LAN, whether LAN Install is
+virtualised, where the log file is, and every event that changes what the game will do next —
+a LAN listener opening, a peer being reached, a broadcast or connection failing with the fix.
+A normal session is a handful of lines. Concise means "do not drown me", not "tell me
+nothing": `chusanApp.exe` has no console, so a quiet level that omitted these facts left
+nothing to read anywhere.
 
-`detailed=1` adds the diagnostic stream: every hook installation and its coverage, adapter
+**`detailed=1` adds the diagnostic stream**: every hook installation and its coverage, adapter
 tables, route lookups, socket lifecycle, endpoints, byte counters, hexadecimal payload
 summaries, TCP stream framing and UDP frame parsing for 50200-50202, and AES-128-ECB prefix
 decoding with known message names where the packet format matches.
 
-`writeFile=1` writes the same output to:
+`[log] enable=0` silences both levels and leaves only the `STATUS` line, which is printed to
+`stderr`, `OutputDebugStringA` and the log file regardless. That line is the proof the DLL
+loaded: it names the process, the architecture, whether the WinSock and LAN Install hooks
+installed, whether adapter presentation is active, and which interface was chosen.
+
+Repeated virtualised calls are folded rather than printed one per call. `[lanInstall] enable=1`
+makes `amdaemon`'s LAN Install polling loop — about one poll per millisecond — hit this DLL
+instead of the stack, so the first call of each kind is reported and later ones are counted,
+with the count carried on the next line (`folded=N`) once a second. A session-long poll loop
+reads as a rate, and nothing is lost: the folded total is reported.
+
+`writeFile=1` writes the same output, `STATUS` included, to:
 
 ```text
 network_hook_logs\network_hook_YYYYMMDD_HHMMSS_pidNNNN.log
