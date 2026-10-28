@@ -722,6 +722,32 @@ void report_peer(SocketState *state, uint16_t port, bool accepted) {
     }
 }
 
+// A non-blocking connect reports its outcome through SO_ERROR rather than from connect(),
+// which returned WSAEWOULDBLOCK, so this is the only place that success becomes visible - and
+// turning "the game opened a socket" into "the game reached the peer" is worth a line.
+//
+// SO_ERROR also reads 0 on sockets that never connected, on UDP sockets, and on the
+// virtualised LAN Install sockets whose connect this DLL faked; reporting those as a reached
+// peer would put a false success in the concise log. So the socket is asked rather than
+// assumed: a stream socket with a peer name has a connection behind it. The peer address is
+// only recorded once that check passes, so a broken socket cannot leave a stale endpoint
+// behind for later lines.
+void report_connect_complete(SOCKET socket) {
+    SocketState *state = state_for(socket, false);
+    if (state == nullptr || state->virtual_lan_port != 0) return;
+    if (g_next_getsockopt == nullptr) return;
+    int type = 0;
+    int type_length = (int)sizeof(type);
+    if (g_next_getsockopt(socket, SOL_SOCKET, SO_TYPE,
+            reinterpret_cast<char *>(&type), &type_length) == SOCKET_ERROR) return;
+    if (type != SOCK_STREAM) return;
+    sockaddr_storage peer = {};
+    int peer_length = (int)sizeof(peer);
+    if (getpeername(socket, reinterpret_cast<sockaddr *>(&peer), &peer_length) != 0) return;
+    save_address(state, reinterpret_cast<const sockaddr *>(&peer), peer_length, true);
+    report_peer(state, state_port(state), false);
+}
+
 void wide_to_utf8(const wchar_t *input, char *output, size_t output_size) {
     if (output_size == 0) return;
     output[0] = '\0';
@@ -1582,14 +1608,9 @@ int WSAAPI hook_getsockopt(SOCKET s, int level, int optname, char *value, int *l
     if (level == SOL_SOCKET && optname == SO_ERROR) {
         int so_error = (r == 0 && value && len && *len >= (int)sizeof(int)) ? *reinterpret_cast<int *>(value) : -1;
         log_io("getsockopt", s, so_error, e, nullptr, 0, nullptr, 0);
-        // A non-blocking connect reports its outcome here rather than from connect(), which
-        // returned WSAEWOULDBLOCK. This is therefore the only place that success is visible,
-        // and reporting it is what turns "the game opened a socket" into "the game reached
-        // the peer". Once per socket: SO_ERROR is polled.
-        if (r == 0 && so_error == 0) {
-            SocketState *state = state_for(s, false);
-            if (state != nullptr) report_peer(state, state_port(state), false);
-        }
+        // Once per socket: SO_ERROR is polled, and report_connect_complete checks that the
+        // socket really has a peer before anything is announced.
+        if (r == 0 && so_error == 0) report_connect_complete(s);
     }
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }

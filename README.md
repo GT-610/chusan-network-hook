@@ -265,10 +265,10 @@ tables, route lookups, socket lifecycle, endpoints, byte counters, hexadecimal p
 summaries, TCP stream framing and UDP frame parsing for 50200-50202, and AES-128-ECB prefix
 decoding with known message names where the packet format matches.
 
-`[log] enable=0` silences both levels and leaves only the `STATUS` line, which is printed to
-`stderr`, `OutputDebugStringA` and the log file regardless. That line is the proof the DLL
-loaded: it names the process, the architecture, whether the WinSock and LAN Install hooks
-installed, whether adapter presentation is active, and which interface was chosen.
+`[log] enable=0` silences both levels and leaves only the `STATUS` line, printed to `stderr`
+and `OutputDebugStringA`. No log file is created in that mode, whatever `writeFile` says: the
+line exists to prove the DLL loaded when nothing else appears, and a console or a debugger is
+where it gets read.
 
 Repeated virtualised calls are reported once, not once per call. `[lanInstall] enable=1`
 makes `amdaemon`'s LAN Install polling loop — about one poll per millisecond — hit this DLL
@@ -278,7 +278,7 @@ socket's own `CLOSE` line (`virtual_calls=`, with the bytes it carried in
 `virtual_tx_bytes=`), so a poll loop costs a constant handful of lines no matter how long the
 session runs.
 
-`writeFile=1` writes the same output, `STATUS` included, to:
+With `enable=1`, `writeFile=1` writes the same output, `STATUS` included, to:
 
 ```text
 network_hook_logs\network_hook_YYYYMMDD_HHMMSS_pidNNNN.log

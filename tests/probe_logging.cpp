@@ -133,9 +133,117 @@ static int run_virtual_flood() {
             sizeof(beacon));
     }
 
+    // SO_ERROR reads 0 on this socket because this DLL answered connect() itself. Nothing is
+    // connected behind it, so it must not be announced as a reached peer.
+    for (int i = 0; i < 5; ++i) {
+        int so_error = -1;
+        int so_error_length = (int)sizeof(so_error);
+        (void)getsockopt(tcp, SOL_SOCKET, SO_ERROR,
+            reinterpret_cast<char *>(&so_error), &so_error_length);
+    }
+
     closesocket(udp);
     closesocket(tcp);
     return 0;
+}
+
+// The other direction of the SO_ERROR guard: a real non-blocking connection has to be
+// announced, and announced once - from connect() when it completes inline, or from the
+// SO_ERROR poll when it does not. Without this, tightening the guard could silently stop
+// reporting genuine peers and nothing would notice.
+static int run_real_connect() {
+    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) return fail("party listener socket", WSAGetLastError());
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(50200);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(listener, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == SOCKET_ERROR) {
+        const DWORD error = WSAGetLastError();
+        closesocket(listener);
+        return fail("party listener bind", error);
+    }
+    if (listen(listener, 1) == SOCKET_ERROR) {
+        const DWORD error = WSAGetLastError();
+        closesocket(listener);
+        return fail("party listener listen", error);
+    }
+
+    SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (client == INVALID_SOCKET) {
+        closesocket(listener);
+        return fail("party client socket", WSAGetLastError());
+    }
+    u_long nonblocking = 1;
+    if (ioctlsocket(client, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+        const DWORD error = WSAGetLastError();
+        closesocket(client);
+        closesocket(listener);
+        return fail("party client non-blocking", error);
+    }
+
+    bool completed = connect(client, reinterpret_cast<const sockaddr *>(&address),
+        sizeof(address)) == 0;
+    if (!completed) {
+        const DWORD error = WSAGetLastError();
+        if (error != WSAEWOULDBLOCK && error != WSAEINPROGRESS && error != WSAEALREADY) {
+            closesocket(client);
+            closesocket(listener);
+            return fail("party non-blocking connect", error);
+        }
+        for (int i = 0; i < 200 && !completed; ++i) {
+            int so_error = -1;
+            int so_error_length = (int)sizeof(so_error);
+            if (getsockopt(client, SOL_SOCKET, SO_ERROR,
+                    reinterpret_cast<char *>(&so_error), &so_error_length) == 0 &&
+                so_error == 0) {
+                completed = true;
+                break;
+            }
+            Sleep(5);
+        }
+    }
+
+    int result = 0;
+    if (!completed) {
+        result = fail_text("the non-blocking connect never completed");
+    } else {
+        const SOCKET accepted = accept(listener, nullptr, nullptr);
+        if (accepted == INVALID_SOCKET) result = fail("party accept", WSAGetLastError());
+        else closesocket(accepted);
+    }
+    closesocket(client);
+    closesocket(listener);
+    return result;
+}
+
+// Reads this run's log into a heap buffer, or returns null when it does not exist yet.
+// Defined with the other log helpers below; the child needs it before then.
+static char *read_log(const wchar_t *directory);
+
+// The hook writes the identity lines from a worker thread, and wait_until_hooked returns
+// once the import table is patched - which happens before START and CONFIG are emitted. The
+// concise case asserts on exactly those lines, so waiting for the file to contain them is
+// what keeps the assertion about the hook rather than about a race. Returns false if they
+// never arrive, which is itself the defect under test.
+static bool wait_for_startup_log(const wchar_t *dll, int seconds) {
+    wchar_t directory[MAX_PATH] = {};
+    if (swprintf_s(directory, L"%s", dll) < 0) return false;
+    wchar_t *separator = wcsrchr(directory, L'\\');
+    if (separator == nullptr) return false;
+    *separator = L'\0';
+
+    const ULONGLONG deadline = GetTickCount64() + (ULONGLONG)seconds * 1000;
+    for (;;) {
+        char *log = read_log(directory);
+        const bool ready = log != nullptr &&
+            strstr(log, "[network_hook] STATUS") != nullptr &&
+            strstr(log, "\tCONFIG\t") != nullptr;
+        free(log);
+        if (ready) return true;
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(50);
+    }
 }
 
 static int run_case(const wchar_t *dll, bool detailed) {
@@ -143,7 +251,13 @@ static int run_case(const wchar_t *dll, bool detailed) {
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return fail("WSAStartup", WSAGetLastError());
     if (LoadLibraryW(dll) == nullptr) return fail("LoadLibraryW", GetLastError());
     if (!wait_until_hooked(15)) return fail("the hook never answered a beacon", GetLastError());
-    const int result = detailed ? run_virtual_flood() : 0;
+    int result = 0;
+    if (detailed) {
+        result = run_virtual_flood();
+        if (result == 0) result = run_real_connect();
+    } else if (!wait_for_startup_log(dll, 10)) {
+        result = fail_text("no STATUS/CONFIG line reached the log file within 10s");
+    }
     WSACleanup();
     return result;
 }
@@ -259,6 +373,16 @@ static int count_category(const char *log, const char *category) {
     return count;
 }
 
+// Occurrences of a literal string. Used to assert "exactly one line for this operation/port
+// pair", which a category count cannot express.
+static int count_text(const char *log, const char *text) {
+    const size_t length = strlen(text);
+    int count = 0;
+    for (const char *cursor = log; (cursor = strstr(cursor, text)) != nullptr; cursor += length)
+        ++count;
+    return count;
+}
+
 // A concise log has to carry the identity, and it must not carry per-call detail.
 static int check_concise(const char *log) {
     struct Marker { const char *text; const char *why; };
@@ -321,13 +445,26 @@ static unsigned long long max_virtual_calls(const char *log) {
 
 static int check_flood(const char *log) {
     const int virtual_lines = count_category(log, "LAN_VIRT");
-    if (strstr(log, "op=accept") == nullptr || strstr(log, "op=sendto") == nullptr) {
-        fputs("FAIL: a virtualised operation was never reported at all\n", stderr);
-        return 1;
+    // One line per operation and port, for the life of the process. Each of these five pairs
+    // is exercised thousands of times, so exactly one line each is the whole point - an
+    // aggregate count could still hide a pair that repeats.
+    const char *pairs[] = {
+        "op=bind port=40110",
+        "op=listen port=40110",
+        "op=accept port=40110",
+        "op=recv port=40110",
+        "op=sendto port=40112",
+    };
+    for (const char *pair : pairs) {
+        const int seen = count_text(log, pair);
+        if (seen != 1) {
+            fprintf(stderr, "FAIL: \"%s\" appears %d times; every virtualised pair must be "
+                "reported exactly once\n", pair, seen);
+            return 1;
+        }
     }
-    // One line per operation and port, for the life of the process: five distinct answers
-    // are exercised here (bind, listen, accept, recv, sendto), plus the keepsake for a
-    // second port. Anything above a dozen means repeats are still being printed.
+    // The aggregate is a separate check, so a new operation/port pair that starts repeating
+    // cannot slip past the list above.
     if (virtual_lines > 12) {
         fprintf(stderr,
             "FAIL: 5015 virtualised calls became %d LAN_VIRT lines; repeats are not silenced\n",
@@ -340,6 +477,20 @@ static int check_flood(const char *log) {
         fprintf(stderr,
             "FAIL: the busiest socket recorded only %llu answered calls, out of 5015; the "
             "repeats were dropped rather than counted\n", virtual_calls);
+        return 1;
+    }
+    // The SO_ERROR path has two directions, and both are asserted here: a real non-blocking
+    // connection is announced exactly once, and a virtualised socket whose connect this DLL
+    // faked is never announced at all.
+    const int real_peers = count_text(log, "PARTY connected to 127.0.0.1");
+    if (real_peers != 1) {
+        fprintf(stderr,
+            "FAIL: a real non-blocking connection produced %d \"PARTY connected to\" lines, "
+            "expected exactly one\n", real_peers);
+        return 1;
+    }
+    if (count_text(log, "LAN_SYNC connected") != 0) {
+        fputs("FAIL: a virtualised socket was announced as a reached peer\n", stderr);
         return 1;
     }
     // The sends answered locally are counted apart from the real ones, so a socket that
