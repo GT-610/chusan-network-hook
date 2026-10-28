@@ -236,9 +236,9 @@ with the fix. Notable checks:
   prologue is verified.
 
 Because every one of those answers is produced here, a caller that polls the port gets the
-same answer on every poll. The first call of each kind is logged; repeats are counted and
-reported once a second as `folded=N`, so a poll loop shows up as a rate instead of one line
-per millisecond (see [Logging](#logging)).
+same answer on every poll, and the log says it once per operation and port. The number of
+calls is counted on the socket and printed by its `CLOSE` line, so a poll loop shows up as a
+volume instead of one line per millisecond (see [Logging](#logging)).
 
 Set `enable=0` to pass real 40110/40112 traffic through WinSock. The duplicate-server patch
 is then not installed, and the `[network]` settings can pin real LAN Install traffic to the
@@ -270,11 +270,13 @@ decoding with known message names where the packet format matches.
 loaded: it names the process, the architecture, whether the WinSock and LAN Install hooks
 installed, whether adapter presentation is active, and which interface was chosen.
 
-Repeated virtualised calls are folded rather than printed one per call. `[lanInstall] enable=1`
+Repeated virtualised calls are reported once, not once per call. `[lanInstall] enable=1`
 makes `amdaemon`'s LAN Install polling loop — about one poll per millisecond — hit this DLL
-instead of the stack, so the first call of each kind is reported and later ones are counted,
-with the count carried on the next line (`folded=N`) once a second. A session-long poll loop
-reads as a rate, and nothing is lost: the folded total is reported.
+instead of the stack, and every poll of a given operation gets the identical answer, so the
+first one is logged and the rest say nothing. The count is not lost: it is carried on the
+socket's own `CLOSE` line (`virtual_calls=`, with the bytes it carried in
+`virtual_tx_bytes=`), so a poll loop costs a constant handful of lines no matter how long the
+session runs.
 
 `writeFile=1` writes the same output, `STATUS` included, to:
 

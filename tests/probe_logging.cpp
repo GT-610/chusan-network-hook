@@ -10,10 +10,11 @@
 //
 //   * `[log] detailed=1` with `[lanInstall] enable=1` turned amdaemon's LAN Install polling
 //     loop (about one poll per millisecond) into one LAN_VIRT line per poll, which buried
-//     every other line and spent the session flushing to disk. Repeats are folded into a
-//     rate now, and this case asserts the fold: thousands of virtualised calls must not
-//     become thousands of lines, while the first call of each kind has to stay visible and
-//     the folded count has to be reported.
+//     every other line and spent the session flushing to disk. Each answer is now reported
+//     once per operation and port, and this case asserts both halves of that: thousands of
+//     virtualised calls must not become thousands of lines, the first call of each kind has
+//     to stay visible, and the volume has to be on the record somewhere - it is counted into
+//     the socket's own CLOSE line rather than dropped.
 //
 // The two cases need separate processes: the hook reads network_hook.ini from its own
 // directory in DllMain, and two copies of it cannot coexist in one process. The parent
@@ -120,8 +121,9 @@ static int run_virtual_flood() {
         }
     }
 
-    // The fold interval has to elapse before the next line can carry a count; these calls
-    // are the ones that report how many were absorbed.
+    // A pause longer than any reporting interval, then more of the same. Nothing may be
+    // printed: reporting used to be rate-limited to once a second, and a timer that keeps
+    // saying "still nothing here" is exactly what has to stay gone.
     Sleep(1100);
     for (int i = 0; i < 5; ++i) {
         const SOCKET accepted = accept(tcp, nullptr, nullptr);
@@ -257,18 +259,7 @@ static int count_category(const char *log, const char *category) {
     return count;
 }
 
-// For the flood case: the sum of the counts folded into the reported lines, which is how the
-// probe proves the calls were absorbed rather than dropped.
-static unsigned long long sum_folded(const char *log) {
-    unsigned long long total = 0;
-    const char *cursor = log;
-    while ((cursor = strstr(cursor, "folded=")) != nullptr) {
-        cursor += 7;
-        total += _strtoui64(cursor, nullptr, 10);
-    }
-    return total;
-}
-
+// A concise log has to carry the identity, and it must not carry per-call detail.
 static int check_concise(const char *log) {
     struct Marker { const char *text; const char *why; };
     const Marker markers[] = {
@@ -315,23 +306,40 @@ static unsigned long long max_virtual_bytes(const char *log) {
     return largest;
 }
 
+// Largest `virtual_calls=` in the log: how many calls one socket had answered for it, which
+// is where the volume of a poll loop is recorded instead of on a line per poll.
+static unsigned long long max_virtual_calls(const char *log) {
+    unsigned long long largest = 0;
+    const char *cursor = log;
+    while ((cursor = strstr(cursor, " virtual_calls=")) != nullptr) {
+        cursor += strlen(" virtual_calls=");
+        const unsigned long long value = _strtoui64(cursor, nullptr, 10);
+        if (value > largest) largest = value;
+    }
+    return largest;
+}
+
 static int check_flood(const char *log) {
     const int virtual_lines = count_category(log, "LAN_VIRT");
-    const unsigned long long folded = sum_folded(log);
     if (strstr(log, "op=accept") == nullptr || strstr(log, "op=sendto") == nullptr) {
         fputs("FAIL: a virtualised operation was never reported at all\n", stderr);
         return 1;
     }
-    if (virtual_lines > 20) {
+    // One line per operation and port, for the life of the process: five distinct answers
+    // are exercised here (bind, listen, accept, recv, sendto), plus the keepsake for a
+    // second port. Anything above a dozen means repeats are still being printed.
+    if (virtual_lines > 12) {
         fprintf(stderr,
-            "FAIL: 5015 virtualised calls became %d LAN_VIRT lines; repeats are not folded\n",
+            "FAIL: 5015 virtualised calls became %d LAN_VIRT lines; repeats are not silenced\n",
             virtual_lines);
         return 1;
     }
-    if (folded < 4000) {
+    // Silence must not mean the calls were lost: the socket counts them, once.
+    const unsigned long long virtual_calls = max_virtual_calls(log);
+    if (virtual_calls < 4000) {
         fprintf(stderr,
-            "FAIL: only %llu folded calls were accounted for; the repeated calls were dropped "
-            "rather than counted\n", folded);
+            "FAIL: the busiest socket recorded only %llu answered calls, out of 5015; the "
+            "repeats were dropped rather than counted\n", virtual_calls);
         return 1;
     }
     // The sends answered locally are counted apart from the real ones, so a socket that
@@ -343,8 +351,8 @@ static int check_flood(const char *log) {
             "the virtualised path\n", virtual_bytes);
         return 1;
     }
-    printf("  5015 virtualised calls: %d LAN_VIRT lines, %llu repeats accounted for, "
-        "%llu bytes counted as virtual\n", virtual_lines, folded, virtual_bytes);
+    printf("  5015 virtualised calls: %d LAN_VIRT lines, %llu answered calls on one socket, "
+        "%llu bytes counted as virtual\n", virtual_lines, virtual_calls, virtual_bytes);
     return 0;
 }
 
@@ -483,6 +491,6 @@ int wmain(int argc, wchar_t **argv) {
         fprintf(stderr, "FAIL: %d logging check(s) disagreed\n", failures);
         return 1;
     }
-    puts("PASS: concise logging keeps the identity and decisions, detailed logging folds repeats");
+    puts("PASS: concise logging keeps the identity and decisions, detailed logging reports repeats once");
     return 0;
 }

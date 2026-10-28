@@ -137,6 +137,9 @@ struct SocketState {
     // which counts what actually reached the stack, so a CLOSE line cannot read as "nothing
     // was sent" on a socket whose traffic was answered locally.
     uint64_t virtual_tx_bytes;
+    // Calls this DLL answered itself on this socket. Printed once, by CLOSE, so a poll loop
+    // costs no lines of its own and its volume is still on the record.
+    unsigned long virtual_calls;
     unsigned char tx_stream[kStreamCapacity];
     size_t tx_stream_length;
     unsigned char rx_stream[kStreamCapacity];
@@ -511,19 +514,20 @@ void status_line(const char *format, ...) {
 }
 
 // LAN Install virtualisation answers these calls itself, so a caller that polls one of the
-// ports gets the same answer on every poll. amdaemon polls its non-blocking LAN Install
+// ports gets the identical answer on every poll. amdaemon polls its non-blocking LAN Install
 // sockets about once per millisecond; at detailed level that was one LAN_VIRT line per
 // millisecond, which buried every other line, spent the session flushing the file to disk,
 // and looked like a failure that kept repeating when it was only "still nothing here".
 //
-// Repeats are therefore folded. The first call for an operation and port is reported at
-// once, later calls are counted, and the count rides on the next report once the interval
-// has elapsed. Nothing is lost - a poll loop shows up as a rate instead of as a flood - and
-// the first call of each kind is always visible, which is what a reader actually needs.
-constexpr DWORD kVirtualRepeatIntervalMs = 1000;
-constexpr size_t kVirtualRepeatSlots = 32;
+// The answer never varies, so it is worth exactly one line: the first call for an operation
+// and port is reported and the rest are silent. Reporting the repeat rate as well - once a
+// second was the earlier attempt - still costs a line per second for the whole session to
+// say nothing new, so the total is counted on the socket instead and printed by the CLOSE
+// line it already has. Nothing is lost: the first call of each kind, the fact that the port
+// is in use (virtual_announce), and how many calls it answered are all still in the log, and
+// a session costs a constant handful of lines no matter how long it runs.
 
-// One value per distinct answer a virtualised port can give, so repeats are folded per
+// One value per distinct answer a virtualised port can give, so calls are reported per
 // operation rather than per message: a beacon send and a beacon receive are different facts.
 enum class VirtualOp {
     bind, listen, connect, accept,
@@ -554,54 +558,19 @@ const char *virtual_op_name(VirtualOp op) {
     }
 }
 
-struct VirtualRepeat {
-    bool used;
-    VirtualOp op;
-    uint16_t port;
-    DWORD last_report;
-    unsigned long folded;
-};
-VirtualRepeat g_virtual_repeats[kVirtualRepeatSlots];
-SRWLOCK g_virtual_lock = SRWLOCK_INIT;
+// Sixteen operations across two ports is exactly one bit each, so "this answer has already
+// been reported" is a bitmask rather than a table, and reading it needs no lock: the poll
+// loop that triggers this runs at about 1 kHz and must not serialise on a logger it is not
+// writing to.
+static_assert(static_cast<size_t>(VirtualOp::enum_events) + 1 <= 16,
+    "each virtualised operation needs one bit per port");
+volatile LONG g_virtual_reported;
 
-// True when this call is the one to report; `folded` receives how many calls since the
-// previous report are being accounted for by it.
-bool virtual_report_due(VirtualOp op, uint16_t port, unsigned long *folded) {
-    *folded = 0;
-    const DWORD now = GetTickCount();
-    AcquireSRWLockExclusive(&g_virtual_lock);
-    VirtualRepeat *entry = nullptr;
-    VirtualRepeat *free_slot = nullptr;
-    for (VirtualRepeat &candidate : g_virtual_repeats) {
-        if (candidate.used && candidate.op == op && candidate.port == port) {
-            entry = &candidate;
-            break;
-        }
-        if (!candidate.used && free_slot == nullptr) free_slot = &candidate;
-    }
-    if (entry == nullptr) {
-        // A full table (more op/port pairs than slots) is not a reason to go silent: an
-        // unreported virtual call is the one kind of line this log exists for.
-        if (free_slot != nullptr) {
-            free_slot->used = true;
-            free_slot->op = op;
-            free_slot->port = port;
-            free_slot->last_report = now;
-            free_slot->folded = 0;
-        }
-        ReleaseSRWLockExclusive(&g_virtual_lock);
-        return true;
-    }
-    if (now - entry->last_report >= kVirtualRepeatIntervalMs) {
-        *folded = entry->folded;
-        entry->folded = 0;
-        entry->last_report = now;
-        ReleaseSRWLockExclusive(&g_virtual_lock);
-        return true;
-    }
-    ++entry->folded;
-    ReleaseSRWLockExclusive(&g_virtual_lock);
-    return false;
+// True the first time a given operation/port pair is seen, false forever after.
+bool virtual_first(VirtualOp op, uint16_t port) {
+    const size_t bit = static_cast<size_t>(op) + (port == kLanSyncPort ? 0 : 16);
+    const LONG mask = static_cast<LONG>(1u << bit);
+    return (InterlockedOr(&g_virtual_reported, mask) & mask) == 0;
 }
 
 // One concise line per virtualised port, at the moment the game first relies on it. The
@@ -623,20 +592,20 @@ void virtual_announce(uint16_t port) {
     }
 }
 
+// One line per operation and port, for the life of the process. Everything after it is the
+// same answer, so it is counted into the socket's CLOSE line instead of being printed.
 void virtual_report(VirtualOp op, uint16_t port, const char *format, ...) {
-    unsigned long folded = 0;
-    if (!virtual_report_due(op, port, &folded)) return;
+    if (!virtual_first(op, port)) return;
     char detail[320] = {};
     va_list args;
     va_start(args, format);
     _vsnprintf_s(detail, sizeof(detail), _TRUNCATE, format, args);
     va_end(args);
-    if (folded != 0) {
-        log_line("LAN_VIRT", "op=%s port=%u result=%s folded=%lu",
-            virtual_op_name(op), port, detail, folded);
-    } else {
-        log_line("LAN_VIRT", "op=%s port=%u result=%s", virtual_op_name(op), port, detail);
-    }
+    log_line("LAN_VIRT", "op=%s port=%u result=%s", virtual_op_name(op), port, detail);
+}
+
+void virtual_call(SocketState *state) {
+    if (state != nullptr) ++state->virtual_calls;
 }
 
 void save_address(SocketState *state, const sockaddr *address, int length, bool remote) {
@@ -1434,6 +1403,7 @@ int WSAAPI hook_bind(SOCKET s, const sockaddr *name, int namelen) {
         if (state) { state->virtual_lan_port = port; save_address(state, name, namelen, false); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
         virtual_announce(port);
+        virtual_call(state);
         virtual_report(VirtualOp::bind, port, "accepted local=%s", requested);
         return 0;
     }
@@ -1447,6 +1417,7 @@ int WSAAPI hook_listen(SOCKET s, int backlog) {
     SocketState *state = state_for(s, false);
     const uint16_t port = state != nullptr ? state_port(state) : 0;
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanSyncPort) {
+        virtual_call(state);
         virtual_report(VirtualOp::listen, kLanSyncPort, "accepted backlog=%d", backlog);
         return 0;
     }
@@ -1466,6 +1437,7 @@ int WSAAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
         SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; save_address(st, name, namelen, true); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
         virtual_announce(port);
+        virtual_call(st);
         virtual_report(VirtualOp::connect, port, "connected target=%s", requested);
         return 0;
     }
@@ -1485,6 +1457,7 @@ SOCKET WSAAPI hook_accept(SOCKET s, sockaddr *addr, int *len) {
     SocketState *listener = state_for(s, false);
     if (g_config.lan_install_enable && listener && listener->virtual_lan_port == kLanSyncPort) {
         WSASetLastError(WSAEWOULDBLOCK);
+        virtual_call(listener);
         virtual_report(VirtualOp::accept, kLanSyncPort, "would_block error=%d/%s",
             WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return INVALID_SOCKET;
@@ -1509,6 +1482,7 @@ int WSAAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanSyncPort) {
         if (len > 0) state->virtual_tx_bytes += (uint64_t)len;
+        virtual_call(state);
         virtual_report(VirtualOp::send, kLanSyncPort, "sent bytes=%d", len);
         return len;
     }
@@ -1526,6 +1500,7 @@ int WSAAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && lan_install_port(state->virtual_lan_port)) {
         WSASetLastError(WSAEWOULDBLOCK);
+        virtual_call(state);
         virtual_report(VirtualOp::recv, state->virtual_lan_port, "would_block error=%d/%s",
             WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return SOCKET_ERROR;
@@ -1549,6 +1524,7 @@ int WSAAPI hook_sendto(SOCKET s, const char *buf, int len, int flags, const sock
             if (len > 0) state->virtual_tx_bytes += (uint64_t)len;
         }
         virtual_announce(port);
+        virtual_call(state);
         virtual_report(VirtualOp::sendto, port, "sent bytes=%d", len);
         return len;
     }
@@ -1577,6 +1553,7 @@ int WSAAPI hook_recvfrom(SOCKET s, char *buf, int len, int flags, sockaddr *from
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanBeaconPort) {
         WSASetLastError(WSAEWOULDBLOCK);
+        virtual_call(state);
         virtual_report(VirtualOp::recvfrom, kLanBeaconPort, "would_block error=%d/%s",
             WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return SOCKET_ERROR;
@@ -1656,6 +1633,7 @@ int WSAAPI hook_wsaconnect(SOCKET s, const sockaddr *name, int namelen, LPWSABUF
         SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; save_address(st, name, namelen, true); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
         virtual_announce(port);
+        virtual_call(st);
         virtual_report(VirtualOp::wsa_connect, port, "connected target=%s", requested);
         return 0;
     }
@@ -1685,6 +1663,7 @@ int WSAAPI hook_wsasendto(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent,
             state->virtual_tx_bytes += bytes;
         }
         virtual_announce(port);
+        virtual_call(state);
         virtual_report(VirtualOp::wsa_sendto, port, "sent bytes=%lu", (unsigned long)bytes);
         return 0;
     }
@@ -1723,6 +1702,7 @@ int WSAAPI hook_wsarecvfrom(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD rec
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanBeaconPort) {
         if (received) *received = 0;
         WSASetLastError(WSAEWOULDBLOCK);
+        virtual_call(state);
         virtual_report(VirtualOp::wsa_recvfrom, kLanBeaconPort, "would_block error=%d/%s",
             WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return SOCKET_ERROR;
@@ -1749,6 +1729,7 @@ int WSAAPI hook_wsasend(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent, D
         const DWORD bytes = buffers && count ? buffers[0].len : 0;
         if (sent) *sent = bytes;
         state->virtual_tx_bytes += bytes;
+        virtual_call(state);
         virtual_report(VirtualOp::wsa_send, kLanSyncPort, "sent bytes=%lu", (unsigned long)bytes);
         return 0;
     }
@@ -1772,6 +1753,7 @@ int WSAAPI hook_wsarecv(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD receive
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanSyncPort) {
         if (received) *received = 0;
         WSASetLastError(WSAEWOULDBLOCK);
+        virtual_call(state);
         virtual_report(VirtualOp::wsa_recv, kLanSyncPort, "would_block error=%d/%s",
             WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return SOCKET_ERROR;
@@ -1793,6 +1775,7 @@ int WSAAPI hook_wsarecv(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD receive
 int WSAAPI hook_wsaeventselect(SOCKET s, WSAEVENT event, long network_events) {
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && lan_install_port(state->virtual_lan_port)) {
+        virtual_call(state);
         virtual_report(VirtualOp::event_select, state->virtual_lan_port,
             "accepted events=0x%lX", network_events);
         return 0;
@@ -1806,6 +1789,7 @@ int WSAAPI hook_wsaenumnetworkevents(SOCKET s, WSAEVENT event, LPWSANETWORKEVENT
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && lan_install_port(state->virtual_lan_port)) {
         if (network_events) memset(network_events, 0, sizeof(*network_events));
+        virtual_call(state);
         virtual_report(VirtualOp::enum_events, state->virtual_lan_port, "no_events");
         return 0;
     }
@@ -1818,6 +1802,7 @@ SOCKET WSAAPI hook_wsaaccept(SOCKET s, sockaddr *addr, LPINT len, LPCONDITIONPRO
     SocketState *listener = state_for(s, false);
     if (g_config.lan_install_enable && listener && listener->virtual_lan_port == kLanSyncPort) {
         WSASetLastError(WSAEWOULDBLOCK);
+        virtual_call(listener);
         virtual_report(VirtualOp::wsa_accept, kLanSyncPort, "would_block error=%d/%s",
             WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return INVALID_SOCKET;
@@ -1841,10 +1826,10 @@ int WSAAPI hook_closesocket(SOCKET s) {
     SocketState *state = state_for(s, false);
     if (state && relevant(state_port(state))) {
         log_line("CLOSE", "socket=%llu service=%s tx_bytes=%llu rx_bytes=%llu "
-            "virtual_tx_bytes=%llu",
+            "virtual_tx_bytes=%llu virtual_calls=%lu",
             (unsigned long long)(uintptr_t)s, service(state_port(state)),
             (unsigned long long)state->tx_bytes, (unsigned long long)state->rx_bytes,
-            (unsigned long long)state->virtual_tx_bytes);
+            (unsigned long long)state->virtual_tx_bytes, state->virtual_calls);
     }
     int r = g_next_closesocket(s); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
     log_io("close", s, r, e, nullptr, 0, nullptr, 0);
