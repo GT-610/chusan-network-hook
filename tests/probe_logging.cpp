@@ -160,6 +160,37 @@ static int run_virtual_flood() {
         }
     }
 
+    // A total that cannot be expressed as a DWORD has to be refused, not wrapped: a wrapped
+    // count would report a truncated send as a successful one. The buffers are never read on
+    // the virtualised path, so the lengths may exceed the storage behind them.
+    {
+        char byte = 0;
+        WSABUF buffers[2] = {{0x80000000u, &byte}, {0x80000000u, &byte}};
+        DWORD sent = 12345;
+        WSASetLastError(0);
+        const int rc = WSASend(tcp, buffers, 2, &sent, 0, nullptr, nullptr);
+        const int error = WSAGetLastError();
+        if (rc != SOCKET_ERROR || error != WSAEMSGSIZE || sent != 0) {
+            closesocket(udp);
+            closesocket(tcp);
+            return fail_text("an oversized WSASend was not refused with WSAEMSGSIZE");
+        }
+    }
+    {
+        char byte = 0;
+        WSABUF buffers[2] = {{0x80000000u, &byte}, {0x80000000u, &byte}};
+        DWORD sent = 12345;
+        WSASetLastError(0);
+        const int rc = WSASendTo(udp, buffers, 2, &sent, 0,
+            reinterpret_cast<const sockaddr *>(&beacon), sizeof(beacon), nullptr, nullptr);
+        const int error = WSAGetLastError();
+        if (rc != SOCKET_ERROR || error != WSAEMSGSIZE || sent != 0) {
+            closesocket(udp);
+            closesocket(tcp);
+            return fail_text("an oversized WSASendTo was not refused with WSAEMSGSIZE");
+        }
+    }
+
     // SO_ERROR reads 0 on this socket because this DLL answered connect() itself. Nothing is
     // connected behind it, so it must not be announced as a reached peer.
     for (int i = 0; i < 5; ++i) {

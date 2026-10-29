@@ -292,11 +292,20 @@ void endpoint(const sockaddr *address, int length, char *out, size_t out_size) {
 // can be scattered over several buffers; the first one is not the message. The virtualised
 // paths need this because they return before the stack fills in `*sent`, and the byte count
 // they report has to describe what the caller asked to send.
-DWORD wsa_buffer_total(LPWSABUF buffers, DWORD count) {
-    if (buffers == nullptr) return 0;
-    DWORD total = 0;
-    for (DWORD i = 0; i < count; ++i) total += buffers[i].len;
-    return total;
+//
+// Accumulated wider than the result: a sum past DWORD_MAX cannot be returned by the API at
+// all, and wrapping it would hand the caller a truncated count that reads as a short, successful
+// write. Those calls are refused instead.
+bool wsa_buffer_total(LPWSABUF buffers, DWORD count, DWORD *total) {
+    *total = 0;
+    if (buffers == nullptr) return true;
+    unsigned long long sum = 0;
+    for (DWORD i = 0; i < count; ++i) {
+        sum += buffers[i].len;
+        if (sum > 0xFFFFFFFFull) return false;
+    }
+    *total = (DWORD)sum;
+    return true;
 }
 
 void hex_dump(const char *data, int length, char *out, size_t out_size) {
@@ -1687,7 +1696,13 @@ int WSAAPI hook_wsasendto(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent,
                           LPWSAOVERLAPPED_COMPLETION_ROUTINE completion) {
     const uint16_t port = port_of(to, tolen);
     if (g_config.lan_install_enable && port == kLanBeaconPort) {
-        const DWORD bytes = wsa_buffer_total(buffers, count);
+        DWORD bytes = 0;
+        if (!wsa_buffer_total(buffers, count, &bytes)) {
+            // Unrepresentable total: refuse it rather than report a truncated send.
+            if (sent) *sent = 0;
+            WSASetLastError(WSAEMSGSIZE);
+            return SOCKET_ERROR;
+        }
         if (sent) *sent = bytes;
         SocketState *state = state_for(s, true);
         if (state != nullptr) {
@@ -1758,7 +1773,13 @@ int WSAAPI hook_wsasend(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent, D
                         LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion) {
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanSyncPort) {
-        const DWORD bytes = wsa_buffer_total(buffers, count);
+        DWORD bytes = 0;
+        if (!wsa_buffer_total(buffers, count, &bytes)) {
+            // Unrepresentable total: refuse it rather than report a truncated send.
+            if (sent) *sent = 0;
+            WSASetLastError(WSAEMSGSIZE);
+            return SOCKET_ERROR;
+        }
         if (sent) *sent = bytes;
         state->virtual_tx_bytes += bytes;
         virtual_call(state);
