@@ -2382,12 +2382,15 @@ DWORD WINAPI initialize(void *) {
     bool lan = false;
     if (g_config.lan_install_enable && _stricmp(exe, "amdaemon.exe") == 0)
         lan = install_duplicate_server_hook(process);
+    // The same value the STATUS line prints. Reporting only "installed or not" here lost the
+    // difference between "this build does not need it", "the switch is off" and "it was
+    // asked for and did not take" - and the last one is the case a reader has to act on.
     if (_stricmp(exe, "amdaemon.exe") == 0)
         lan_hook_status = lan ? "installed" : (g_config.lan_install_enable ? "skipped_or_failed" : "disabled");
     notice_line("START", "process=%s architecture=x64 image_base=%p iat=%s hooked=%ld "
         "lan_duplicate_hook=%s ports=40110,40112,50200,50201,50202",
         exe, process, iat ? "installed" : "not_installed", iat_report.patched,
-        lan ? "installed" : "not_applicable_or_skipped");
+        lan_hook_status);
 #else
     notice_line("START", "process=%s architecture=x86 image_base=%p iat=%s hooked=%ld "
         "ports=40110,40112,50200,50201,50202 lan_duplicate_hook=not_available",
