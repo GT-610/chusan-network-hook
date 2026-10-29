@@ -245,6 +245,17 @@ static int run_real_connect() {
         }
     }
 
+    if (completed) {
+        // One more read, now that getpeername has confirmed the peer. The hook reports from
+        // inside this call, and its previous read may have landed while the socket was still
+        // connecting - when its own getpeername correctly refused to report. Without this the
+        // assertion would depend on which of the two won the race, not on the hook.
+        int so_error = -1;
+        int so_error_length = (int)sizeof(so_error);
+        (void)getsockopt(client, SOL_SOCKET, SO_ERROR,
+            reinterpret_cast<char *>(&so_error), &so_error_length);
+    }
+
     int result = 0;
     if (!completed) {
         result = fail_text("the non-blocking connect never completed");
