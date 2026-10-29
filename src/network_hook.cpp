@@ -288,6 +288,17 @@ void endpoint(const sockaddr *address, int length, char *out, size_t out_size) {
     _snprintf_s(out, out_size, _TRUNCATE, "af=%d", address->sa_family);
 }
 
+// Bytes across a WSABUF array. WSASend and WSASendTo take a count and an array, so a message
+// can be scattered over several buffers; the first one is not the message. The virtualised
+// paths need this because they return before the stack fills in `*sent`, and the byte count
+// they report has to describe what the caller asked to send.
+DWORD wsa_buffer_total(LPWSABUF buffers, DWORD count) {
+    if (buffers == nullptr) return 0;
+    DWORD total = 0;
+    for (DWORD i = 0; i < count; ++i) total += buffers[i].len;
+    return total;
+}
+
 void hex_dump(const char *data, int length, char *out, size_t out_size) {
     static const char digits[] = "0123456789ABCDEF";
     if (out_size == 0) return;
@@ -1676,7 +1687,7 @@ int WSAAPI hook_wsasendto(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent,
                           LPWSAOVERLAPPED_COMPLETION_ROUTINE completion) {
     const uint16_t port = port_of(to, tolen);
     if (g_config.lan_install_enable && port == kLanBeaconPort) {
-        const DWORD bytes = buffers && count ? buffers[0].len : 0;
+        const DWORD bytes = wsa_buffer_total(buffers, count);
         if (sent) *sent = bytes;
         SocketState *state = state_for(s, true);
         if (state != nullptr) {
@@ -1747,7 +1758,7 @@ int WSAAPI hook_wsasend(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent, D
                         LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion) {
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanSyncPort) {
-        const DWORD bytes = buffers && count ? buffers[0].len : 0;
+        const DWORD bytes = wsa_buffer_total(buffers, count);
         if (sent) *sent = bytes;
         state->virtual_tx_bytes += bytes;
         virtual_call(state);

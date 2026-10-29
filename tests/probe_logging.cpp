@@ -133,6 +133,33 @@ static int run_virtual_flood() {
             sizeof(beacon));
     }
 
+    // WSASend and WSASendTo take an array of buffers, so the byte count they report has to be
+    // the sum of the array rather than its first entry. These are the only calls of their
+    // kind in this child, so their lines can be asserted exactly: three 4-byte buffers are
+    // 12 bytes, two 5-byte buffers are 10.
+    {
+        char part[3][4] = {};
+        WSABUF buffers[3] = {{4, part[0]}, {4, part[1]}, {4, part[2]}};
+        DWORD sent = 0;
+        if (WSASend(tcp, buffers, 3, &sent, 0, nullptr, nullptr) != 0 || sent != 12) {
+            closesocket(udp);
+            closesocket(tcp);
+            return fail_text("virtual WSASend did not report the summed byte count");
+        }
+    }
+    {
+        char part[2][5] = {};
+        WSABUF buffers[2] = {{5, part[0]}, {5, part[1]}};
+        DWORD sent = 0;
+        if (WSASendTo(udp, buffers, 2, &sent, 0,
+                reinterpret_cast<const sockaddr *>(&beacon), sizeof(beacon), nullptr,
+                nullptr) != 0 || sent != 10) {
+            closesocket(udp);
+            closesocket(tcp);
+            return fail_text("virtual WSASendTo did not report the summed byte count");
+        }
+    }
+
     // SO_ERROR reads 0 on this socket because this DLL answered connect() itself. Nothing is
     // connected behind it, so it must not be announced as a reached peer.
     for (int i = 0; i < 5; ++i) {
@@ -151,6 +178,9 @@ static int run_virtual_flood() {
 // announced, and announced once - from connect() when it completes inline, or from the
 // SO_ERROR poll when it does not. Without this, tightening the guard could silently stop
 // reporting genuine peers and nothing would notice.
+//
+// Both ends are non-blocking. A probe that blocks in accept() on a connection it wrongly
+// believes exists does not fail, it hangs, and the parent's WaitForSingleObject never returns.
 static int run_real_connect() {
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listener == INVALID_SOCKET) return fail("party listener socket", WSAGetLastError());
@@ -168,13 +198,18 @@ static int run_real_connect() {
         closesocket(listener);
         return fail("party listener listen", error);
     }
+    u_long nonblocking = 1;
+    if (ioctlsocket(listener, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+        const DWORD error = WSAGetLastError();
+        closesocket(listener);
+        return fail("party listener non-blocking", error);
+    }
 
     SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (client == INVALID_SOCKET) {
         closesocket(listener);
         return fail("party client socket", WSAGetLastError());
     }
-    u_long nonblocking = 1;
     if (ioctlsocket(client, FIONBIO, &nonblocking) == SOCKET_ERROR) {
         const DWORD error = WSAGetLastError();
         closesocket(client);
@@ -197,9 +232,15 @@ static int run_real_connect() {
             if (getsockopt(client, SOL_SOCKET, SO_ERROR,
                     reinterpret_cast<char *>(&so_error), &so_error_length) == 0 &&
                 so_error == 0) {
-                completed = true;
-                break;
+                // SO_ERROR == 0 says the connect attempt has finished, not that a peer is
+                // there. The connection is confirmed the way the hook confirms it: with
+                // getpeername, which only answers on a socket that is really connected.
+                sockaddr_storage peer = {};
+                int peer_length = (int)sizeof(peer);
+                completed = getpeername(client, reinterpret_cast<sockaddr *>(&peer),
+                    &peer_length) == 0;
             }
+            if (completed) break;
             Sleep(5);
         }
     }
@@ -208,9 +249,20 @@ static int run_real_connect() {
     if (!completed) {
         result = fail_text("the non-blocking connect never completed");
     } else {
-        const SOCKET accepted = accept(listener, nullptr, nullptr);
-        if (accepted == INVALID_SOCKET) result = fail("party accept", WSAGetLastError());
-        else closesocket(accepted);
+        // Non-blocking, with a bound: a connection that is not in the queue must fail this
+        // probe rather than park it.
+        SOCKET accepted = INVALID_SOCKET;
+        for (int i = 0; i < 200; ++i) {
+            accepted = accept(listener, nullptr, nullptr);
+            if (accepted != INVALID_SOCKET) break;
+            if (WSAGetLastError() != WSAEWOULDBLOCK) break;
+            Sleep(5);
+        }
+        if (accepted == INVALID_SOCKET) {
+            result = fail("party accept", WSAGetLastError());
+        } else {
+            closesocket(accepted);
+        }
     }
     closesocket(client);
     closesocket(listener);
@@ -479,6 +531,15 @@ static int check_flood(const char *log) {
             "repeats were dropped rather than counted\n", virtual_calls);
         return 1;
     }
+    // The summed WSABUF counts: a scattered send has to be reported as one total.
+    if (count_text(log, "op=WSASend port=40110 result=sent bytes=12") != 1) {
+        fputs("FAIL: virtual WSASend did not report 12 bytes for three 4-byte buffers\n", stderr);
+        return 1;
+    }
+    if (count_text(log, "op=WSASendTo port=40112 result=sent bytes=10") != 1) {
+        fputs("FAIL: virtual WSASendTo did not report 10 bytes for two 5-byte buffers\n", stderr);
+        return 1;
+    }
     // The SO_ERROR path has two directions, and both are asserted here: a real non-blocking
     // connection is announced exactly once, and a virtualised socket whose connect this DLL
     // faked is never announced at all.
@@ -620,14 +681,20 @@ int wmain(int argc, wchar_t **argv) {
     failures += child_failures;
 
     if (concise == nullptr) {
-        if (child_failures == 0) fputs("FAIL: detailed=0 left no log file at all\n", stderr);
-        ++failures;
+        // A child that already failed has said why; this only covers "the child passed but
+        // left no log", which is a separate defect.
+        if (child_failures == 0) {
+            fputs("FAIL: detailed=0 left no log file at all\n", stderr);
+            ++failures;
+        }
     } else if (check_concise(concise) != 0) {
         ++failures;
     }
     if (detail == nullptr) {
-        if (child_failures == 0) fputs("FAIL: detailed=1 left no log file\n", stderr);
-        ++failures;
+        if (child_failures == 0) {
+            fputs("FAIL: detailed=1 left no log file\n", stderr);
+            ++failures;
+        }
     } else if (check_flood(detail) != 0) {
         ++failures;
     }
