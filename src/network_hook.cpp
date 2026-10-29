@@ -1503,8 +1503,12 @@ int WSAAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
     refresh_addresses(st);
     log_io("connect", s, r, e, name, namelen, nullptr, 0);
     if (r == 0) report_peer(st, port, false);
-    if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS && e != WSAEALREADY)
-        notice_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), e, wsa_name(e));
+    // Only a port this hook pins is its business. A failure elsewhere - the game server, a
+    // web call - is the game's own to report, and here it would print as "OTHER".
+    if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS &&
+        e != WSAEALREADY && relevant(port))
+        notice_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), e,
+            wsa_name(e));
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1699,8 +1703,12 @@ int WSAAPI hook_wsaconnect(SOCKET s, const sockaddr *name, int namelen, LPWSABUF
     refresh_addresses(st);
     log_io("WSAConnect", s, r, e, name, namelen, nullptr, 0);
     if (r == 0) report_peer(st, port, false);
-    if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS && e != WSAEALREADY)
-        notice_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), e, wsa_name(e));
+    // Only a port this hook pins is its business. A failure elsewhere - the game server, a
+    // web call - is the game's own to report, and here it would print as "OTHER".
+    if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS &&
+        e != WSAEALREADY && relevant(port))
+        notice_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), e,
+            wsa_name(e));
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 

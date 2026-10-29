@@ -377,6 +377,35 @@ static int run_mixed_udp_socket() {
     return 0;
 }
 
+// A refused connection is worth a resolution only when the port is one this hook pins.
+// Failing to reach anything else - the game server, a web call - is the game's own business,
+// and reporting it here would print as "OTHER" in the concise stream.
+static int run_failed_connects() {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        SOCKET refused = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (refused == INVALID_SOCKET) return fail("refused-connect socket", WSAGetLastError());
+        sockaddr_in to = {};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(65000);
+        to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        (void)connect(refused, reinterpret_cast<const sockaddr *>(&to), sizeof(to));
+        closesocket(refused);
+    }
+
+    // The same on a port this hook pins. This one is only here so the assertion below can tell
+    // "gated" from "silenced": if something happens to be listening, the connect succeeds and
+    // no notice is expected either.
+    SOCKET setting = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (setting == INVALID_SOCKET) return fail("setting-connect socket", WSAGetLastError());
+    sockaddr_in to = {};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(50201);
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    (void)connect(setting, reinterpret_cast<const sockaddr *>(&to), sizeof(to));
+    closesocket(setting);
+    return 0;
+}
+
 // Reads this run's log into a heap buffer, or returns null when it does not exist yet.
 // Defined with the other log helpers below; the child needs it before then.
 static char *read_log(const wchar_t *directory);
@@ -416,6 +445,7 @@ static int run_case(const wchar_t *dll, bool detailed) {
         result = run_virtual_flood();
         if (result == 0) result = run_real_connect();
         if (result == 0) result = run_mixed_udp_socket();
+        if (result == 0) result = run_failed_connects();
     } else if (!wait_for_startup_log(dll, 10)) {
         result = fail_text("no STATUS/CONFIG line reached the log file within 10s");
     }
@@ -638,6 +668,16 @@ static int check_flood(const char *log) {
         fprintf(stderr,
             "FAIL: the busiest socket recorded only %llu answered calls, out of 5015; the "
             "repeats were dropped rather than counted\n", virtual_calls);
+        return 1;
+    }
+    // A refused connection outside this hook's ports stays out of the concise stream; the one
+    // on a port it pins is allowed, at most once, and only if nothing was listening there.
+    if (count_text(log, "OTHER TCP connection") != 0) {
+        fputs("FAIL: a failed connection on a port this hook does not pin was reported\n", stderr);
+        return 1;
+    }
+    if (count_text(log, "SETTING TCP connection to the peer failed") > 1) {
+        fputs("FAIL: the same refused connection was reported more than once\n", stderr);
         return 1;
     }
     // The summed WSABUF counts: a scattered send has to be reported as one total.
