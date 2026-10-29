@@ -236,8 +236,8 @@ with the fix. Notable checks:
   prologue is verified.
 
 Because every one of those answers is produced here, a caller that polls the port gets the
-same answer on every poll, and the log says it once per operation and port. The number of
-calls is counted on the socket and printed by its `CLOSE` line, so a poll loop shows up as a
+same answer on every poll, and the detailed log says it once per operation and port. The number
+of calls is counted on the socket and printed by its `CLOSE` line, so a poll loop shows up as a
 volume instead of one line per millisecond (see [Logging](#logging)).
 
 Set `enable=0` to pass real 40110/40112 traffic through WinSock. The duplicate-server patch
@@ -254,11 +254,11 @@ Two levels, because they answer different questions.
 **`detailed=0` — concise — is the session record.** It states what this DLL is and what it
 decided: the `STATUS` line, `START` and `CONFIG` (which process, whether the hooks installed,
 the settings this run actually used), which interface carries the LAN, whether LAN Install is
-virtualised, where the log file is, and every event that changes what the game will do next —
-a LAN listener opening, a peer being reached, a broadcast or connection failing with the fix.
-A normal session is a handful of lines. Concise means "do not drown me", not "tell me
-nothing": `chusanApp.exe` has no console, so a quiet level that omitted these facts left
-nothing to read anywhere.
+virtualised, the log file path (when `writeFile=1` and the file opened), and every event that
+changes what the game will do next — a LAN listener opening, a peer being reached, a broadcast
+or connection failing with the fix. A normal session is a handful of lines. Concise means "do
+not drown me", not "tell me nothing": `chusanApp.exe` has no console, so a quiet level that
+omitted these facts left nothing to read anywhere.
 
 **`detailed=1` adds the diagnostic stream**: every hook installation and its coverage, adapter
 tables, route lookups, socket lifecycle, endpoints, byte counters, hexadecimal payload
@@ -270,13 +270,13 @@ and `OutputDebugStringA`. No log file is created in that mode, whatever `writeFi
 line exists to prove the DLL loaded when nothing else appears, and a console or a debugger is
 where it gets read.
 
-Repeated virtualised calls are reported once, not once per call. `[lanInstall] enable=1`
-makes `amdaemon`'s LAN Install polling loop — about one poll per millisecond — hit this DLL
-instead of the stack, and every poll of a given operation gets the identical answer, so the
-first one is logged and the rest say nothing. The count is not lost: it is carried on the
-socket's own `CLOSE` line (`virtual_calls=`, with the bytes it carried in
-`virtual_tx_bytes=`), so a poll loop costs a constant handful of lines no matter how long the
-session runs.
+At `detailed=1`, repeated virtualised calls are reported once, not once per call.
+`[lanInstall] enable=1` makes `amdaemon`'s LAN Install polling loop — about one poll per
+millisecond — hit this DLL instead of the stack, and every poll of a given operation gets the
+identical answer, so the first one is logged and the rest say nothing. The count is not lost:
+it is carried on the socket's own `CLOSE` line (`virtual_calls=`, with the bytes it carried in
+`virtual_tx_bytes=`). Both of those are detail lines, so none of this appears at `detailed=0`,
+where a virtualised poll loop costs nothing at all.
 
 With `enable=1`, `writeFile=1` writes the same output, `STATUS` included, to:
 

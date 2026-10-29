@@ -1976,16 +1976,19 @@ InstallReport install_hook_table(HMODULE module, const char *dll_a, const char *
                             "%s%s", patched_names[0] ? ", " : "", hook.name);
                     }
                 } else {
-                    // Never silent: a slot left unpatched means every call through
-                    // it bypasses the hook and is invisible in the log.
+                    // Never silent, at either level: a slot left unpatched means every call
+                    // through it bypasses the hook, and the default level is the one most
+                    // sessions run at. Reporting this only in the detailed stream would hide
+                    // a hole in the coverage exactly when nobody is looking for one.
                     const DWORD protect_error = GetLastError();
                     ++report.failed;
                     if (quiet)
                         defer_line("[%s] could not patch %s (%p): error %lu", tag, hook.name,
                             (void *)slot, protect_error);
                     else
-                        log_line("IAT", "patch_failed table=%s function=%s slot=%p error=%lu/%s",
-                            tag, hook.name, (void *)slot, protect_error, "WIN32_ERROR");
+                        notice_line("ERROR", "Could not patch %s!%s (%p): error %lu. Calls "
+                            "through it bypass the hook.", tag, hook.name, (void *)slot,
+                            protect_error);
                 }
                 break;
             }
@@ -2410,9 +2413,11 @@ DWORD WINAPI initialize(void *) {
         g_config.lan_install_enable ? 1 : 0, g_config.log_enable ? 1 : 0,
         g_config.log_detailed ? 1 : 0, g_config.log_write_file ? 1 : 0);
 
-    // Where the log is. Stated at notice level because "the game misbehaved, send me the
-    // log" is the first thing that goes wrong when nobody knows the file exists.
-    if (g_config.log_write_file) {
+    // Where the log is, once it is really open. Stated at notice level because "the game
+    // misbehaved, send me the log" is the first thing that goes wrong when nobody knows the
+    // file exists - and withheld when the handle is invalid, which would contradict the ERROR
+    // above it and send a reader looking for a file that was never created.
+    if (g_config.log_write_file && g_log_file != INVALID_HANDLE_VALUE) {
         char log_path[MAX_PATH * 2] = {};
         wide_to_utf8(g_log_path, log_path, sizeof(log_path));
         notice_line("INFO", "Writing this log to %s.", log_path);
