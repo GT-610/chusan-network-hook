@@ -21,6 +21,14 @@
 
 namespace {
 
+// The socket option Winsock documents but the SDK headers do not export: seconds since the
+// connection was established, or 0xFFFFFFFF when the socket is not connected. It is the only
+// way to tell a completed non-blocking connect from one still pending (see
+// report_connect_complete for the measurement).
+#ifndef SO_CONNECT_TIME
+#define SO_CONNECT_TIME 0x700C
+#endif
+
 // LAN Install virtualization is intentionally socketless at the network boundary:
 // the original bind/listen/connect/send/recv calls for ports 40110/40112 are not
 // forwarded to Winsock. The valid return values only keep amdaemon's state machine
@@ -136,6 +144,10 @@ struct SocketState {
     // Set once a peer result has been reported at notice level, so a non-blocking connect
     // (whose outcome only appears through SO_ERROR, which is polled) is announced once.
     bool peer_reported;
+    // Set once a connection failure has been announced. A blocking connect fails inside
+    // connect(); a non-blocking one reports "pending" and only reveals the failure through
+    // SO_ERROR later, and both must add up to a single line.
+    bool connect_failure_reported;
     uint64_t tx_bytes;
     uint64_t rx_bytes;
     // Bytes the game tried to send through a virtualised port. Kept apart from tx_bytes,
@@ -761,6 +773,12 @@ void report_peer(SocketState *state, uint16_t port, bool accepted) {
 // assumed: a stream socket with a peer name has a connection behind it. The peer address is
 // only recorded once that check passes, so a broken socket cannot leave a stale endpoint
 // behind for later lines.
+//
+// getpeername alone is not that check. On this platform it answers for a socket whose
+// non-blocking connect is still pending - measured: connect to a closed loopback port returns
+// WSAEWOULDBLOCK, SO_ERROR stays 0, getpeername succeeds, and SO_CONNECT_TIME stays
+// 0xFFFFFFFF. SO_CONNECT_TIME is the one option that distinguishes the two, so it decides
+// whether anything is announced.
 void report_connect_complete(SOCKET socket) {
     SocketState *state = state_for(socket, false);
     if (state == nullptr || state->virtual_lan_port != 0) return;
@@ -770,11 +788,27 @@ void report_connect_complete(SOCKET socket) {
     if (g_next_getsockopt(socket, SOL_SOCKET, SO_TYPE,
             reinterpret_cast<char *>(&type), &type_length) == SOCKET_ERROR) return;
     if (type != SOCK_STREAM) return;
+    int connected_seconds = 0;
+    int connected_length = (int)sizeof(connected_seconds);
+    if (g_next_getsockopt(socket, SOL_SOCKET, SO_CONNECT_TIME,
+            reinterpret_cast<char *>(&connected_seconds), &connected_length) == SOCKET_ERROR) return;
+    if (connected_seconds == -1) return; // 0xFFFFFFFF: the connect has not completed
     sockaddr_storage peer = {};
     int peer_length = (int)sizeof(peer);
     if (getpeername(socket, reinterpret_cast<sockaddr *>(&peer), &peer_length) != 0) return;
     save_address(state, reinterpret_cast<const sockaddr *>(&peer), peer_length, true);
     report_peer(state, state_port(state), false);
+}
+
+// The other half of the same outcome: a connection that did not come up. A blocking connect
+// fails inside connect(); a non-blocking one returns "pending" there and only reveals the
+// failure on a later SO_ERROR read, where nothing else would have reported it. Both paths call
+// this, and the per-socket flag means the two can never say it twice.
+void report_connect_failure(SocketState *state, uint16_t port, int error) {
+    if (state == nullptr || !relevant(port) || state->connect_failure_reported) return;
+    state->connect_failure_reported = true;
+    notice_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), error,
+        wsa_name(error));
 }
 
 void wide_to_utf8(const wchar_t *input, char *output, size_t output_size) {
@@ -1503,12 +1537,10 @@ int WSAAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
     refresh_addresses(st);
     log_io("connect", s, r, e, name, namelen, nullptr, 0);
     if (r == 0) report_peer(st, port, false);
-    // Only a port this hook pins is its business. A failure elsewhere - the game server, a
-    // web call - is the game's own to report, and here it would print as "OTHER".
+    // Only a port this hook pins is its business; report_connect_failure filters the rest.
     if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS &&
-        e != WSAEALREADY && relevant(port))
-        notice_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), e,
-            wsa_name(e));
+        e != WSAEALREADY)
+        report_connect_failure(st, port, e);
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1645,9 +1677,16 @@ int WSAAPI hook_getsockopt(SOCKET s, int level, int optname, char *value, int *l
     if (level == SOL_SOCKET && optname == SO_ERROR) {
         int so_error = (r == 0 && value && len && *len >= (int)sizeof(int)) ? *reinterpret_cast<int *>(value) : -1;
         log_io("getsockopt", s, so_error, e, nullptr, 0, nullptr, 0);
-        // Once per socket: SO_ERROR is polled, and report_connect_complete checks that the
-        // socket really has a peer before anything is announced.
-        if (r == 0 && so_error == 0) report_connect_complete(s);
+        // SO_ERROR is polled, so both outcomes are guarded per socket: report_connect_complete
+        // checks that a peer is really there before announcing success, and
+        // report_connect_failure announces a terminal error once. A zero error on a socket
+        // that is still connecting is neither, so the pending case stays silent here.
+        if (r == 0 && so_error == 0) {
+            report_connect_complete(s);
+        } else if (r == 0 && so_error > 0) {
+            SocketState *state = state_for(s, false);
+            if (state != nullptr) report_connect_failure(state, state_port(state), so_error);
+        }
     }
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
@@ -1703,12 +1742,10 @@ int WSAAPI hook_wsaconnect(SOCKET s, const sockaddr *name, int namelen, LPWSABUF
     refresh_addresses(st);
     log_io("WSAConnect", s, r, e, name, namelen, nullptr, 0);
     if (r == 0) report_peer(st, port, false);
-    // Only a port this hook pins is its business. A failure elsewhere - the game server, a
-    // web call - is the game's own to report, and here it would print as "OTHER".
+    // Only a port this hook pins is its business; report_connect_failure filters the rest.
     if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS &&
-        e != WSAEALREADY && relevant(port))
-        notice_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), e,
-            wsa_name(e));
+        e != WSAEALREADY)
+        report_connect_failure(st, port, e);
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 

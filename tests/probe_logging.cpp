@@ -33,6 +33,13 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
+// Not in the SDK headers, but the only option that answers "is this socket connected" for a
+// non-blocking connect in progress. Measured: SO_ERROR stays 0 and getpeername succeeds while
+// the connect is still pending, so neither can be used for it.
+#ifndef SO_CONNECT_TIME
+#define SO_CONNECT_TIME 0x700C
+#endif
+
 static int fail(const char *what, DWORD error) {
     fprintf(stderr, "FAIL: %s (%lu)\n", what, error);
     return 1;
@@ -377,10 +384,68 @@ static int run_mixed_udp_socket() {
     return 0;
 }
 
+// The directory a file lives in, which is where the hook puts its log and where this probe
+// leaves notes for the parent.
+static bool directory_of(const wchar_t *path, wchar_t *out, size_t count) {
+    if (swprintf_s(out, count, L"%s", path) < 0) return false;
+    wchar_t *separator = wcsrchr(out, L'\\');
+    if (separator == nullptr) return false;
+    *separator = L'\0';
+    return true;
+}
+
+static void write_note(const wchar_t *directory, const char *text) {
+    wchar_t path[MAX_PATH] = {};
+    if (swprintf_s(path, L"%s\\probe_notes.txt", directory) < 0) return;
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(file, text, (DWORD)strlen(text), &written, nullptr);
+    CloseHandle(file);
+}
+
+// What the child observed, so the parent can tell "the notice was correctly not printed" from
+// "the notice should have been printed and was not" without guessing.
+struct ConnectNotes {
+    bool present;
+    bool setting_refused;
+    bool advertise_refused;
+    // SO_CONNECT_TIME said the non-blocking connection was up. The log must then carry one
+    // "connected" line and no failure line; when it never came up, neither may appear.
+    bool advertise_connected;
+};
+
+static ConnectNotes read_notes(const wchar_t *directory) {
+    ConnectNotes notes = {};
+    wchar_t path[MAX_PATH] = {};
+    if (swprintf_s(path, L"%s\\probe_notes.txt", directory) < 0) return notes;
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return notes;
+    char text[128] = {};
+    DWORD read = 0;
+    const bool ok = ReadFile(file, text, sizeof(text) - 1, &read, nullptr) != 0;
+    CloseHandle(file);
+    if (!ok) return notes;
+    notes.present = true;
+    notes.setting_refused = strstr(text, "setting=1") != nullptr;
+    notes.advertise_refused = strstr(text, "advertise=1") != nullptr;
+    notes.advertise_connected = strstr(text, "advertise_connected=1") != nullptr;
+    return notes;
+}
+
 // A refused connection is worth a resolution only when the port is one this hook pins.
 // Failing to reach anything else - the game server, a web call - is the game's own business,
 // and reporting it here would print as "OTHER" in the concise stream.
-static int run_failed_connects() {
+//
+// Three connections, all to loopback addresses nothing listens on:
+//   65000  unmanaged, so neither failure may be reported;
+//   50201  managed and blocking, so connect() itself sees the refusal;
+//   50202  managed and non-blocking, so connect() says "pending" and the failure only shows up
+//          on the SO_ERROR polls - which are made several times over to prove the notice is
+//          printed once and not once per poll.
+static int run_failed_connects(const wchar_t *dll) {
     for (int attempt = 0; attempt < 2; ++attempt) {
         SOCKET refused = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (refused == INVALID_SOCKET) return fail("refused-connect socket", WSAGetLastError());
@@ -392,17 +457,71 @@ static int run_failed_connects() {
         closesocket(refused);
     }
 
-    // The same on a port this hook pins. This one is only here so the assertion below can tell
-    // "gated" from "silenced": if something happens to be listening, the connect succeeds and
-    // no notice is expected either.
-    SOCKET setting = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (setting == INVALID_SOCKET) return fail("setting-connect socket", WSAGetLastError());
-    sockaddr_in to = {};
-    to.sin_family = AF_INET;
-    to.sin_port = htons(50201);
-    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    (void)connect(setting, reinterpret_cast<const sockaddr *>(&to), sizeof(to));
-    closesocket(setting);
+    bool setting_refused = false;
+    {
+        SOCKET setting = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (setting == INVALID_SOCKET) return fail("setting-connect socket", WSAGetLastError());
+        sockaddr_in to = {};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(50201);
+        to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        WSASetLastError(0);
+        if (connect(setting, reinterpret_cast<const sockaddr *>(&to), sizeof(to)) == SOCKET_ERROR &&
+            WSAGetLastError() == WSAECONNREFUSED) {
+            setting_refused = true;
+        }
+        closesocket(setting);
+    }
+
+    bool advertise_refused = false;
+    bool advertise_connected = false;
+    {
+        SOCKET pending = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (pending == INVALID_SOCKET) return fail("pending-connect socket", WSAGetLastError());
+        u_long nonblocking = 1;
+        if (ioctlsocket(pending, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+            const DWORD error = WSAGetLastError();
+            closesocket(pending);
+            return fail("pending-connect non-blocking", error);
+        }
+        sockaddr_in to = {};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(50202);
+        to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        WSASetLastError(0);
+        if (connect(pending, reinterpret_cast<const sockaddr *>(&to), sizeof(to)) == SOCKET_ERROR &&
+            WSAGetLastError() == WSAECONNREFUSED) {
+            advertise_refused = true;
+        }
+        for (int poll = 0; poll < 8; ++poll) {
+            int so_error = 0;
+            int so_error_length = (int)sizeof(so_error);
+            if (getsockopt(pending, SOL_SOCKET, SO_ERROR,
+                    reinterpret_cast<char *>(&so_error), &so_error_length) == 0 &&
+                so_error != 0) {
+                advertise_refused = true;
+            }
+            // The only option that distinguishes "connected" from "still connecting".
+            int connected_seconds = -1;
+            int connected_length = (int)sizeof(connected_seconds);
+            if (getsockopt(pending, SOL_SOCKET, SO_CONNECT_TIME,
+                    reinterpret_cast<char *>(&connected_seconds), &connected_length) == 0 &&
+                connected_seconds != -1) {
+                advertise_connected = true;
+            }
+            Sleep(5);
+        }
+        closesocket(pending);
+    }
+
+    wchar_t directory[MAX_PATH] = {};
+    if (directory_of(dll, directory, MAX_PATH)) {
+        char note[96] = {};
+        _snprintf_s(note, sizeof(note), _TRUNCATE,
+            "setting=%d\nadvertise=%d\nadvertise_connected=%d\n",
+            setting_refused ? 1 : 0, advertise_refused ? 1 : 0, advertise_connected ? 1 : 0);
+        write_note(directory, note);
+    }
     return 0;
 }
 
@@ -417,10 +536,7 @@ static char *read_log(const wchar_t *directory);
 // never arrive, which is itself the defect under test.
 static bool wait_for_startup_log(const wchar_t *dll, int seconds) {
     wchar_t directory[MAX_PATH] = {};
-    if (swprintf_s(directory, L"%s", dll) < 0) return false;
-    wchar_t *separator = wcsrchr(directory, L'\\');
-    if (separator == nullptr) return false;
-    *separator = L'\0';
+    if (!directory_of(dll, directory, MAX_PATH)) return false;
 
     const ULONGLONG deadline = GetTickCount64() + (ULONGLONG)seconds * 1000;
     for (;;) {
@@ -445,7 +561,7 @@ static int run_case(const wchar_t *dll, bool detailed) {
         result = run_virtual_flood();
         if (result == 0) result = run_real_connect();
         if (result == 0) result = run_mixed_udp_socket();
-        if (result == 0) result = run_failed_connects();
+        if (result == 0) result = run_failed_connects(dll);
     } else if (!wait_for_startup_log(dll, 10)) {
         result = fail_text("no STATUS/CONFIG line reached the log file within 10s");
     }
@@ -634,7 +750,7 @@ static unsigned long long max_virtual_calls(const char *log) {
     return largest;
 }
 
-static int check_flood(const char *log) {
+static int check_flood(const char *log, const ConnectNotes &notes) {
     const int virtual_lines = count_category(log, "LAN_VIRT");
     // One line per operation and port, for the life of the process. Each of these five pairs
     // is exercised thousands of times, so exactly one line each is the whole point - an
@@ -670,15 +786,44 @@ static int check_flood(const char *log) {
             "repeats were dropped rather than counted\n", virtual_calls);
         return 1;
     }
-    // A refused connection outside this hook's ports stays out of the concise stream; the one
-    // on a port it pins is allowed, at most once, and only if nothing was listening there.
+    // A refused connection outside this hook's ports stays out of the concise stream.
     if (count_text(log, "OTHER TCP connection") != 0) {
         fputs("FAIL: a failed connection on a port this hook does not pin was reported\n", stderr);
         return 1;
     }
-    if (count_text(log, "SETTING TCP connection to the peer failed") > 1) {
-        fputs("FAIL: the same refused connection was reported more than once\n", stderr);
-        return 1;
+    // Both halves of the same rule, now that the child has said what actually happened: a
+    // refusal on a pinned port is reported once and only once, whichever path saw it - the
+    // blocking connect, or the SO_ERROR poll behind a non-blocking one - and a connection that
+    // really came up is announced as a connection rather than as either a failure or a lie.
+    struct Expected {
+        const char *text;
+        bool observed;
+        const char *why;
+    };
+    const Expected expected[] = {
+        { "SETTING TCP connection to the peer failed", notes.setting_refused,
+          "a refused SETTING connection has to be reported" },
+        { "ADVERTISE TCP connection to the peer failed", notes.advertise_refused,
+          "a refused ADVERTISE connection has to be reported" },
+        { "ADVERTISE connected to", notes.advertise_connected,
+          "a connection that completed has to be announced" },
+    };
+    if (!notes.present) {
+        fputs("note: the child left no probe notes, so the connection counts were not checked\n",
+            stderr);
+    } else {
+        for (const Expected &item : expected) {
+            const int seen = count_text(log, item.text);
+            const int wanted = item.observed ? 1 : 0;
+            if (seen != wanted) {
+                fprintf(stderr, "FAIL: \"%s\" appears %d times, expected %d: %s\n",
+                    item.text, seen, wanted,
+                    item.observed ? item.why
+                                  : "the child did not observe that outcome, so nothing may be "
+                                    "reported for it");
+                return 1;
+            }
+        }
     }
     // The summed WSABUF counts: a scattered send has to be reported as one total.
     if (count_text(log, "op=WSASend port=40110 result=sent bytes=12") != 1) {
@@ -743,6 +888,7 @@ static void remove_case(const wchar_t *root, const wchar_t *name, const wchar_t 
     DeleteFileW(dll);
     wchar_t path[MAX_PATH] = {};
     if (swprintf_s(path, L"%s\\%s\\network_hook.ini", root, name) >= 0) DeleteFileW(path);
+    if (swprintf_s(path, L"%s\\%s\\probe_notes.txt", root, name) >= 0) DeleteFileW(path);
     if (swprintf_s(path, L"%s\\%s\\network_hook_logs", root, name) >= 0) {
         WIN32_FIND_DATAW entry = {};
         wchar_t pattern[MAX_PATH] = {};
@@ -844,8 +990,14 @@ int wmain(int argc, wchar_t **argv) {
             fputs("FAIL: detailed=1 left no log file\n", stderr);
             ++failures;
         }
-    } else if (check_flood(detail) != 0) {
-        ++failures;
+    } else {
+        // What the child saw on its three refused connections, so the counts below can be
+        // exact rather than "at most one".
+        wchar_t detail_directory[MAX_PATH] = {};
+        ConnectNotes notes = {};
+        if (swprintf_s(detail_directory, L"%s\\detail", root) >= 0)
+            notes = read_notes(detail_directory);
+        if (check_flood(detail, notes) != 0) ++failures;
     }
 
     free(concise);
