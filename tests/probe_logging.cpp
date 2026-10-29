@@ -311,6 +311,72 @@ static int run_real_connect() {
     return result;
 }
 
+// Sending one beacon must not turn a socket into a LAN Install socket. hook_recvfrom suppresses
+// receives on sockets bound to 40112, so if a send marked a shared socket the same way, every
+// later receive on it would return WSAEWOULDBLOCK - silent data loss for whatever else the
+// socket carries.
+static int run_mixed_udp_socket() {
+    SOCKET shared = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (shared == INVALID_SOCKET) return fail("shared udp socket", WSAGetLastError());
+
+    const char byte = 0;
+    sockaddr_in beacon = {};
+    beacon.sin_family = AF_INET;
+    beacon.sin_port = htons(40112);
+    beacon.sin_addr.s_addr = INADDR_BROADCAST;
+    if (sendto(shared, &byte, 1, 0, reinterpret_cast<const sockaddr *>(&beacon),
+            sizeof(beacon)) != 1) {
+        const DWORD error = WSAGetLastError();
+        closesocket(shared);
+        return fail("virtual beacon send on a shared socket", error);
+    }
+
+    sockaddr_in local = {};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local.sin_port = 0;
+    if (bind(shared, reinterpret_cast<const sockaddr *>(&local), sizeof(local)) == SOCKET_ERROR) {
+        const DWORD error = WSAGetLastError();
+        closesocket(shared);
+        return fail("shared socket bind", error);
+    }
+    int local_length = (int)sizeof(local);
+    if (getsockname(shared, reinterpret_cast<sockaddr *>(&local), &local_length) == SOCKET_ERROR) {
+        const DWORD error = WSAGetLastError();
+        closesocket(shared);
+        return fail("shared socket getsockname", error);
+    }
+    // Bounded receive, so a suppressed one fails instead of hanging the probe.
+    const DWORD timeout = 500;
+    setsockopt(shared, SOL_SOCKET, SO_RCVTIMEO,
+        reinterpret_cast<const char *>(&timeout), sizeof(timeout));
+
+    SOCKET peer = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (peer == INVALID_SOCKET) {
+        closesocket(shared);
+        return fail("shared socket peer", WSAGetLastError());
+    }
+    if (sendto(peer, "hi", 2, 0, reinterpret_cast<const sockaddr *>(&local),
+            local_length) != 2) {
+        const DWORD error = WSAGetLastError();
+        closesocket(peer);
+        closesocket(shared);
+        return fail("shared socket peer send", error);
+    }
+
+    char buffer[8] = {};
+    const int received = recvfrom(shared, buffer, (int)sizeof(buffer), 0, nullptr, nullptr);
+    const DWORD receive_error = WSAGetLastError();
+    closesocket(peer);
+    closesocket(shared);
+    if (received != 2 || memcmp(buffer, "hi", 2) != 0) {
+        fprintf(stderr, "FAIL: a socket that sent one beacon stopped receiving real traffic "
+            "(%d bytes, error %lu)\n", received, receive_error);
+        return 1;
+    }
+    return 0;
+}
+
 // Reads this run's log into a heap buffer, or returns null when it does not exist yet.
 // Defined with the other log helpers below; the child needs it before then.
 static char *read_log(const wchar_t *directory);
@@ -349,6 +415,7 @@ static int run_case(const wchar_t *dll, bool detailed) {
     if (detailed) {
         result = run_virtual_flood();
         if (result == 0) result = run_real_connect();
+        if (result == 0) result = run_mixed_udp_socket();
     } else if (!wait_for_startup_log(dll, 10)) {
         result = fail_text("no STATUS/CONFIG line reached the log file within 10s");
     }

@@ -125,6 +125,11 @@ struct SocketState {
     bool used;
     SOCKET socket;
     uint16_t virtual_lan_port;
+    // Set when a virtualised send was answered on this socket, for labelling only. Kept apart
+    // from virtual_lan_port on purpose: that one means "this socket exists to serve LAN
+    // Install", which is what suppresses receives on it. Sending one beacon does not make
+    // that true - the same socket can still carry real traffic to a real peer.
+    uint16_t virtual_send_port;
     bool broadcast_interface_configured;
     bool tcp_source_bound;
     bool route_logged;
@@ -691,7 +696,11 @@ uint16_t state_port(const SocketState *state) {
     if (state->virtual_lan_port != 0) return state->virtual_lan_port;
     uint16_t p = port_of(reinterpret_cast<const sockaddr *>(&state->local), state->local_length);
     if (relevant(p)) return p;
-    return port_of(reinterpret_cast<const sockaddr *>(&state->remote), state->remote_length);
+    p = port_of(reinterpret_cast<const sockaddr *>(&state->remote), state->remote_length);
+    if (relevant(p)) return p;
+    // Nothing on the socket identifies it - a beacon sender that never bound - so the port it
+    // last carried is what names it in the log.
+    return state->virtual_send_port;
 }
 
 void log_io(const char *op, SOCKET socket, int result, int error,
@@ -1566,7 +1575,7 @@ int WSAAPI hook_sendto(SOCKET s, const char *buf, int len, int flags, const sock
     if (g_config.lan_install_enable && port == kLanBeaconPort) {
         SocketState *state = state_for(s, true);
         if (state != nullptr) {
-            if (state->virtual_lan_port == 0) state->virtual_lan_port = port;
+            if (state->virtual_send_port == 0) state->virtual_send_port = port;
             if (len > 0) state->virtual_tx_bytes += (uint64_t)len;
         }
         virtual_announce(port);
@@ -1591,7 +1600,11 @@ int WSAAPI hook_sendto(SOCKET s, const char *buf, int len, int flags, const sock
             parse_datagram(state, "TX", reinterpret_cast<const unsigned char *>(buf), r);
     }
     log_io("sendto", s, r, e, to, tolen, buf, r > 0 ? r : 0);
-    if (r == SOCKET_ERROR) notice_line("ERROR", "%s broadcast send failed: %d/%s.", service(port), e, wsa_name(e));
+    // Would-block means "try again", not a fault, and a destination outside this hook's ports
+    // is not its business. Neither belongs at notice level; both stay in the detailed stream
+    // through log_io.
+    if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && relevant(port))
+        notice_line("ERROR", "%s broadcast send failed: %d/%s.", service(port), e, wsa_name(e));
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1706,7 +1719,7 @@ int WSAAPI hook_wsasendto(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent,
         if (sent) *sent = bytes;
         SocketState *state = state_for(s, true);
         if (state != nullptr) {
-            if (state->virtual_lan_port == 0) state->virtual_lan_port = port;
+            if (state->virtual_send_port == 0) state->virtual_send_port = port;
             state->virtual_tx_bytes += bytes;
         }
         virtual_announce(port);
@@ -1737,7 +1750,7 @@ int WSAAPI hook_wsasendto(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent,
                 bytes <= (int)buffers[0].len ? bytes : buffers[0].len);
     }
     if (buffers && count) log_io("WSASendTo", s, r, e, to, tolen, buffers[0].buf, bytes);
-    if (r == SOCKET_ERROR && e != WSA_IO_PENDING)
+    if (r == SOCKET_ERROR && e != WSA_IO_PENDING && e != WSAEWOULDBLOCK && relevant(port))
         notice_line("ERROR", "%s broadcast send failed: %d/%s.", service(port), e, wsa_name(e));
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
@@ -2453,10 +2466,18 @@ DWORD WINAPI initialize(void *) {
     if (g_config.lan_install_enable) {
         notice_line("INFO", "LAN Install is virtualised: TCP %u and UDP %u are answered by "
             "this DLL, so they never reach the network.", kLanSyncPort, kLanBeaconPort);
-    } else {
+    } else if (g_config.network_enable && owns_network()) {
         notice_line("INFO", "LAN Install is not virtualised: TCP %u and UDP %u reach WinSock "
             "and are pinned to the LAN interface like the rest of the LAN traffic.",
             kLanSyncPort, kLanBeaconPort);
+    } else {
+        // Pinning is not unconditional: it needs [network] enable=1 and a hook that owns the
+        // network. Claiming it here would describe a configuration the user is not in.
+        notice_line("INFO", "LAN Install is not virtualised: TCP %u and UDP %u reach WinSock. "
+            "They are not pinned, because %s.", kLanSyncPort, kLanBeaconPort,
+            g_owner == NetworkOwner::segatools
+                ? "segatools owns the network ([netenv] enable=1 in segatools.ini)"
+                : "[network] enable=0 in network_hook.ini");
     }
 
     // One line that answers the three questions a start-up log exists for: did the DLL
