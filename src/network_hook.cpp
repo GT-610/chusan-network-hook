@@ -724,10 +724,16 @@ uint16_t state_port(const SocketState *state) {
 // not the same question state_port answers: a socket whose connect is still pending was never
 // bound to that service, so its local address names either nothing or a port the game chose
 // itself, and a failure line built from that would blame the wrong service.
+//
+// Any destination port is returned, not only one this hook manages. The caller decides what to
+// report from it, and report_connect_failure already refuses a port it does not pin - so a
+// failure aimed at an ordinary port stays out of the log. Falling back to the local address
+// instead would answer a different question: a socket the game bound to a managed port and then
+// pointed somewhere else would report a failure against the service it never contacted.
 uint16_t remote_port(const SocketState *state) {
     const uint16_t p = port_of(reinterpret_cast<const sockaddr *>(&state->remote),
         state->remote_length);
-    if (relevant(p)) return p;
+    if (p != 0) return p;
     return state_port(state);
 }
 

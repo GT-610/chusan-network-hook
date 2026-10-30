@@ -143,7 +143,8 @@ static int run_virtual_flood() {
     // WSASend and WSASendTo take an array of buffers, so the byte count they report has to be
     // the sum of the array rather than its first entry. These are the only calls of their
     // kind in this child, so their lines can be asserted exactly: three 4-byte buffers are
-    // 12 bytes, two 5-byte buffers are 10.
+    // 12 bytes, two 5-byte buffers are 10. Where those bytes land is checked per socket by the
+    // parent: LAN_SYNC closes on exactly 12, LAN_BEACON on exactly 1015.
     {
         char part[3][4] = {};
         WSABUF buffers[3] = {{4, part[0]}, {4, part[1]}, {4, part[2]}};
@@ -423,6 +424,9 @@ struct ConnectNotes {
     bool advertise_attributed_pending;
     // A datagram socket's connect() was refused, on a port whose stream connection works.
     bool datagram_refused;
+    // A stream socket bound to PARTY was refused on the way to an unmanaged port, so nothing
+    // about it may reach the log - and in particular not as a failure against PARTY.
+    bool unmanaged_refused;
 };
 
 static ConnectNotes read_notes(const wchar_t *directory) {
@@ -432,7 +436,7 @@ static ConnectNotes read_notes(const wchar_t *directory) {
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return notes;
-    char text[192] = {};
+    char text[224] = {};
     DWORD read = 0;
     const bool ok = ReadFile(file, text, sizeof(text) - 1, &read, nullptr) != 0;
     CloseHandle(file);
@@ -444,6 +448,7 @@ static ConnectNotes read_notes(const wchar_t *directory) {
     notes.advertise_attributed = strstr(text, "attributed=1") != nullptr;
     notes.advertise_attributed_pending = strstr(text, "attributed_pending=1") != nullptr;
     notes.datagram_refused = strstr(text, "datagram=1") != nullptr;
+    notes.unmanaged_refused = strstr(text, "unmanaged=1") != nullptr;
     return notes;
 }
 
@@ -601,6 +606,84 @@ static int run_failed_connects(const wchar_t *dll) {
         }
     }
 
+    // The same shape, aimed at a port this hook does not manage. Nothing may be reported for
+    // it: the failure is the game's own business, and the concise stream has no room for it.
+    // The distinction matters because this socket is bound to PARTY, so a hook that fell back
+    // to the local address for a failure's identity would print "PARTY TCP connection to the
+    // peer failed" for a connect that never went to PARTY - blaming a service that is working.
+    bool unmanaged_refused = false;
+    {
+        unsigned long candidates[16] = {};
+        int candidate_count = 0;
+        {
+            SOCKET query = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (query != INVALID_SOCKET) {
+                char buffer[512] = {};
+                DWORD returned = 0;
+                if (WSAIoctl(query, SIO_ADDRESS_LIST_QUERY, nullptr, 0, buffer,
+                        (DWORD)sizeof(buffer), &returned, nullptr, nullptr) == 0) {
+                    const SOCKET_ADDRESS_LIST *list =
+                        reinterpret_cast<const SOCKET_ADDRESS_LIST *>(buffer);
+                    for (int i = 0; i < list->iAddressCount &&
+                            candidate_count < (int)(sizeof(candidates) / sizeof(candidates[0]));
+                            ++i) {
+                        const sockaddr *entry = list->Address[i].lpSockaddr;
+                        if (entry == nullptr || entry->sa_family != AF_INET ||
+                            list->Address[i].iSockaddrLength < (int)sizeof(sockaddr_in)) {
+                            continue;
+                        }
+                        const unsigned long address = reinterpret_cast<const sockaddr_in *>(entry)
+                            ->sin_addr.s_addr;
+                        if (address == 0 || address == htonl(INADDR_LOOPBACK)) continue;
+                        candidates[candidate_count++] = address;
+                    }
+                }
+                closesocket(query);
+            }
+        }
+
+        for (int index = 0; index < candidate_count && !unmanaged_refused; ++index) {
+            SOCKET bound = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (bound == INVALID_SOCKET) return fail("unmanaged-connect socket", WSAGetLastError());
+            sockaddr_in local = {};
+            local.sin_family = AF_INET;
+            local.sin_port = htons(50200);
+            local.sin_addr.s_addr = candidates[index];
+            bool ready = bind(bound, reinterpret_cast<const sockaddr *>(&local), sizeof(local)) == 0;
+            u_long nonblocking = 1;
+            if (ready) ready = ioctlsocket(bound, FIONBIO, &nonblocking) == 0;
+            if (ready) {
+                const int pins_before = log_count(dll, kPinRefusedText);
+                sockaddr_in to = {};
+                to.sin_family = AF_INET;
+                to.sin_port = htons(65010);
+                to.sin_addr.s_addr = htonl(INADDR_ANY);
+                WSASetLastError(0);
+                const int connected = connect(bound, reinterpret_cast<const sockaddr *>(&to),
+                    sizeof(to));
+                const DWORD error = WSAGetLastError();
+                if (connected == SOCKET_ERROR &&
+                    (error == WSAEWOULDBLOCK || error == WSAEINPROGRESS ||
+                     error == WSAEALREADY)) {
+                    for (int poll = 0; poll < 40 && !unmanaged_refused; ++poll) {
+                        int so_error = 0;
+                        int so_error_length = (int)sizeof(so_error);
+                        if (getsockopt(bound, SOL_SOCKET, SO_ERROR,
+                                reinterpret_cast<char *>(&so_error), &so_error_length) == 0 &&
+                            so_error != 0) {
+                            unmanaged_refused = true;
+                        }
+                        if (!unmanaged_refused) Sleep(5);
+                    }
+                }
+                // A pin refuse means the stack never saw this attempt, so it proves nothing
+                // about the destination and the next candidate gets the turn.
+                if (log_count(dll, kPinRefusedText) != pins_before) unmanaged_refused = false;
+            }
+            closesocket(bound);
+        }
+    }
+
     // A datagram connect() that the stack refuses. This is the pure form of the same mistake:
     // no connection was ever attempted, so nothing about a TCP connection is true. It uses
     // PARTY, whose stream connection above succeeded, so a failure line on that port can only
@@ -678,12 +761,13 @@ static int run_failed_connects(const wchar_t *dll) {
 
     wchar_t directory[MAX_PATH] = {};
     if (directory_of(dll, directory, MAX_PATH)) {
-        char note[192] = {};
+        char note[224] = {};
         _snprintf_s(note, sizeof(note), _TRUNCATE,
             "setting=%d\nadvertise=%d\nadvertise_connected=%d\nattributed=%d\n"
-            "attributed_pending=%d\ndatagram=%d\n",
+            "attributed_pending=%d\ndatagram=%d\nunmanaged=%d\n",
             setting_refused ? 1 : 0, advertise_refused ? 1 : 0, advertise_connected ? 1 : 0,
-            attributed ? 1 : 0, attributed_pending ? 1 : 0, datagram_refused ? 1 : 0);
+            attributed ? 1 : 0, attributed_pending ? 1 : 0, datagram_refused ? 1 : 0,
+            unmanaged_refused ? 1 : 0);
         write_note(directory, note);
     }
     return 0;
@@ -888,17 +972,35 @@ static int check_concise(const char *log) {
     return 0;
 }
 
-// Largest `virtual_tx_bytes=` in the log: the byte count carried on a CLOSE line for a
-// socket whose sends this DLL answered itself.
-static unsigned long long max_virtual_bytes(const char *log) {
-    unsigned long long largest = 0;
+// Whether a CLOSE line for `service` recorded exactly `wanted` virtual bytes.
+//
+// The bytes have to be checked per socket. A single "largest virtual_tx_bytes in the log" test
+// passes as long as one socket counted a lot, so an under-counted total on a different socket -
+// which is exactly where a WSABUF summing bug lands - goes unnoticed, and so does a total that
+// was never written at all.
+static bool close_total_seen(const char *log, const char *service_name,
+        unsigned long long wanted) {
+    char needle[64] = {};
+    if (_snprintf_s(needle, sizeof(needle), _TRUNCATE, " service=%s tx_bytes=", service_name) < 0)
+        return false;
     const char *cursor = log;
-    while ((cursor = strstr(cursor, "virtual_tx_bytes=")) != nullptr) {
-        cursor += strlen("virtual_tx_bytes=");
-        const unsigned long long value = _strtoui64(cursor, nullptr, 10);
-        if (value > largest) largest = value;
+    while ((cursor = strstr(cursor, "CLOSE\tsocket=")) != nullptr) {
+        const char *end = strchr(cursor, '\n');
+        const size_t length = end != nullptr ? (size_t)(end - cursor) : strlen(cursor);
+        // A bounded copy, so a field is never read past the line it belongs to.
+        char line[512] = {};
+        const size_t copy = length < sizeof(line) - 1 ? length : sizeof(line) - 1;
+        memcpy(line, cursor, copy);
+        if (strstr(line, needle) != nullptr) {
+            const char *field = strstr(line, " virtual_tx_bytes=");
+            if (field != nullptr &&
+                _strtoui64(field + strlen(" virtual_tx_bytes="), nullptr, 10) == wanted) {
+                return true;
+            }
+        }
+        cursor += length;
     }
-    return largest;
+    return false;
 }
 
 // Largest `virtual_calls=` in the log: how many calls one socket had answered for it, which
@@ -997,6 +1099,10 @@ static int check_flood(const char *log, const ConnectNotes &notes) {
             fputs("note: the datagram connect was not refused here, so only the attribution "
                 "half of the port check ran\n", stderr);
         }
+        if (!notes.unmanaged_refused) {
+            fputs("note: the unmanaged-port connect was not refused here, so the part of the "
+                "assertion that keeps PARTY out of it did not run\n", stderr);
+        }
         if (!notes.advertise_attributed) {
             fputs("note: no pinned local address could be produced, so the attribution case "
                 "did not run\n", stderr);
@@ -1030,16 +1136,24 @@ static int check_flood(const char *log, const ConnectNotes &notes) {
         return 1;
     }
     // The sends answered locally are counted apart from the real ones, so a socket that
-    // carried 1005 virtual beacon bytes cannot close as "tx_bytes=0" and read as unused.
-    const unsigned long long virtual_bytes = max_virtual_bytes(log);
-    if (virtual_bytes < 1000) {
-        fprintf(stderr,
-            "FAIL: virtual_tx_bytes reached only %llu on a socket that sent 1005 bytes through "
-            "the virtualised path\n", virtual_bytes);
+    // carried virtual beacon bytes cannot close as "tx_bytes=0" and read as unused. The total
+    // is asserted per socket, because the WSABUF summing bug this covers is a per-socket
+    // number: LAN_SYNC sent exactly 12 bytes through three 4-byte buffers and nothing else,
+    // LAN_BEACON 1005 one-byte sends plus the two 5-byte buffers of the scattered WSASendTo.
+    // A "largest total in the log" check would pass on the beacon alone and say nothing about
+    // the socket whose count was wrong.
+    if (!close_total_seen(log, "LAN_SYNC", 12)) {
+        fputs("FAIL: the LAN_SYNC socket did not close with virtual_tx_bytes=12, the total of "
+            "its scattered WSASend\n", stderr);
+        return 1;
+    }
+    if (!close_total_seen(log, "LAN_BEACON", 1015)) {
+        fputs("FAIL: the LAN_BEACON socket did not close with virtual_tx_bytes=1015, the total "
+            "of its beacons and its scattered WSASendTo\n", stderr);
         return 1;
     }
     printf("  5015 virtualised calls: %d LAN_VIRT lines, %llu answered calls on one socket, "
-        "%llu bytes counted as virtual\n", virtual_lines, virtual_calls, virtual_bytes);
+        "12 and 1015 bytes counted per virtual socket\n", virtual_lines, virtual_calls);
     return 0;
 }
 
