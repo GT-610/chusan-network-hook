@@ -417,6 +417,10 @@ struct ConnectNotes {
     // The connect that was aimed at ADVERTISE failed on a socket whose own local port is
     // PARTY. What the log calls the failure has to follow the target, not the local address.
     bool advertise_attributed;
+    // That failure came from an SO_ERROR poll rather than from connect() itself, which is the
+    // path that has to choose a port. False means the stack refused inline and the assertion
+    // above only proved connect()'s own attribution.
+    bool advertise_attributed_pending;
     // A datagram socket's connect() was refused, on a port whose stream connection works.
     bool datagram_refused;
 };
@@ -438,9 +442,38 @@ static ConnectNotes read_notes(const wchar_t *directory) {
     notes.advertise_refused = strstr(text, "advertise=1") != nullptr;
     notes.advertise_connected = strstr(text, "advertise_connected=1") != nullptr;
     notes.advertise_attributed = strstr(text, "attributed=1") != nullptr;
+    notes.advertise_attributed_pending = strstr(text, "attributed_pending=1") != nullptr;
     notes.datagram_refused = strstr(text, "datagram=1") != nullptr;
     return notes;
 }
+
+// Reads this run's log into a heap buffer, or returns null when it does not exist yet.
+// Defined with the other log helpers below; the child needs it before then.
+static char *read_log(const wchar_t *directory);
+
+// How many times the log beside this DLL contains a literal string.
+//
+// The child decides what it observed before the parent reads the log, so an in-process case
+// has to be able to ask what the hook has already said. It is used for the one observation the
+// probe cannot make from the stack: whether strict mode blocked a connect before the stack saw
+// it. Reading that from the hook is sound because it is a different line from the one under
+// test - the case never asks "did the attribution appear" to decide whether anything happened.
+static int log_count(const wchar_t *dll, const char *text) {
+    wchar_t directory[MAX_PATH] = {};
+    if (!directory_of(dll, directory, MAX_PATH)) return 0;
+    char *log = read_log(directory);
+    if (log == nullptr) return 0;
+    const size_t length = strlen(text);
+    int count = 0;
+    for (const char *cursor = log; (cursor = strstr(cursor, text)) != nullptr; cursor += length)
+        ++count;
+    free(log);
+    return count;
+}
+
+// What strict mode prints when it blocks a connect for the source pin instead of letting the
+// stack try. It is the only reason a candidate address can fail without reaching the network.
+static const char kPinRefusedText[] = "Binding the TCP source address failed";
 
 // A refused connection is worth a resolution only when the port is one this hook pins.
 // Failing to reach anything else - the game server, a web call - is the game's own business,
@@ -473,17 +506,24 @@ static int run_failed_connects(const wchar_t *dll) {
         closesocket(refused);
     }
 
-    // Attribution: a refused pending connect on a socket whose local port is already a managed
-    // one. The destination is 0.0.0.0, which the stack refuses with WSAEADDRNOTAVAIL as soon
-    // as the attempt is polled (measured, not assumed), so the failure is reported from the
-    // SO_ERROR path - the only one that has to choose which port to name. PARTY is what the
-    // local address says; ADVERTISE is what was contacted, and only the second is the truth.
+    // Attribution: a refused connect on a socket whose local port is already a managed one.
+    // The destination is 0.0.0.0, which the stack refuses before any peer exists. PARTY is
+    // what the local address says; ADVERTISE is what was contacted, and only the second is
+    // the truth.
     //
-    // The bind has to use the address this hook pins as the TCP source, or strict mode refuses
-    // the connect for the pin instead of for the destination. That address is the hook's own
-    // choice, so every local address is tried and the first one that gets a refusal through is
-    // the one that was pinned.
+    // Which path reports it is the stack's choice: connect() either says "pending" and the
+    // refusal arrives on an SO_ERROR poll - the path that has to pick a port itself, and the
+    // one this case exists for - or it fails inline, where no peer ever existed. Both have to
+    // end in the same line, so both are accepted and the notes record which one ran.
+    //
+    // What must not decide this is the hook's own output: "no line appeared" has to stay
+    // distinguishable from "nothing was refused", or the case would pass by reporting nothing.
+    // So the observation is made from the stack, and only the pin can hide it: strict mode
+    // refuses a source pin this socket does not already satisfy without ever calling connect(),
+    // and says so in its own line. A candidate that tripped that line did not reach the stack,
+    // and is retried with the next local address rather than counted either way.
     bool attributed = false;
+    bool attributed_pending = false;
     {
         unsigned long candidates[16] = {};
         int candidate_count = 0;
@@ -525,6 +565,7 @@ static int run_failed_connects(const wchar_t *dll) {
             u_long nonblocking = 1;
             if (ready) ready = ioctlsocket(bound, FIONBIO, &nonblocking) == 0;
             if (ready) {
+                const int pins_before = log_count(dll, kPinRefusedText);
                 sockaddr_in to = {};
                 to.sin_family = AF_INET;
                 to.sin_port = htons(50202);
@@ -533,19 +574,27 @@ static int run_failed_connects(const wchar_t *dll) {
                 const int connected = connect(bound, reinterpret_cast<const sockaddr *>(&to),
                     sizeof(to));
                 const DWORD error = WSAGetLastError();
+                bool refusal_on_poll = false;
                 if (connected == SOCKET_ERROR &&
                     (error == WSAEWOULDBLOCK || error == WSAEINPROGRESS ||
                      error == WSAEALREADY)) {
-                    for (int poll = 0; poll < 40 && !attributed; ++poll) {
+                    for (int poll = 0; poll < 40 && !refusal_on_poll; ++poll) {
                         int so_error = 0;
                         int so_error_length = (int)sizeof(so_error);
                         if (getsockopt(bound, SOL_SOCKET, SO_ERROR,
                                 reinterpret_cast<char *>(&so_error), &so_error_length) == 0 &&
                             so_error != 0) {
-                            attributed = true;
+                            refusal_on_poll = true;
                         }
-                        if (!attributed) Sleep(5);
+                        if (!refusal_on_poll) Sleep(5);
                     }
+                }
+                // Pure observation, no waiting: strict mode writes its line before connect()
+                // returns, so the count is already final here. If it grew, this attempt was
+                // blocked before the stack saw it, and the next candidate gets the turn.
+                if (log_count(dll, kPinRefusedText) == pins_before && connected == SOCKET_ERROR) {
+                    attributed = true;
+                    attributed_pending = refusal_on_poll;
                 }
             }
             closesocket(bound);
@@ -631,9 +680,10 @@ static int run_failed_connects(const wchar_t *dll) {
     if (directory_of(dll, directory, MAX_PATH)) {
         char note[192] = {};
         _snprintf_s(note, sizeof(note), _TRUNCATE,
-            "setting=%d\nadvertise=%d\nadvertise_connected=%d\nattributed=%d\ndatagram=%d\n",
+            "setting=%d\nadvertise=%d\nadvertise_connected=%d\nattributed=%d\n"
+            "attributed_pending=%d\ndatagram=%d\n",
             setting_refused ? 1 : 0, advertise_refused ? 1 : 0, advertise_connected ? 1 : 0,
-            attributed ? 1 : 0, datagram_refused ? 1 : 0);
+            attributed ? 1 : 0, attributed_pending ? 1 : 0, datagram_refused ? 1 : 0);
         write_note(directory, note);
     }
     return 0;
@@ -950,6 +1000,10 @@ static int check_flood(const char *log, const ConnectNotes &notes) {
         if (!notes.advertise_attributed) {
             fputs("note: no pinned local address could be produced, so the attribution case "
                 "did not run\n", stderr);
+        } else if (!notes.advertise_attributed_pending) {
+            fputs("note: the refusal arrived from connect() itself, so the SO_ERROR path - the "
+                "one that has to choose a port - was not the path this run exercised\n",
+                stderr);
         }
     }
     // The summed WSABUF counts: a scattered send has to be reported as one total.
