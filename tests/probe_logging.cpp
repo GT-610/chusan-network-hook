@@ -414,6 +414,11 @@ struct ConnectNotes {
     // SO_CONNECT_TIME said the non-blocking connection was up. The log must then carry one
     // "connected" line and no failure line; when it never came up, neither may appear.
     bool advertise_connected;
+    // The connect that was aimed at ADVERTISE failed on a socket whose own local port is
+    // PARTY. What the log calls the failure has to follow the target, not the local address.
+    bool advertise_attributed;
+    // A datagram socket's connect() was refused, on a port whose stream connection works.
+    bool datagram_refused;
 };
 
 static ConnectNotes read_notes(const wchar_t *directory) {
@@ -423,7 +428,7 @@ static ConnectNotes read_notes(const wchar_t *directory) {
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return notes;
-    char text[128] = {};
+    char text[192] = {};
     DWORD read = 0;
     const bool ok = ReadFile(file, text, sizeof(text) - 1, &read, nullptr) != 0;
     CloseHandle(file);
@@ -432,6 +437,8 @@ static ConnectNotes read_notes(const wchar_t *directory) {
     notes.setting_refused = strstr(text, "setting=1") != nullptr;
     notes.advertise_refused = strstr(text, "advertise=1") != nullptr;
     notes.advertise_connected = strstr(text, "advertise_connected=1") != nullptr;
+    notes.advertise_attributed = strstr(text, "attributed=1") != nullptr;
+    notes.datagram_refused = strstr(text, "datagram=1") != nullptr;
     return notes;
 }
 
@@ -445,6 +452,15 @@ static ConnectNotes read_notes(const wchar_t *directory) {
 //   50202  managed and non-blocking, so connect() says "pending" and the failure only shows up
 //          on the SO_ERROR polls - which are made several times over to prove the notice is
 //          printed once and not once per poll.
+//
+// Two more cases cover what the failure line is allowed to say:
+//
+//   stream 50200 -> 50202  a socket pre-bound to the PARTY port, connecting to ADVERTISE and
+//                          refused before any peer exists. The failure belongs to ADVERTISE;
+//                          naming it PARTY would blame a service that was never contacted, and
+//                          the local port is only PARTY because the probe chose it.
+//   datagram 50200         connect() on a UDP socket, refused. No connection was attempted, so
+//                          no "TCP connection failed" line may be printed for it.
 static int run_failed_connects(const wchar_t *dll) {
     for (int attempt = 0; attempt < 2; ++attempt) {
         SOCKET refused = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -455,6 +471,103 @@ static int run_failed_connects(const wchar_t *dll) {
         to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         (void)connect(refused, reinterpret_cast<const sockaddr *>(&to), sizeof(to));
         closesocket(refused);
+    }
+
+    // Attribution: a refused pending connect on a socket whose local port is already a managed
+    // one. The destination is 0.0.0.0, which the stack refuses with WSAEADDRNOTAVAIL as soon
+    // as the attempt is polled (measured, not assumed), so the failure is reported from the
+    // SO_ERROR path - the only one that has to choose which port to name. PARTY is what the
+    // local address says; ADVERTISE is what was contacted, and only the second is the truth.
+    //
+    // The bind has to use the address this hook pins as the TCP source, or strict mode refuses
+    // the connect for the pin instead of for the destination. That address is the hook's own
+    // choice, so every local address is tried and the first one that gets a refusal through is
+    // the one that was pinned.
+    bool attributed = false;
+    {
+        unsigned long candidates[16] = {};
+        int candidate_count = 0;
+        {
+            SOCKET query = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (query != INVALID_SOCKET) {
+                char buffer[512] = {};
+                DWORD returned = 0;
+                if (WSAIoctl(query, SIO_ADDRESS_LIST_QUERY, nullptr, 0, buffer,
+                        (DWORD)sizeof(buffer), &returned, nullptr, nullptr) == 0) {
+                    const SOCKET_ADDRESS_LIST *list =
+                        reinterpret_cast<const SOCKET_ADDRESS_LIST *>(buffer);
+                    for (int i = 0; i < list->iAddressCount &&
+                            candidate_count < (int)(sizeof(candidates) / sizeof(candidates[0]));
+                            ++i) {
+                        const sockaddr *entry = list->Address[i].lpSockaddr;
+                        if (entry == nullptr || entry->sa_family != AF_INET ||
+                            list->Address[i].iSockaddrLength < (int)sizeof(sockaddr_in)) {
+                            continue;
+                        }
+                        const unsigned long address = reinterpret_cast<const sockaddr_in *>(entry)
+                            ->sin_addr.s_addr;
+                        if (address == 0 || address == htonl(INADDR_LOOPBACK)) continue;
+                        candidates[candidate_count++] = address;
+                    }
+                }
+                closesocket(query);
+            }
+        }
+
+        for (int index = 0; index < candidate_count && !attributed; ++index) {
+            SOCKET bound = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (bound == INVALID_SOCKET) return fail("attribution socket", WSAGetLastError());
+            sockaddr_in local = {};
+            local.sin_family = AF_INET;
+            local.sin_port = htons(50200);
+            local.sin_addr.s_addr = candidates[index];
+            bool ready = bind(bound, reinterpret_cast<const sockaddr *>(&local), sizeof(local)) == 0;
+            u_long nonblocking = 1;
+            if (ready) ready = ioctlsocket(bound, FIONBIO, &nonblocking) == 0;
+            if (ready) {
+                sockaddr_in to = {};
+                to.sin_family = AF_INET;
+                to.sin_port = htons(50202);
+                to.sin_addr.s_addr = htonl(INADDR_ANY);
+                WSASetLastError(0);
+                const int connected = connect(bound, reinterpret_cast<const sockaddr *>(&to),
+                    sizeof(to));
+                const DWORD error = WSAGetLastError();
+                if (connected == SOCKET_ERROR &&
+                    (error == WSAEWOULDBLOCK || error == WSAEINPROGRESS ||
+                     error == WSAEALREADY)) {
+                    for (int poll = 0; poll < 40 && !attributed; ++poll) {
+                        int so_error = 0;
+                        int so_error_length = (int)sizeof(so_error);
+                        if (getsockopt(bound, SOL_SOCKET, SO_ERROR,
+                                reinterpret_cast<char *>(&so_error), &so_error_length) == 0 &&
+                            so_error != 0) {
+                            attributed = true;
+                        }
+                        if (!attributed) Sleep(5);
+                    }
+                }
+            }
+            closesocket(bound);
+        }
+    }
+
+    // A datagram connect() that the stack refuses. This is the pure form of the same mistake:
+    // no connection was ever attempted, so nothing about a TCP connection is true. It uses
+    // PARTY, whose stream connection above succeeded, so a failure line on that port can only
+    // have come from this datagram.
+    bool datagram_refused = false;
+    {
+        SOCKET datagram = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (datagram == INVALID_SOCKET) return fail("datagram socket", WSAGetLastError());
+        sockaddr_in to = {};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(50200);
+        to.sin_addr.s_addr = htonl(INADDR_ANY);
+        WSASetLastError(0);
+        datagram_refused = connect(datagram, reinterpret_cast<const sockaddr *>(&to),
+            sizeof(to)) == SOCKET_ERROR;
+        closesocket(datagram);
     }
 
     bool setting_refused = false;
@@ -516,10 +629,11 @@ static int run_failed_connects(const wchar_t *dll) {
 
     wchar_t directory[MAX_PATH] = {};
     if (directory_of(dll, directory, MAX_PATH)) {
-        char note[96] = {};
+        char note[192] = {};
         _snprintf_s(note, sizeof(note), _TRUNCATE,
-            "setting=%d\nadvertise=%d\nadvertise_connected=%d\n",
-            setting_refused ? 1 : 0, advertise_refused ? 1 : 0, advertise_connected ? 1 : 0);
+            "setting=%d\nadvertise=%d\nadvertise_connected=%d\nattributed=%d\ndatagram=%d\n",
+            setting_refused ? 1 : 0, advertise_refused ? 1 : 0, advertise_connected ? 1 : 0,
+            attributed ? 1 : 0, datagram_refused ? 1 : 0);
         write_note(directory, note);
     }
     return 0;
@@ -797,16 +911,25 @@ static int check_flood(const char *log, const ConnectNotes &notes) {
     // really came up is announced as a connection rather than as either a failure or a lie.
     struct Expected {
         const char *text;
-        bool observed;
+        int wanted;
         const char *why;
     };
+    // ADVERTISE is refused twice by the child: once on a loopback socket, and once on the
+    // socket pre-bound to PARTY. Both lines name ADVERTISE, because that is the service each
+    // of them was trying to reach.
+    const int advertise_refusals = (notes.advertise_refused ? 1 : 0) +
+        (notes.advertise_attributed ? 1 : 0);
     const Expected expected[] = {
-        { "SETTING TCP connection to the peer failed", notes.setting_refused,
+        { "SETTING TCP connection to the peer failed", notes.setting_refused ? 1 : 0,
           "a refused SETTING connection has to be reported" },
-        { "ADVERTISE TCP connection to the peer failed", notes.advertise_refused,
+        { "ADVERTISE TCP connection to the peer failed", advertise_refusals,
           "a refused ADVERTISE connection has to be reported" },
-        { "ADVERTISE connected to", notes.advertise_connected,
+        { "ADVERTISE connected to", notes.advertise_connected ? 1 : 0,
           "a connection that completed has to be announced" },
+        // Nothing in this probe ever fails to reach PARTY: its stream connection succeeds and
+        // the only refused attempt at it is a datagram connect, which is not a connection.
+        { "PARTY TCP connection to the peer failed", 0,
+          "a failure was attributed to PARTY" },
     };
     if (!notes.present) {
         fputs("note: the child left no probe notes, so the connection counts were not checked\n",
@@ -814,15 +937,19 @@ static int check_flood(const char *log, const ConnectNotes &notes) {
     } else {
         for (const Expected &item : expected) {
             const int seen = count_text(log, item.text);
-            const int wanted = item.observed ? 1 : 0;
-            if (seen != wanted) {
+            if (seen != item.wanted) {
                 fprintf(stderr, "FAIL: \"%s\" appears %d times, expected %d: %s\n",
-                    item.text, seen, wanted,
-                    item.observed ? item.why
-                                  : "the child did not observe that outcome, so nothing may be "
-                                    "reported for it");
+                    item.text, seen, item.wanted, item.why);
                 return 1;
             }
+        }
+        if (!notes.datagram_refused) {
+            fputs("note: the datagram connect was not refused here, so only the attribution "
+                "half of the port check ran\n", stderr);
+        }
+        if (!notes.advertise_attributed) {
+            fputs("note: no pinned local address could be produced, so the attribution case "
+                "did not run\n", stderr);
         }
     }
     // The summed WSABUF counts: a scattered send has to be reported as one total.

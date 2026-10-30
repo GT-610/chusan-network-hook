@@ -148,6 +148,11 @@ struct SocketState {
     // connect(); a non-blocking one reports "pending" and only reveals the failure through
     // SO_ERROR later, and both must add up to a single line.
     bool connect_failure_reported;
+    // Set while a connect this DLL saw is still in flight - it returned a "pending" error - so
+    // that a later SO_ERROR read can be attributed to that attempt. Without it, an error on a
+    // socket that never connected (a datagram socket's ICMP feedback, say) would be announced
+    // as a failed TCP connection. Consumed by the first terminal SO_ERROR read.
+    bool connect_pending;
     uint64_t tx_bytes;
     uint64_t rx_bytes;
     // Bytes the game tried to send through a virtualised port. Kept apart from tx_bytes,
@@ -715,6 +720,26 @@ uint16_t state_port(const SocketState *state) {
     return state->virtual_send_port;
 }
 
+// The port this socket was pointed at, from the destination the game passed to connect. It is
+// not the same question state_port answers: a socket whose connect is still pending was never
+// bound to that service, so its local address names either nothing or a port the game chose
+// itself, and a failure line built from that would blame the wrong service.
+uint16_t remote_port(const SocketState *state) {
+    const uint16_t p = port_of(reinterpret_cast<const sockaddr *>(&state->remote),
+        state->remote_length);
+    if (relevant(p)) return p;
+    return state_port(state);
+}
+
+// Records how a connect call ended, for the case where it ended without an answer yet. A
+// socket is reused in place - the game connecting again on the same descriptor is normal - so
+// the flag is written on every outcome, not only on the pending one.
+void note_connect_outcome(SocketState *state, int result, int error) {
+    if (state == nullptr) return;
+    state->connect_pending = result == SOCKET_ERROR &&
+        (error == WSAEWOULDBLOCK || error == WSAEINPROGRESS || error == WSAEALREADY);
+}
+
 void log_io(const char *op, SOCKET socket, int result, int error,
             const sockaddr *address, int address_length, const char *data, int data_length) {
     SocketState *state = state_for(socket, false);
@@ -763,6 +788,30 @@ void report_peer(SocketState *state, uint16_t port, bool accepted) {
     }
 }
 
+// Whether this is a stream socket, asked of the stack rather than remembered: a socket can be
+// inherited or wrapped in ways this DLL did not create, and both SO_ERROR readers below need
+// the same answer. Only a stream socket can have a TCP connection to report.
+bool stream_socket(SOCKET socket) {
+    if (g_next_getsockopt == nullptr) return false;
+    int type = 0;
+    int type_length = (int)sizeof(type);
+    if (g_next_getsockopt(socket, SOL_SOCKET, SO_TYPE,
+            reinterpret_cast<char *>(&type), &type_length) == SOCKET_ERROR) return false;
+    return type == SOCK_STREAM;
+}
+
+// The mirror of stream_socket, for the one decision that must not be answered by default: a
+// failed SO_TYPE query means "not known to be a datagram socket", and that has to keep a real
+// failure reportable rather than suppress it.
+bool datagram_socket(SOCKET socket) {
+    if (g_next_getsockopt == nullptr) return false;
+    int type = 0;
+    int type_length = (int)sizeof(type);
+    if (g_next_getsockopt(socket, SOL_SOCKET, SO_TYPE,
+            reinterpret_cast<char *>(&type), &type_length) == SOCKET_ERROR) return false;
+    return type == SOCK_DGRAM;
+}
+
 // A non-blocking connect reports its outcome through SO_ERROR rather than from connect(),
 // which returned WSAEWOULDBLOCK, so this is the only place that success becomes visible - and
 // turning "the game opened a socket" into "the game reached the peer" is worth a line.
@@ -778,26 +827,23 @@ void report_peer(SocketState *state, uint16_t port, bool accepted) {
 // non-blocking connect is still pending - measured: connect to a closed loopback port returns
 // WSAEWOULDBLOCK, SO_ERROR stays 0, getpeername succeeds, and SO_CONNECT_TIME stays
 // 0xFFFFFFFF. SO_CONNECT_TIME is the one option that distinguishes the two, so it decides
-// whether anything is announced.
-void report_connect_complete(SOCKET socket) {
+// whether anything is announced. Returns whether a connection was actually confirmed, which is
+// also the only terminal answer this function can give.
+bool report_connect_complete(SOCKET socket) {
     SocketState *state = state_for(socket, false);
-    if (state == nullptr || state->virtual_lan_port != 0) return;
-    if (g_next_getsockopt == nullptr) return;
-    int type = 0;
-    int type_length = (int)sizeof(type);
-    if (g_next_getsockopt(socket, SOL_SOCKET, SO_TYPE,
-            reinterpret_cast<char *>(&type), &type_length) == SOCKET_ERROR) return;
-    if (type != SOCK_STREAM) return;
+    if (state == nullptr || state->virtual_lan_port != 0) return false;
+    if (!stream_socket(socket)) return false;
     int connected_seconds = 0;
     int connected_length = (int)sizeof(connected_seconds);
     if (g_next_getsockopt(socket, SOL_SOCKET, SO_CONNECT_TIME,
-            reinterpret_cast<char *>(&connected_seconds), &connected_length) == SOCKET_ERROR) return;
-    if (connected_seconds == -1) return; // 0xFFFFFFFF: the connect has not completed
+            reinterpret_cast<char *>(&connected_seconds), &connected_length) == SOCKET_ERROR) return false;
+    if (connected_seconds == -1) return false; // 0xFFFFFFFF: the connect has not completed
     sockaddr_storage peer = {};
     int peer_length = (int)sizeof(peer);
-    if (getpeername(socket, reinterpret_cast<sockaddr *>(&peer), &peer_length) != 0) return;
+    if (getpeername(socket, reinterpret_cast<sockaddr *>(&peer), &peer_length) != 0) return false;
     save_address(state, reinterpret_cast<const sockaddr *>(&peer), peer_length, true);
     report_peer(state, state_port(state), false);
+    return true;
 }
 
 // The other half of the same outcome: a connection that did not come up. A blocking connect
@@ -806,6 +852,11 @@ void report_connect_complete(SOCKET socket) {
 // this, and the per-socket flag means the two can never say it twice.
 void report_connect_failure(SocketState *state, uint16_t port, int error) {
     if (state == nullptr || !relevant(port) || state->connect_failure_reported) return;
+    // connect() is also the call that points a datagram socket at a peer, and it can fail
+    // there too. That is not a TCP connection, and a line claiming one failed is a wrong
+    // diagnosis in the log a user reads to fix their network. Only a socket the stack calls a
+    // datagram socket is excluded, so a failed SO_TYPE query cannot silence a real failure.
+    if (datagram_socket(state->socket)) return;
     state->connect_failure_reported = true;
     notice_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), error,
         wsa_name(error));
@@ -1537,6 +1588,7 @@ int WSAAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
     refresh_addresses(st);
     log_io("connect", s, r, e, name, namelen, nullptr, 0);
     if (r == 0) report_peer(st, port, false);
+    note_connect_outcome(st, r, e);
     // Only a port this hook pins is its business; report_connect_failure filters the rest.
     if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS &&
         e != WSAEALREADY)
@@ -1681,11 +1733,27 @@ int WSAAPI hook_getsockopt(SOCKET s, int level, int optname, char *value, int *l
         // checks that a peer is really there before announcing success, and
         // report_connect_failure announces a terminal error once. A zero error on a socket
         // that is still connecting is neither, so the pending case stays silent here.
+        //
+        // A non-zero error is only a failed connection on a socket this DLL saw go pending and
+        // that is a stream socket. SO_ERROR carries every socket error, including the ones a
+        // datagram socket collects from ICMP, and calling those a failed TCP connection would
+        // invent a connection that was never attempted.
         if (r == 0 && so_error == 0) {
-            report_connect_complete(s);
+            // A confirmed connection is terminal, so the attempt is over. Reading zero on a
+            // socket that is still connecting is not: that read says nothing yet, and the flag
+            // has to survive it for the failure that may still arrive.
+            SocketState *state = state_for(s, false);
+            if (report_connect_complete(s) && state != nullptr) state->connect_pending = false;
         } else if (r == 0 && so_error > 0) {
             SocketState *state = state_for(s, false);
-            if (state != nullptr) report_connect_failure(state, state_port(state), so_error);
+            if (state != nullptr && state->connect_pending && stream_socket(s)) {
+                // The attempt is over either way, so the flag does not survive the read: a
+                // later error on the same socket is the socket's, not that connect's.
+                state->connect_pending = false;
+                // The destination names the service this attempt was for; the local port does
+                // not, because the socket was never given one by that service.
+                report_connect_failure(state, remote_port(state), so_error);
+            }
         }
     }
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
@@ -1742,6 +1810,7 @@ int WSAAPI hook_wsaconnect(SOCKET s, const sockaddr *name, int namelen, LPWSABUF
     refresh_addresses(st);
     log_io("WSAConnect", s, r, e, name, namelen, nullptr, 0);
     if (r == 0) report_peer(st, port, false);
+    note_connect_outcome(st, r, e);
     // Only a port this hook pins is its business; report_connect_failure filters the rest.
     if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS &&
         e != WSAEALREADY)
