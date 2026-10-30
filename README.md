@@ -47,8 +47,16 @@ build\probe_logging_x64.exe build\chusan_network_hook_x64.dll
 build\probe_ownership_x64.exe build\chusan_network_hook_x64.dll
 ```
 
-All five run in `release.yml` before anything is published, so a tag cannot ship from a
-tree where they fail.
+`tests\run-probes.ps1` runs all five and reports every result, so the list is not something to
+remember, and one broken probe does not hide the others:
+
+```powershell
+pwsh -File tests\run-probes.ps1
+```
+
+CI runs that script over the same list in two places: `probes.yml` on every push to `main` and
+every pull request, and `release.yml` before anything is published, so neither a pull request
+nor a tag can come from a tree where the probes fail.
 
 ## Injection
 
