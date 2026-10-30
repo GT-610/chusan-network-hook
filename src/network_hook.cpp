@@ -21,6 +21,14 @@
 
 namespace {
 
+// The socket option Winsock documents but the SDK headers do not export: seconds since the
+// connection was established, or 0xFFFFFFFF when the socket is not connected. It is the only
+// way to tell a completed non-blocking connect from one still pending (see
+// report_connect_complete for the measurement).
+#ifndef SO_CONNECT_TIME
+#define SO_CONNECT_TIME 0x700C
+#endif
+
 // LAN Install virtualization is intentionally socketless at the network boundary:
 // the original bind/listen/connect/send/recv calls for ports 40110/40112 are not
 // forwarded to Winsock. The valid return values only keep amdaemon's state machine
@@ -37,6 +45,19 @@ constexpr size_t kStreamCapacity = 32768;
 constexpr unsigned char kProtocolKey[16] = {
     'C', 'H', 'U', 'N', 'I', 'C', 'H', 'U', 'N', 'I', 'C', 'H', 'U', 'N', 'I', 'C'
 };
+
+// Two levels, because the two readers want opposite things.
+//
+// `notice` is the concise stream: what this DLL is, what it decided, which interface it took
+// over, whether the hooks installed, where the log is, and every event that changes what the
+// game will do next - a LAN listener opening, a peer being reached, a failure with its fix.
+// A normal session is a handful of lines at that level, which is the point: `detailed=0`
+// means "do not drown me", not "tell me nothing".
+//
+// `detail` is the diagnostic stream: every call, address, route, counter and payload, which
+// is deliberately a firehose (one line per send and receive). It only makes sense while
+// something is being debugged, so it stays behind `detailed=1`.
+enum class Level { notice, detail };
 
 struct Config {
     bool network_enable = false;
@@ -112,11 +133,35 @@ struct SocketState {
     bool used;
     SOCKET socket;
     uint16_t virtual_lan_port;
+    // Set when a virtualised send was answered on this socket, for labelling only. Kept apart
+    // from virtual_lan_port on purpose: that one means "this socket exists to serve LAN
+    // Install", which is what suppresses receives on it. Sending one beacon does not make
+    // that true - the same socket can still carry real traffic to a real peer.
+    uint16_t virtual_send_port;
     bool broadcast_interface_configured;
     bool tcp_source_bound;
     bool route_logged;
+    // Set once a peer result has been reported at notice level, so a non-blocking connect
+    // (whose outcome only appears through SO_ERROR, which is polled) is announced once.
+    bool peer_reported;
+    // Set once a connection failure has been announced. A blocking connect fails inside
+    // connect(); a non-blocking one reports "pending" and only reveals the failure through
+    // SO_ERROR later, and both must add up to a single line.
+    bool connect_failure_reported;
+    // Set while a connect this DLL saw is still in flight - it returned a "pending" error - so
+    // that a later SO_ERROR read can be attributed to that attempt. Without it, an error on a
+    // socket that never connected (a datagram socket's ICMP feedback, say) would be announced
+    // as a failed TCP connection. Consumed by the first terminal SO_ERROR read.
+    bool connect_pending;
     uint64_t tx_bytes;
     uint64_t rx_bytes;
+    // Bytes the game tried to send through a virtualised port. Kept apart from tx_bytes,
+    // which counts what actually reached the stack, so a CLOSE line cannot read as "nothing
+    // was sent" on a socket whose traffic was answered locally.
+    uint64_t virtual_tx_bytes;
+    // Calls this DLL answered itself on this socket. Printed once, by CLOSE, so a poll loop
+    // costs no lines of its own and its volume is still on the record.
+    unsigned long virtual_calls;
     unsigned char tx_stream[kStreamCapacity];
     size_t tx_stream_length;
     unsigned char rx_stream[kStreamCapacity];
@@ -265,6 +310,26 @@ void endpoint(const sockaddr *address, int length, char *out, size_t out_size) {
     _snprintf_s(out, out_size, _TRUNCATE, "af=%d", address->sa_family);
 }
 
+// Bytes across a WSABUF array. WSASend and WSASendTo take a count and an array, so a message
+// can be scattered over several buffers; the first one is not the message. The virtualised
+// paths need this because they return before the stack fills in `*sent`, and the byte count
+// they report has to describe what the caller asked to send.
+//
+// Accumulated wider than the result: a sum past DWORD_MAX cannot be returned by the API at
+// all, and wrapping it would hand the caller a truncated count that reads as a short, successful
+// write. Those calls are refused instead.
+bool wsa_buffer_total(LPWSABUF buffers, DWORD count, DWORD *total) {
+    *total = 0;
+    if (buffers == nullptr) return true;
+    unsigned long long sum = 0;
+    for (DWORD i = 0; i < count; ++i) {
+        sum += buffers[i].len;
+        if (sum > 0xFFFFFFFFull) return false;
+    }
+    *total = (DWORD)sum;
+    return true;
+}
+
 void hex_dump(const char *data, int length, char *out, size_t out_size) {
     static const char digits[] = "0123456789ABCDEF";
     if (out_size == 0) return;
@@ -360,7 +425,7 @@ const char *g_interface_ready_text() {
     return text;
 }
 
-void human_line(const char *category, const char *format, ...);
+void notice_line(const char *category, const char *format, ...);
 
 // Buffers a diagnostic raised before the logging thread exists. Calling the normal
 // logger from DllMain would take a lock and touch the filesystem under the loader
@@ -391,7 +456,7 @@ void defer_info(const char *format, ...) {
 void flush_pending() {
     const LONG count = g_pending_count;
     for (LONG i = 0; i < count && i < (LONG)(sizeof(g_pending) / sizeof(g_pending[0])); ++i) {
-        human_line(g_pending[i].error ? "ERROR" : "INFO", "%s", g_pending[i].text);
+        notice_line(g_pending[i].error ? "ERROR" : "INFO", "%s", g_pending[i].text);
     }
     InterlockedExchange(&g_pending_count, 0);
 }
@@ -410,9 +475,9 @@ void open_log_file() {
         FILE_ATTRIBUTE_NORMAL, nullptr);
 }
 
-void write_log_v(bool detailed, const char *category, const char *format, va_list args) {
+void write_log_v(Level level, const char *category, const char *format, va_list args) {
     const int saved_wsa_error = WSAGetLastError();
-    if (!g_config.log_enable || (detailed && !g_config.log_detailed)) {
+    if (!g_config.log_enable || (level == Level::detail && !g_config.log_detailed)) {
         WSASetLastError(saved_wsa_error);
         return;
     }
@@ -453,17 +518,22 @@ void write_log_v(bool detailed, const char *category, const char *format, va_lis
 void log_line(const char *category, const char *format, ...) {
     va_list args;
     va_start(args, format);
-    write_log_v(true, category, format, args);
+    write_log_v(Level::detail, category, format, args);
     va_end(args);
 }
 
-void human_line(const char *category, const char *format, ...) {
+// The concise stream. Everything a reader needs to answer "is this DLL working, what did it
+// decide, and where will I see it go wrong" belongs here, and nothing else does.
+void notice_line(const char *category, const char *format, ...) {
     va_list args;
     va_start(args, format);
-    write_log_v(false, category, format, args);
+    write_log_v(Level::notice, category, format, args);
     va_end(args);
 }
 
+// The one line that proves the DLL loaded, printed whether or not any logging is configured.
+// It also goes to the file: a start-up record that lives only in stderr is invisible in a
+// process without a console, which is exactly the case for chusanApp.exe.
 void status_line(const char *format, ...) {
     char message[2048] = {};
     va_list args;
@@ -471,13 +541,113 @@ void status_line(const char *format, ...) {
     _vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args);
     va_end(args);
     char line[2304] = {};
-    _snprintf_s(line, sizeof(line), _TRUNCATE,
+    const int length = _snprintf_s(line, sizeof(line), _TRUNCATE,
         "[network_hook] STATUS pid=%lu %s\n", GetCurrentProcessId(), message);
     AcquireSRWLockExclusive(&g_log_lock);
+    if (length > 0 && g_log_file != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(g_log_file, line, (DWORD)length, &written, nullptr);
+        FlushFileBuffers(g_log_file);
+    }
     OutputDebugStringA(line);
     fputs(line, stderr);
     fflush(stderr);
     ReleaseSRWLockExclusive(&g_log_lock);
+}
+
+// LAN Install virtualisation answers these calls itself, so a caller that polls one of the
+// ports gets the identical answer on every poll. amdaemon polls its non-blocking LAN Install
+// sockets about once per millisecond; at detailed level that was one LAN_VIRT line per
+// millisecond, which buried every other line, spent the session flushing the file to disk,
+// and looked like a failure that kept repeating when it was only "still nothing here".
+//
+// The answer never varies, so it is worth exactly one line: the first call for an operation
+// and port is reported and the rest are silent. Reporting the repeat rate as well - once a
+// second was the earlier attempt - still costs a line per second for the whole session to
+// say nothing new, so the total is counted on the socket instead and printed by the CLOSE
+// line it already has. Nothing is lost: the first call of each kind, the fact that the port
+// is in use (virtual_announce), and how many calls it answered are all still in the log, and
+// a session costs a constant handful of lines no matter how long it runs.
+
+// One value per distinct answer a virtualised port can give, so calls are reported per
+// operation rather than per message: a beacon send and a beacon receive are different facts.
+enum class VirtualOp {
+    bind, listen, connect, accept,
+    send, recv, sendto, recvfrom,
+    wsa_connect, wsa_accept, wsa_send, wsa_recv, wsa_sendto, wsa_recvfrom,
+    event_select, enum_events,
+};
+
+const char *virtual_op_name(VirtualOp op) {
+    switch (op) {
+    case VirtualOp::bind: return "bind";
+    case VirtualOp::listen: return "listen";
+    case VirtualOp::connect: return "connect";
+    case VirtualOp::accept: return "accept";
+    case VirtualOp::send: return "send";
+    case VirtualOp::recv: return "recv";
+    case VirtualOp::sendto: return "sendto";
+    case VirtualOp::recvfrom: return "recvfrom";
+    case VirtualOp::wsa_connect: return "WSAConnect";
+    case VirtualOp::wsa_accept: return "WSAAccept";
+    case VirtualOp::wsa_send: return "WSASend";
+    case VirtualOp::wsa_recv: return "WSARecv";
+    case VirtualOp::wsa_sendto: return "WSASendTo";
+    case VirtualOp::wsa_recvfrom: return "WSARecvFrom";
+    case VirtualOp::event_select: return "WSAEventSelect";
+    case VirtualOp::enum_events: return "WSAEnumNetworkEvents";
+    default: return "unknown";
+    }
+}
+
+// Sixteen operations across two ports is exactly one bit each, so "this answer has already
+// been reported" is a bitmask rather than a table, and reading it needs no lock: the poll
+// loop that triggers this runs at about 1 kHz and must not serialise on a logger it is not
+// writing to.
+static_assert(static_cast<size_t>(VirtualOp::enum_events) + 1 <= 16,
+    "each virtualised operation needs one bit per port");
+volatile LONG g_virtual_reported;
+
+// True the first time a given operation/port pair is seen, false forever after.
+bool virtual_first(VirtualOp op, uint16_t port) {
+    const size_t bit = static_cast<size_t>(op) + (port == kLanSyncPort ? 0 : 16);
+    const LONG mask = static_cast<LONG>(1u << bit);
+    return (InterlockedOr(&g_virtual_reported, mask) & mask) == 0;
+}
+
+// One concise line per virtualised port, at the moment the game first relies on it. The
+// start-up line says the switch is on; this says the game actually reached the port, which
+// is the difference between "configured" and "in use" that a session log should record.
+volatile LONG g_virtual_announced[2];
+
+void virtual_announce(uint16_t port) {
+    if (!lan_install_port(port)) return;
+    const size_t slot = port == kLanSyncPort ? 0 : 1;
+    if (InterlockedExchange(&g_virtual_announced[slot], 1) != 0) return;
+    if (port == kLanSyncPort) {
+        notice_line("INFO", "LAN Install sync port %u (TCP) is answered by this DLL from here "
+            "on: bind and send report success, receives report WSAEWOULDBLOCK, and nothing "
+            "reaches the network.", port);
+    } else {
+        notice_line("INFO", "LAN Install beacon port %u (UDP) is answered by this DLL from here "
+            "on: sends report success and nothing reaches the network.", port);
+    }
+}
+
+// One line per operation and port, for the life of the process. Everything after it is the
+// same answer, so it is counted into the socket's CLOSE line instead of being printed.
+void virtual_report(VirtualOp op, uint16_t port, const char *format, ...) {
+    if (!virtual_first(op, port)) return;
+    char detail[320] = {};
+    va_list args;
+    va_start(args, format);
+    _vsnprintf_s(detail, sizeof(detail), _TRUNCATE, format, args);
+    va_end(args);
+    log_line("LAN_VIRT", "op=%s port=%u result=%s", virtual_op_name(op), port, detail);
+}
+
+void virtual_call(SocketState *state) {
+    if (state != nullptr) ++state->virtual_calls;
 }
 
 void save_address(SocketState *state, const sockaddr *address, int length, bool remote) {
@@ -536,9 +706,44 @@ void refresh_addresses(SocketState *state) {
 }
 
 uint16_t state_port(const SocketState *state) {
+    // A virtualised socket has no address to read a port from - the call that would have
+    // bound one returned before reaching the stack - so the port it was virtualised for is
+    // the only identification it has. Reporting it keeps LAN Install traffic labelled
+    // LAN_SYNC/LAN_BEACON instead of falling out of the socket lines entirely.
+    if (state->virtual_lan_port != 0) return state->virtual_lan_port;
     uint16_t p = port_of(reinterpret_cast<const sockaddr *>(&state->local), state->local_length);
     if (relevant(p)) return p;
-    return port_of(reinterpret_cast<const sockaddr *>(&state->remote), state->remote_length);
+    p = port_of(reinterpret_cast<const sockaddr *>(&state->remote), state->remote_length);
+    if (relevant(p)) return p;
+    // Nothing on the socket identifies it - a beacon sender that never bound - so the port it
+    // last carried is what names it in the log.
+    return state->virtual_send_port;
+}
+
+// The port this socket was pointed at, from the destination the game passed to connect. It is
+// not the same question state_port answers: a socket whose connect is still pending was never
+// bound to that service, so its local address names either nothing or a port the game chose
+// itself, and a failure line built from that would blame the wrong service.
+//
+// Any destination port is returned, not only one this hook manages. The caller decides what to
+// report from it, and report_connect_failure already refuses a port it does not pin - so a
+// failure aimed at an ordinary port stays out of the log. Falling back to the local address
+// instead would answer a different question: a socket the game bound to a managed port and then
+// pointed somewhere else would report a failure against the service it never contacted.
+uint16_t remote_port(const SocketState *state) {
+    const uint16_t p = port_of(reinterpret_cast<const sockaddr *>(&state->remote),
+        state->remote_length);
+    if (p != 0) return p;
+    return state_port(state);
+}
+
+// Records how a connect call ended, for the case where it ended without an answer yet. A
+// socket is reused in place - the game connecting again on the same descriptor is normal - so
+// the flag is written on every outcome, not only on the pending one.
+void note_connect_outcome(SocketState *state, int result, int error) {
+    if (state == nullptr) return;
+    state->connect_pending = result == SOCKET_ERROR &&
+        (error == WSAEWOULDBLOCK || error == WSAEINPROGRESS || error == WSAEALREADY);
 }
 
 void log_io(const char *op, SOCKET socket, int result, int error,
@@ -563,6 +768,104 @@ void log_io(const char *op, SOCKET socket, int result, int error,
     log_line("NET", "%s sock=%llu service=%s local=%s remote=%s target=%s result=%d error=%d/%s bytes=%d hex=%s",
         op, (unsigned long long)(uintptr_t)socket, service(p), local, remote, target,
         result, error, wsa_name(error), data_length, hex);
+}
+
+// Reports that a LAN peer was reached, once per socket. The Party/Setting/Advertise TCP
+// sockets are the part of in-store play a reader can see succeed, so the moment of success
+// belongs in the concise stream - and it is the only place a non-blocking connect's outcome
+// is visible at all, because that result arrives through SO_ERROR rather than connect().
+//
+// An accepted socket accepted with a null address argument has no peer address to print;
+// saying so is better than printing "af=0", which reads like a parse failure in the hook.
+void report_peer(SocketState *state, uint16_t port, bool accepted) {
+    if (state == nullptr || !relevant(port) || state->peer_reported) return;
+    state->peer_reported = true;
+    char remote[96] = {};
+    endpoint(reinterpret_cast<const sockaddr *>(&state->remote), state->remote_length,
+        remote, sizeof(remote));
+    const bool named = remote[0] != 0 && strcmp(remote, "-") != 0 &&
+        strncmp(remote, "af=", 3) != 0;
+    if (accepted) {
+        if (named) notice_line("INFO", "%s accepted a connection from %s.", service(port), remote);
+        else notice_line("INFO", "%s accepted a connection.", service(port));
+    } else {
+        if (named) notice_line("INFO", "%s connected to %s.", service(port), remote);
+        else notice_line("INFO", "%s connected to its peer.", service(port));
+    }
+}
+
+// Whether this is a stream socket, asked of the stack rather than remembered: a socket can be
+// inherited or wrapped in ways this DLL did not create, and both SO_ERROR readers below need
+// the same answer. Only a stream socket can have a TCP connection to report.
+bool stream_socket(SOCKET socket) {
+    if (g_next_getsockopt == nullptr) return false;
+    int type = 0;
+    int type_length = (int)sizeof(type);
+    if (g_next_getsockopt(socket, SOL_SOCKET, SO_TYPE,
+            reinterpret_cast<char *>(&type), &type_length) == SOCKET_ERROR) return false;
+    return type == SOCK_STREAM;
+}
+
+// The mirror of stream_socket, for the one decision that must not be answered by default: a
+// failed SO_TYPE query means "not known to be a datagram socket", and that has to keep a real
+// failure reportable rather than suppress it.
+bool datagram_socket(SOCKET socket) {
+    if (g_next_getsockopt == nullptr) return false;
+    int type = 0;
+    int type_length = (int)sizeof(type);
+    if (g_next_getsockopt(socket, SOL_SOCKET, SO_TYPE,
+            reinterpret_cast<char *>(&type), &type_length) == SOCKET_ERROR) return false;
+    return type == SOCK_DGRAM;
+}
+
+// A non-blocking connect reports its outcome through SO_ERROR rather than from connect(),
+// which returned WSAEWOULDBLOCK, so this is the only place that success becomes visible - and
+// turning "the game opened a socket" into "the game reached the peer" is worth a line.
+//
+// SO_ERROR also reads 0 on sockets that never connected, on UDP sockets, and on the
+// virtualised LAN Install sockets whose connect this DLL faked; reporting those as a reached
+// peer would put a false success in the concise log. So the socket is asked rather than
+// assumed: a stream socket with a peer name has a connection behind it. The peer address is
+// only recorded once that check passes, so a broken socket cannot leave a stale endpoint
+// behind for later lines.
+//
+// getpeername alone is not that check. On this platform it answers for a socket whose
+// non-blocking connect is still pending - measured: connect to a closed loopback port returns
+// WSAEWOULDBLOCK, SO_ERROR stays 0, getpeername succeeds, and SO_CONNECT_TIME stays
+// 0xFFFFFFFF. SO_CONNECT_TIME is the one option that distinguishes the two, so it decides
+// whether anything is announced. Returns whether a connection was actually confirmed, which is
+// also the only terminal answer this function can give.
+bool report_connect_complete(SOCKET socket) {
+    SocketState *state = state_for(socket, false);
+    if (state == nullptr || state->virtual_lan_port != 0) return false;
+    if (!stream_socket(socket)) return false;
+    int connected_seconds = 0;
+    int connected_length = (int)sizeof(connected_seconds);
+    if (g_next_getsockopt(socket, SOL_SOCKET, SO_CONNECT_TIME,
+            reinterpret_cast<char *>(&connected_seconds), &connected_length) == SOCKET_ERROR) return false;
+    if (connected_seconds == -1) return false; // 0xFFFFFFFF: the connect has not completed
+    sockaddr_storage peer = {};
+    int peer_length = (int)sizeof(peer);
+    if (getpeername(socket, reinterpret_cast<sockaddr *>(&peer), &peer_length) != 0) return false;
+    save_address(state, reinterpret_cast<const sockaddr *>(&peer), peer_length, true);
+    report_peer(state, state_port(state), false);
+    return true;
+}
+
+// The other half of the same outcome: a connection that did not come up. A blocking connect
+// fails inside connect(); a non-blocking one returns "pending" there and only reveals the
+// failure on a later SO_ERROR read, where nothing else would have reported it. Both paths call
+// this, and the per-socket flag means the two can never say it twice.
+void report_connect_failure(SocketState *state, uint16_t port, int error) {
+    if (state == nullptr || !relevant(port) || state->connect_failure_reported) return;
+    // connect() is also the call that points a datagram socket at a peer, and it can fail
+    // there too. That is not a TCP connection, and a line claiming one failed is a wrong
+    // diagnosis in the log a user reads to fix their network. Only a socket the stack calls a
+    // datagram socket is excluded, so a failed SO_TYPE query cannot silence a real failure.
+    if (datagram_socket(state->socket)) return;
+    state->connect_failure_reported = true;
+    notice_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), error,
+        wsa_name(error));
 }
 
 void wide_to_utf8(const wchar_t *input, char *output, size_t output_size) {
@@ -910,7 +1213,7 @@ bool broadcast_pin_enabled(bool directed) {
 }
 
 bool network_failure(const char *operation, uint16_t port, int error) {
-    human_line("ERROR", "%s failed for %s (%u) on interface %s: %d/%s.%s",
+    notice_line("ERROR", "%s failed for %s (%u) on interface %s: %d/%s.%s",
         operation, service(port), port,
         g_interface_ready_text(),
         error, wsa_name(error),
@@ -934,7 +1237,7 @@ bool network_unresolved(const char *operation, uint16_t port) {
     }
     static volatile LONG warned = 0;
     if (InterlockedExchange(&warned, 1) == 0) {
-        human_line("ERROR", "%s: no interface is selected, so nothing was pinned. Game "
+        notice_line("ERROR", "%s: no interface is selected, so nothing was pinned. Game "
             "traffic follows Windows routing. Set [network] interface to the adapter that "
             "carries the LAN.", operation);
     }
@@ -1245,7 +1548,9 @@ int WSAAPI hook_bind(SOCKET s, const sockaddr *name, int namelen) {
         SocketState *state = state_for(s, true);
         if (state) { state->virtual_lan_port = port; save_address(state, name, namelen, false); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
-        log_line("LAN_VIRT", "bind_skipped port=%u requested=%s result=0", port, requested);
+        virtual_announce(port);
+        virtual_call(state);
+        virtual_report(VirtualOp::bind, port, "accepted local=%s", requested);
         return 0;
     }
     int r = g_next_bind(s, name, namelen);
@@ -1256,11 +1561,19 @@ int WSAAPI hook_bind(SOCKET s, const sockaddr *name, int namelen) {
 
 int WSAAPI hook_listen(SOCKET s, int backlog) {
     SocketState *state = state_for(s, false);
+    const uint16_t port = state != nullptr ? state_port(state) : 0;
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanSyncPort) {
-        log_line("LAN_VIRT", "listen_skipped port=%u backlog=%d result=0", kLanSyncPort, backlog);
+        virtual_call(state);
+        virtual_report(VirtualOp::listen, kLanSyncPort, "accepted backlog=%d", backlog);
         return 0;
     }
     int r = g_next_listen(s, backlog); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
+    if (r == 0 && state != nullptr && relevant(port)) {
+        char local[96] = "-";
+        endpoint(reinterpret_cast<const sockaddr *>(&state->local), state->local_length,
+            local, sizeof(local));
+        notice_line("INFO", "%s is listening on %s.", service(port), local);
+    }
     log_io("listen", s, r, e, nullptr, 0, nullptr, 0); if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1269,7 +1582,9 @@ int WSAAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
     if (g_config.lan_install_enable && port == kLanSyncPort) {
         SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; save_address(st, name, namelen, true); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
-        log_line("LAN_VIRT", "connect_skipped port=%u requested=%s result=0", port, requested);
+        virtual_announce(port);
+        virtual_call(st);
+        virtual_report(VirtualOp::connect, port, "connected target=%s", requested);
         return 0;
     }
     if (relevant(port) && !ensure_tcp_source(s, port, name, namelen)) return SOCKET_ERROR;
@@ -1278,8 +1593,12 @@ int WSAAPI hook_connect(SOCKET s, const sockaddr *name, int namelen) {
     int r = g_next_connect(s, name, namelen); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
     refresh_addresses(st);
     log_io("connect", s, r, e, name, namelen, nullptr, 0);
-    if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS && e != WSAEALREADY)
-        human_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), e, wsa_name(e));
+    if (r == 0) report_peer(st, port, false);
+    note_connect_outcome(st, r, e);
+    // Only a port this hook pins is its business; report_connect_failure filters the rest.
+    if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS &&
+        e != WSAEALREADY)
+        report_connect_failure(st, port, e);
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1287,7 +1606,9 @@ SOCKET WSAAPI hook_accept(SOCKET s, sockaddr *addr, int *len) {
     SocketState *listener = state_for(s, false);
     if (g_config.lan_install_enable && listener && listener->virtual_lan_port == kLanSyncPort) {
         WSASetLastError(WSAEWOULDBLOCK);
-        log_line("LAN_VIRT", "accept_skipped port=%u result=SOCKET_ERROR error=%d/%s", kLanSyncPort, WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
+        virtual_call(listener);
+        virtual_report(VirtualOp::accept, kLanSyncPort, "would_block error=%d/%s",
+            WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return INVALID_SOCKET;
     }
     SOCKET r = g_next_accept(s, addr, len); int e = r == INVALID_SOCKET ? WSAGetLastError() : 0;
@@ -1296,6 +1617,10 @@ SOCKET WSAAPI hook_accept(SOCKET s, sockaddr *addr, int *len) {
         if (st) {
             if (listener) save_address(st, reinterpret_cast<const sockaddr *>(&listener->local), listener->local_length, false);
             if (addr && len) save_address(st, addr, *len, true);
+            // getpeername, so the peer can be named in the notice even when the caller
+            // passed a null address (which is how the game's own accept loops call it).
+            refresh_addresses(st);
+            report_peer(st, state_port(st), true);
         }
     }
     log_io("accept", s, r == INVALID_SOCKET ? SOCKET_ERROR : 0, e, addr, len ? *len : 0, nullptr, 0);
@@ -1305,7 +1630,9 @@ SOCKET WSAAPI hook_accept(SOCKET s, sockaddr *addr, int *len) {
 int WSAAPI hook_send(SOCKET s, const char *buf, int len, int flags) {
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanSyncPort) {
-        log_line("LAN_VIRT", "send_skipped port=%u bytes=%d result=%d", kLanSyncPort, len, len);
+        if (len > 0) state->virtual_tx_bytes += (uint64_t)len;
+        virtual_call(state);
+        virtual_report(VirtualOp::send, kLanSyncPort, "sent bytes=%d", len);
         return len;
     }
     int r = g_next_send(s, buf, len, flags); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
@@ -1322,7 +1649,9 @@ int WSAAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && lan_install_port(state->virtual_lan_port)) {
         WSASetLastError(WSAEWOULDBLOCK);
-        log_line("LAN_VIRT", "recv_skipped port=%u result=SOCKET_ERROR error=%d/%s", state->virtual_lan_port, WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
+        virtual_call(state);
+        virtual_report(VirtualOp::recv, state->virtual_lan_port, "would_block error=%d/%s",
+            WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return SOCKET_ERROR;
     }
     int r = g_next_recv(s, buf, len, flags); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
@@ -1338,7 +1667,14 @@ int WSAAPI hook_recv(SOCKET s, char *buf, int len, int flags) {
 int WSAAPI hook_sendto(SOCKET s, const char *buf, int len, int flags, const sockaddr *to, int tolen) {
     const uint16_t port = port_of(to, tolen);
     if (g_config.lan_install_enable && port == kLanBeaconPort) {
-        log_line("LAN_VIRT", "sendto_skipped port=%u bytes=%d result=%d", port, len, len);
+        SocketState *state = state_for(s, true);
+        if (state != nullptr) {
+            if (state->virtual_send_port == 0) state->virtual_send_port = port;
+            if (len > 0) state->virtual_tx_bytes += (uint64_t)len;
+        }
+        virtual_announce(port);
+        virtual_call(state);
+        virtual_report(VirtualOp::sendto, port, "sent bytes=%d", len);
         return len;
     }
     SocketState *state = state_for(s, true);
@@ -1358,7 +1694,11 @@ int WSAAPI hook_sendto(SOCKET s, const char *buf, int len, int flags, const sock
             parse_datagram(state, "TX", reinterpret_cast<const unsigned char *>(buf), r);
     }
     log_io("sendto", s, r, e, to, tolen, buf, r > 0 ? r : 0);
-    if (r == SOCKET_ERROR) human_line("ERROR", "%s broadcast send failed: %d/%s.", service(port), e, wsa_name(e));
+    // Would-block means "try again", not a fault, and a destination outside this hook's ports
+    // is not its business. Neither belongs at notice level; both stay in the detailed stream
+    // through log_io.
+    if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && relevant(port))
+        notice_line("ERROR", "%s broadcast send failed: %d/%s.", service(port), e, wsa_name(e));
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1366,7 +1706,9 @@ int WSAAPI hook_recvfrom(SOCKET s, char *buf, int len, int flags, sockaddr *from
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanBeaconPort) {
         WSASetLastError(WSAEWOULDBLOCK);
-        log_line("LAN_VIRT", "recvfrom_skipped port=%u result=SOCKET_ERROR error=%d/%s", kLanBeaconPort, WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
+        virtual_call(state);
+        virtual_report(VirtualOp::recvfrom, kLanBeaconPort, "would_block error=%d/%s",
+            WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return SOCKET_ERROR;
     }
     int r = g_next_recvfrom(s, buf, len, flags, from, fromlen); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
@@ -1393,6 +1735,32 @@ int WSAAPI hook_getsockopt(SOCKET s, int level, int optname, char *value, int *l
     if (level == SOL_SOCKET && optname == SO_ERROR) {
         int so_error = (r == 0 && value && len && *len >= (int)sizeof(int)) ? *reinterpret_cast<int *>(value) : -1;
         log_io("getsockopt", s, so_error, e, nullptr, 0, nullptr, 0);
+        // SO_ERROR is polled, so both outcomes are guarded per socket: report_connect_complete
+        // checks that a peer is really there before announcing success, and
+        // report_connect_failure announces a terminal error once. A zero error on a socket
+        // that is still connecting is neither, so the pending case stays silent here.
+        //
+        // A non-zero error is only a failed connection on a socket this DLL saw go pending and
+        // that is a stream socket. SO_ERROR carries every socket error, including the ones a
+        // datagram socket collects from ICMP, and calling those a failed TCP connection would
+        // invent a connection that was never attempted.
+        if (r == 0 && so_error == 0) {
+            // A confirmed connection is terminal, so the attempt is over. Reading zero on a
+            // socket that is still connecting is not: that read says nothing yet, and the flag
+            // has to survive it for the failure that may still arrive.
+            SocketState *state = state_for(s, false);
+            if (report_connect_complete(s) && state != nullptr) state->connect_pending = false;
+        } else if (r == 0 && so_error > 0) {
+            SocketState *state = state_for(s, false);
+            if (state != nullptr && state->connect_pending && stream_socket(s)) {
+                // The attempt is over either way, so the flag does not survive the read: a
+                // later error on the same socket is the socket's, not that connect's.
+                state->connect_pending = false;
+                // The destination names the service this attempt was for; the local port does
+                // not, because the socket was never given one by that service.
+                report_connect_failure(state, remote_port(state), so_error);
+            }
+        }
     }
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
@@ -1435,7 +1803,9 @@ int WSAAPI hook_wsaconnect(SOCKET s, const sockaddr *name, int namelen, LPWSABUF
     if (g_config.lan_install_enable && port == kLanSyncPort) {
         SocketState *st = state_for(s, true); if (st) { st->virtual_lan_port = port; save_address(st, name, namelen, true); }
         char requested[96]; endpoint(name, namelen, requested, sizeof(requested));
-        log_line("LAN_VIRT", "WSAConnect_skipped port=%u requested=%s result=0", port, requested);
+        virtual_announce(port);
+        virtual_call(st);
+        virtual_report(VirtualOp::wsa_connect, port, "connected target=%s", requested);
         return 0;
     }
     if (relevant(port) && !ensure_tcp_source(s, port, name, namelen)) return SOCKET_ERROR;
@@ -1445,8 +1815,12 @@ int WSAAPI hook_wsaconnect(SOCKET s, const sockaddr *name, int namelen, LPWSABUF
     int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
     refresh_addresses(st);
     log_io("WSAConnect", s, r, e, name, namelen, nullptr, 0);
-    if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS && e != WSAEALREADY)
-        human_line("ERROR", "%s TCP connection to the peer failed: %d/%s.", service(port), e, wsa_name(e));
+    if (r == 0) report_peer(st, port, false);
+    note_connect_outcome(st, r, e);
+    // Only a port this hook pins is its business; report_connect_failure filters the rest.
+    if (r == SOCKET_ERROR && e != WSAEWOULDBLOCK && e != WSAEINPROGRESS &&
+        e != WSAEALREADY)
+        report_connect_failure(st, port, e);
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1455,9 +1829,22 @@ int WSAAPI hook_wsasendto(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent,
                           LPWSAOVERLAPPED_COMPLETION_ROUTINE completion) {
     const uint16_t port = port_of(to, tolen);
     if (g_config.lan_install_enable && port == kLanBeaconPort) {
-        const DWORD bytes = buffers && count ? buffers[0].len : 0;
+        DWORD bytes = 0;
+        if (!wsa_buffer_total(buffers, count, &bytes)) {
+            // Unrepresentable total: refuse it rather than report a truncated send.
+            if (sent) *sent = 0;
+            WSASetLastError(WSAEMSGSIZE);
+            return SOCKET_ERROR;
+        }
         if (sent) *sent = bytes;
-        log_line("LAN_VIRT", "WSASendTo_skipped port=%u bytes=%lu result=0", port, (unsigned long)bytes);
+        SocketState *state = state_for(s, true);
+        if (state != nullptr) {
+            if (state->virtual_send_port == 0) state->virtual_send_port = port;
+            state->virtual_tx_bytes += bytes;
+        }
+        virtual_announce(port);
+        virtual_call(state);
+        virtual_report(VirtualOp::wsa_sendto, port, "sent bytes=%lu", (unsigned long)bytes);
         return 0;
     }
     SocketState *state = state_for(s, true);
@@ -1483,8 +1870,8 @@ int WSAAPI hook_wsasendto(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent,
                 bytes <= (int)buffers[0].len ? bytes : buffers[0].len);
     }
     if (buffers && count) log_io("WSASendTo", s, r, e, to, tolen, buffers[0].buf, bytes);
-    if (r == SOCKET_ERROR && e != WSA_IO_PENDING)
-        human_line("ERROR", "%s broadcast send failed: %d/%s.", service(port), e, wsa_name(e));
+    if (r == SOCKET_ERROR && e != WSA_IO_PENDING && e != WSAEWOULDBLOCK && relevant(port))
+        notice_line("ERROR", "%s broadcast send failed: %d/%s.", service(port), e, wsa_name(e));
     if (r == SOCKET_ERROR) WSASetLastError(e); return r;
 }
 
@@ -1495,7 +1882,9 @@ int WSAAPI hook_wsarecvfrom(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD rec
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanBeaconPort) {
         if (received) *received = 0;
         WSASetLastError(WSAEWOULDBLOCK);
-        log_line("LAN_VIRT", "WSARecvFrom_skipped port=%u result=SOCKET_ERROR error=%d/%s", kLanBeaconPort, WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
+        virtual_call(state);
+        virtual_report(VirtualOp::wsa_recvfrom, kLanBeaconPort, "would_block error=%d/%s",
+            WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return SOCKET_ERROR;
     }
     int r = g_next_wsarecvfrom(s, buffers, count, received, flags, from, fromlen, overlapped, completion);
@@ -1517,9 +1906,17 @@ int WSAAPI hook_wsasend(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent, D
                         LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion) {
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanSyncPort) {
-        const DWORD bytes = buffers && count ? buffers[0].len : 0;
+        DWORD bytes = 0;
+        if (!wsa_buffer_total(buffers, count, &bytes)) {
+            // Unrepresentable total: refuse it rather than report a truncated send.
+            if (sent) *sent = 0;
+            WSASetLastError(WSAEMSGSIZE);
+            return SOCKET_ERROR;
+        }
         if (sent) *sent = bytes;
-        log_line("LAN_VIRT", "WSASend_skipped port=%u bytes=%lu result=0", kLanSyncPort, (unsigned long)bytes);
+        state->virtual_tx_bytes += bytes;
+        virtual_call(state);
+        virtual_report(VirtualOp::wsa_send, kLanSyncPort, "sent bytes=%lu", (unsigned long)bytes);
         return 0;
     }
     int r = g_next_wsasend(s, buffers, count, sent, flags, overlapped, completion);
@@ -1542,7 +1939,9 @@ int WSAAPI hook_wsarecv(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD receive
     if (g_config.lan_install_enable && state && state->virtual_lan_port == kLanSyncPort) {
         if (received) *received = 0;
         WSASetLastError(WSAEWOULDBLOCK);
-        log_line("LAN_VIRT", "WSARecv_skipped port=%u result=SOCKET_ERROR error=%d/%s", kLanSyncPort, WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
+        virtual_call(state);
+        virtual_report(VirtualOp::wsa_recv, kLanSyncPort, "would_block error=%d/%s",
+            WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return SOCKET_ERROR;
     }
     int r = g_next_wsarecv(s, buffers, count, received, flags, overlapped, completion);
@@ -1562,7 +1961,9 @@ int WSAAPI hook_wsarecv(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD receive
 int WSAAPI hook_wsaeventselect(SOCKET s, WSAEVENT event, long network_events) {
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && lan_install_port(state->virtual_lan_port)) {
-        log_line("LAN_VIRT", "WSAEventSelect_skipped port=%u events=0x%lX result=0", state->virtual_lan_port, network_events);
+        virtual_call(state);
+        virtual_report(VirtualOp::event_select, state->virtual_lan_port,
+            "accepted events=0x%lX", network_events);
         return 0;
     }
     int r = g_next_wsaeventselect(s, event, network_events);
@@ -1574,7 +1975,8 @@ int WSAAPI hook_wsaenumnetworkevents(SOCKET s, WSAEVENT event, LPWSANETWORKEVENT
     SocketState *state = state_for(s, false);
     if (g_config.lan_install_enable && state && lan_install_port(state->virtual_lan_port)) {
         if (network_events) memset(network_events, 0, sizeof(*network_events));
-        log_line("LAN_VIRT", "WSAEnumNetworkEvents_skipped port=%u result=0", state->virtual_lan_port);
+        virtual_call(state);
+        virtual_report(VirtualOp::enum_events, state->virtual_lan_port, "no_events");
         return 0;
     }
     int r = g_next_wsaenumnetworkevents(s, event, network_events);
@@ -1586,7 +1988,9 @@ SOCKET WSAAPI hook_wsaaccept(SOCKET s, sockaddr *addr, LPINT len, LPCONDITIONPRO
     SocketState *listener = state_for(s, false);
     if (g_config.lan_install_enable && listener && listener->virtual_lan_port == kLanSyncPort) {
         WSASetLastError(WSAEWOULDBLOCK);
-        log_line("LAN_VIRT", "WSAAccept_skipped port=%u result=SOCKET_ERROR error=%d/%s", kLanSyncPort, WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
+        virtual_call(listener);
+        virtual_report(VirtualOp::wsa_accept, kLanSyncPort, "would_block error=%d/%s",
+            WSAEWOULDBLOCK, wsa_name(WSAEWOULDBLOCK));
         return INVALID_SOCKET;
     }
     SOCKET r = g_next_wsaaccept(s, addr, len, condition, callback);
@@ -1596,6 +2000,8 @@ SOCKET WSAAPI hook_wsaaccept(SOCKET s, sockaddr *addr, LPINT len, LPCONDITIONPRO
         if (st) {
             if (listener) save_address(st, reinterpret_cast<const sockaddr *>(&listener->local), listener->local_length, false);
             if (addr && len) save_address(st, addr, *len, true);
+            refresh_addresses(st);
+            report_peer(st, state_port(st), true);
         }
     }
     log_io("WSAAccept", s, r == INVALID_SOCKET ? SOCKET_ERROR : 0, e, addr, len ? *len : 0, nullptr, 0);
@@ -1605,9 +2011,11 @@ SOCKET WSAAPI hook_wsaaccept(SOCKET s, sockaddr *addr, LPINT len, LPCONDITIONPRO
 int WSAAPI hook_closesocket(SOCKET s) {
     SocketState *state = state_for(s, false);
     if (state && relevant(state_port(state))) {
-        log_line("CLOSE", "socket=%llu service=%s tx_bytes=%llu rx_bytes=%llu",
+        log_line("CLOSE", "socket=%llu service=%s tx_bytes=%llu rx_bytes=%llu "
+            "virtual_tx_bytes=%llu virtual_calls=%lu",
             (unsigned long long)(uintptr_t)s, service(state_port(state)),
-            (unsigned long long)state->tx_bytes, (unsigned long long)state->rx_bytes);
+            (unsigned long long)state->tx_bytes, (unsigned long long)state->rx_bytes,
+            (unsigned long long)state->virtual_tx_bytes, state->virtual_calls);
     }
     int r = g_next_closesocket(s); int e = r == SOCKET_ERROR ? WSAGetLastError() : 0;
     log_io("close", s, r, e, nullptr, 0, nullptr, 0);
@@ -1722,16 +2130,19 @@ InstallReport install_hook_table(HMODULE module, const char *dll_a, const char *
                             "%s%s", patched_names[0] ? ", " : "", hook.name);
                     }
                 } else {
-                    // Never silent: a slot left unpatched means every call through
-                    // it bypasses the hook and is invisible in the log.
+                    // Never silent, at either level: a slot left unpatched means every call
+                    // through it bypasses the hook, and the default level is the one most
+                    // sessions run at. Reporting this only in the detailed stream would hide
+                    // a hole in the coverage exactly when nobody is looking for one.
                     const DWORD protect_error = GetLastError();
                     ++report.failed;
                     if (quiet)
                         defer_line("[%s] could not patch %s (%p): error %lu", tag, hook.name,
                             (void *)slot, protect_error);
                     else
-                        log_line("IAT", "patch_failed table=%s function=%s slot=%p error=%lu/%s",
-                            tag, hook.name, (void *)slot, protect_error, "WIN32_ERROR");
+                        notice_line("ERROR", "Could not patch %s!%s (%p): error %lu. Calls "
+                            "through it bypass the hook.", tag, hook.name, (void *)slot,
+                            protect_error);
                 }
                 break;
             }
@@ -1762,9 +2173,10 @@ InstallReport install_hook_table(HMODULE module, const char *dll_a, const char *
     return report;
 }
 
-bool install_iat_hooks(HMODULE module) {
+bool install_iat_hooks(HMODULE module, InstallReport *report_out) {
     const InstallReport report = install_hook_table(module, "ws2_32.dll", "wsock32.dll",
         g_hooks, sizeof(g_hooks) / sizeof(g_hooks[0]), "ws2_32", false);
+    if (report_out != nullptr) *report_out = report;
     return report.patched != 0 || report.already != 0;
 }
 
@@ -1785,12 +2197,24 @@ bool install_duplicate_server_hook(HMODULE module) {
     };
     unsigned char *target = reinterpret_cast<unsigned char *>(module) + kRva;
     if (memcmp(target, expected, sizeof(expected)) != 0) {
-        log_line("LAN_HOOK", "status=skipped reason=prologue_mismatch rva=0x%llX", (unsigned long long)kRva);
+        // A different amdaemon build. The patch is skipped rather than forced onto a
+        // prologue it was not verified against, and the consequence is stated: LAN Install
+        // may then refuse this host as a duplicate server.
+        notice_line("ERROR", "The duplicate-server check in amdaemon.exe could not be "
+            "neutralised: the prologue at rva=0x%llX does not match this build, so LAN "
+            "Install may still refuse the host.", (unsigned long long)kRva);
+        log_line("LAN_HOOK", "status=skipped reason=prologue_mismatch rva=0x%llX",
+            (unsigned long long)kRva);
         return false;
     }
     DWORD old = 0;
     if (!VirtualProtect(target, 13, PAGE_EXECUTE_READWRITE, &old)) {
-        log_line("LAN_HOOK", "status=failed stage=VirtualProtect error=%d/%s", GetLastError(), "WIN32_ERROR");
+        const DWORD error = GetLastError();
+        notice_line("ERROR", "The duplicate-server check in amdaemon.exe could not be "
+            "neutralised: VirtualProtect failed with %lu, so LAN Install may still refuse the "
+            "host.", error);
+        log_line("LAN_HOOK", "status=failed stage=VirtualProtect error=%lu/%s", error,
+            "WIN32_ERROR");
         return false;
     }
     unsigned char patch[13] = {0x48,0xB8};
@@ -1800,7 +2224,11 @@ bool install_duplicate_server_hook(HMODULE module) {
     memcpy(target, patch, sizeof(patch));
     DWORD ignored; VirtualProtect(target, 13, old, &ignored);
     FlushInstructionCache(GetCurrentProcess(), target, 13);
-    log_line("LAN_HOOK", "status=installed target=amdaemon.exe rva=0x%llX action=force_duplicate_server_false", (unsigned long long)kRva);
+    notice_line("INFO", "The duplicate-server check in amdaemon.exe is disabled "
+        "(rva=0x%llX, forced to return false), so LAN Install cannot reject this host as a "
+        "duplicate server.", (unsigned long long)kRva);
+    log_line("LAN_HOOK", "status=installed target=amdaemon.exe rva=0x%llX "
+        "action=force_duplicate_server_false", (unsigned long long)kRva);
     return true;
 }
 
@@ -2062,7 +2490,7 @@ void prepare() {
             }
         }
         adapter_override::log_sink() = [](const char *message) {
-            human_line("ADAPTER", "%s", message);
+            notice_line("ADAPTER", "%s", message);
         };
         adapter_override::trace_sink() = [](const char *message) {
             log_line("ADAPTER", "%s", message);
@@ -2098,24 +2526,34 @@ DWORD WINAPI initialize(void *) {
     flush_pending();
 
     if (g_config.log_write_file && g_log_file == INVALID_HANDLE_VALUE)
-        human_line("ERROR", "File logging was requested, but the log file could not be created.");
+        notice_line("ERROR", "File logging was requested, but the log file could not be created.");
     initialize_crypto();
     log_adapters();
-    bool iat = install_iat_hooks(process);
+    InstallReport iat_report = {};
+    const bool iat = install_iat_hooks(process, &iat_report);
     const char *lan_hook_status = "not_applicable";
 #ifdef _WIN64
     bool lan = false;
     if (g_config.lan_install_enable && _stricmp(exe, "amdaemon.exe") == 0)
         lan = install_duplicate_server_hook(process);
+    // The same value the STATUS line prints. Reporting only "installed or not" here lost the
+    // difference between "this build does not need it", "the switch is off" and "it was
+    // asked for and did not take" - and the last one is the case a reader has to act on.
     if (_stricmp(exe, "amdaemon.exe") == 0)
         lan_hook_status = lan ? "installed" : (g_config.lan_install_enable ? "skipped_or_failed" : "disabled");
-    log_line("START", "process=%s architecture=x64 image_base=%p iat=%s lan_duplicate_hook=%s ports=40110,40112,50200,50201,50202",
-        exe, process, iat ? "installed" : "not_installed", lan ? "installed" : "not_applicable_or_skipped");
+    notice_line("START", "process=%s architecture=x64 image_base=%p iat=%s hooked=%ld "
+        "lan_duplicate_hook=%s ports=40110,40112,50200,50201,50202",
+        exe, process, iat ? "installed" : "not_installed", iat_report.patched,
+        lan_hook_status);
 #else
-    log_line("START", "process=%s architecture=x86 image_base=%p iat=%s ports=40110,40112,50200,50201,50202 lan_duplicate_hook=not_available",
-        exe, process, iat ? "installed" : "not_installed");
+    notice_line("START", "process=%s architecture=x86 image_base=%p iat=%s hooked=%ld "
+        "ports=40110,40112,50200,50201,50202 lan_duplicate_hook=not_available",
+        exe, process, iat ? "installed" : "not_installed", iat_report.patched);
 #endif
-    log_line("CONFIG",
+    // The effective configuration on one line. It belongs in the concise stream: every
+    // report about this DLL starts with "what was it told to do", and without this line the
+    // answer lives only in a file the reader has to go and find.
+    notice_line("CONFIG",
         "network_enable=%d interface_selector=%s resolved_address=%s interface_index=%lu "
         "exclusive=%d allow_loopback=%d force_limited_broadcast=%d "
         "force_directed_broadcast=%d force_tcp_source=%d strict=%d virtualize_icmp=%d "
@@ -2131,6 +2569,36 @@ DWORD WINAPI initialize(void *) {
         g_config.virtualize_icmp ? 1 : 0,
         g_config.lan_install_enable ? 1 : 0, g_config.log_enable ? 1 : 0,
         g_config.log_detailed ? 1 : 0, g_config.log_write_file ? 1 : 0);
+
+    // Where the log is, once it is really open. Stated at notice level because "the game
+    // misbehaved, send me the log" is the first thing that goes wrong when nobody knows the
+    // file exists - and withheld when the handle is invalid, which would contradict the ERROR
+    // above it and send a reader looking for a file that was never created.
+    if (g_config.log_write_file && g_log_file != INVALID_HANDLE_VALUE) {
+        char log_path[MAX_PATH * 2] = {};
+        wide_to_utf8(g_log_path, log_path, sizeof(log_path));
+        notice_line("INFO", "Writing this log to %s.", log_path);
+    }
+
+    // What LAN Install virtualisation is doing, at notice level. The detailed stream
+    // reports every virtualised call, but the decision itself is a single fact and the
+    // reader needs it whether or not detailed logging is on.
+    if (g_config.lan_install_enable) {
+        notice_line("INFO", "LAN Install is virtualised: TCP %u and UDP %u are answered by "
+            "this DLL, so they never reach the network.", kLanSyncPort, kLanBeaconPort);
+    } else if (g_config.network_enable && owns_network()) {
+        notice_line("INFO", "LAN Install is not virtualised: TCP %u and UDP %u reach WinSock "
+            "and are pinned to the LAN interface like the rest of the LAN traffic.",
+            kLanSyncPort, kLanBeaconPort);
+    } else {
+        // Pinning is not unconditional: it needs [network] enable=1 and a hook that owns the
+        // network. Claiming it here would describe a configuration the user is not in.
+        notice_line("INFO", "LAN Install is not virtualised: TCP %u and UDP %u reach WinSock. "
+            "They are not pinned, because %s.", kLanSyncPort, kLanBeaconPort,
+            g_owner == NetworkOwner::segatools
+                ? "segatools owns the network ([netenv] enable=1 in segatools.ini)"
+                : "[network] enable=0 in network_hook.ini");
+    }
 
     // One line that answers the three questions a start-up log exists for: did the DLL
     // load, which process is it in, and what did it decide. Printed to stderr and the
@@ -2160,7 +2628,7 @@ DWORD WINAPI initialize(void *) {
         char mask[INET_ADDRSTRLEN] = {};
         InetNtopA(AF_INET, &g_interface_address, text, sizeof(text));
         InetNtopA(AF_INET, &g_interface_mask, mask, sizeof(mask));
-        human_line("INFO", "LAN traffic uses %s (index %lu, %s/%s).",
+        notice_line("INFO", "LAN traffic uses %s (index %lu, %s/%s).",
             g_interface_name, g_interface_index, text, mask);
     }
     return 0;

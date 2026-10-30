@@ -1,0 +1,39 @@
+name: Probe tests
+
+# The probes are the only thing in this repository that can tell a working change from a
+# broken one: the DLL's job is to make a network behave differently, and none of that is
+# visible to a compiler or to CodeQL. They used to run only at tag time in release.yml, so a
+# pull request could break the log, the virtualised ports or the broadcast pin and still show
+# a green check - the failure would surface at release, when the tree is already tagged.
+#
+# The list of probes lives in tests/run-probes.ps1, which release.yml runs too. Keeping it in
+# one place is the point: a probe added to the build and to one workflow but not the other is
+# silently not a gate.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  probes:
+    name: Build and run probes
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build DLLs, smoke tests and probes
+        shell: cmd
+        run: build.bat
+
+      # Several probes start a child process that loads the DLL from a scratch directory
+      # beside it, so they need a writable build directory and a loopback interface - both of
+      # which a hosted Windows runner has. None of them needs the real network.
+      - name: Run probes
+        shell: pwsh
+        run: ./tests/run-probes.ps1

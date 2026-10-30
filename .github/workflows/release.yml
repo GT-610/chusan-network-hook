@@ -20,17 +20,10 @@ jobs:
         shell: cmd
         run: build.bat
 
+      # The same script probes.yml runs, so a tag and a pull request are gated by one list.
       - name: Run smoke tests and probes
         shell: pwsh
-        run: |
-          .\build\network_hook_smoketest_x64.exe .\build\chusan_network_hook_x64.dll
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\build\network_hook_smoketest_x86.exe .\build\chusan_network_hook_x86.dll
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\build\probe_icmp_x64.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\build\probe_ownership_x64.exe .\build\chusan_network_hook_x64.dll
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: ./tests/run-probes.ps1
 
       - name: Assemble release archive
         shell: pwsh
